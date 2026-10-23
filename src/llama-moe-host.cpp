@@ -54,6 +54,8 @@ struct moe_host_mat {
     ggml_type         vdt      = GGML_TYPE_COUNT;
     ggml_from_float_t quantize = nullptr; // to vdt
     size_t            qrow     = 0;       // bytes of an input row quantized to vdt
+    ggml_type         type     = GGML_TYPE_COUNT;
+    int               row8_min = 0;       // an expert with this many entries or more unpacks each row once, 0 = never
 };
 
 struct moe_host_layer {
@@ -83,6 +85,16 @@ bool moe_host_mat_init(moe_host_mat & m, const ggml_tensor * t, int64_t n_in, in
     m.vdt      = tr->vec_dot_type;
     m.quantize = tq->from_float;
     m.qrow     = ggml_row_size(tr->vec_dot_type, n_in);
+    m.type     = t->type;
+    // an unpacked row costs about one dot product and the next ones are much cheaper; the IQ4 and Q2_0 dot products
+    // are cheap already, so the unpacking pays from a third entry
+    if (ggml_cpu_row8_supported(t->type) && n_in % 32 == 0) {
+        const bool cheap = t->type == GGML_TYPE_IQ4_XS || t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_Q2_0;
+        m.row8_min = cheap ? 3 : 2;
+        if (const char * v = getenv("LLAMA_MOE_HOST_ROW8"); v != nullptr && *v != '\0') {
+            m.row8_min = atoi(v) > 0 ? std::max(m.row8_min, atoi(v)) : 0;
+        }
+    }
     return true;
 }
 
@@ -153,6 +165,16 @@ struct llama_moe_host::impl {
     std::vector<float>   u;           // [max_entries][n_ff]
     std::vector<uint8_t> qh;          // [max_entries][qh_row]
     std::vector<std::vector<float>> acc; // per thread [max_tokens]
+
+    // per thread, a row unpacked for the entries of an expert (ggml_cpu_row8_unpack) and their activation rows
+    struct row8_buf {
+        std::vector<int8_t>       q;
+        std::vector<int16_t>      sc;
+        std::vector<float>        d;
+        std::vector<const void *> ys;
+        std::vector<float>        out;
+    };
+    std::vector<row8_buf> r8;
 
     // the request being computed
     const moe_host_layer * cur   = nullptr;
@@ -279,6 +301,15 @@ struct llama_moe_host::impl {
         n_workers = std::max(0, n_threads - 1);
         bar.n = n_workers + 1;
         acc.resize(n_workers + 1, std::vector<float>(max_tokens));
+        r8.resize(n_workers + 1);
+        for (row8_buf & b : r8) {
+            const size_t n = (size_t) std::max(n_embd, n_ff);
+            b.q.resize(n);
+            b.sc.resize(n/16);
+            b.d.resize(n/32);
+            b.ys.resize(max_tokens);
+            b.out.resize(max_tokens);
+        }
         for (auto & n : next) {
             n.store(0);
         }
@@ -388,6 +419,20 @@ struct llama_moe_host::impl {
             const int32_t r0 = c*chunk_a;
             const int32_t r1 = std::min(r0 + chunk_a, n_ff);
             const char * w = m.data + (size_t) ce.e*m.nb2;
+            if (m.row8_min > 0 && ce.count >= m.row8_min) {
+                row8_buf & b = r8[ith];
+                for (int32_t j = 0; j < ce.count; ++j) {
+                    b.ys[j] = qxs + (size_t) ent_tok[ce.first + j]*qx_row;
+                }
+                for (int32_t r = r0; r < r1; ++r) {
+                    ggml_cpu_row8_unpack(m.type, w + (size_t) r*m.nb1, n_embd, b.q.data(), b.sc.data(), b.d.data());
+                    ggml_cpu_row8_dot(m.vdt, b.q.data(), b.sc.data(), b.d.data(), b.ys.data(), ce.count, n_embd, b.out.data());
+                    for (int32_t j = 0; j < ce.count; ++j) {
+                        out[(size_t) (ce.first + j)*n_ff + r] = b.out[j];
+                    }
+                }
+                continue;
+            }
             for (int32_t r = r0; r < r1; ++r) {
                 const char * wr = w + (size_t) r*m.nb1;
                 for (int32_t q = ce.first; q < ce.first + ce.count; ++q) {
@@ -426,6 +471,18 @@ struct llama_moe_host::impl {
                 std::fill(a, a + cur_n_tokens, 0.0f);
                 for (const cpu_expert & ce : experts) {
                     const char * wr = md.data + (size_t) ce.e*md.nb2 + (size_t) r*md.nb1;
+                    if (md.row8_min > 0 && ce.count >= md.row8_min) {
+                        row8_buf & b = r8[ith];
+                        for (int32_t j = 0; j < ce.count; ++j) {
+                            b.ys[j] = qh.data() + (size_t) (ce.first + j)*qh_row;
+                        }
+                        ggml_cpu_row8_unpack(md.type, wr, n_ff, b.q.data(), b.sc.data(), b.d.data());
+                        ggml_cpu_row8_dot(md.vdt, b.q.data(), b.sc.data(), b.d.data(), b.ys.data(), ce.count, n_ff, b.out.data());
+                        for (int32_t j = 0; j < ce.count; ++j) {
+                            a[ent_tok[ce.first + j]] += ent_w[ce.first + j]*b.out[j];
+                        }
+                        continue;
+                    }
                     for (int32_t q = ce.first; q < ce.first + ce.count; ++q) {
                         float v;
                         md.dot(n_ff, &v, 0, wr, 0, qh.data() + (size_t) q*qh_row, 0, 1);

@@ -101,6 +101,13 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+#if defined(__AVX2__)
+// see ggml_cpu_row8_unpack and ggml_cpu_row8_dot
+bool ggml_row8_unpack_avx2(enum ggml_type type, const void * GGML_RESTRICT row, int64_t n, int8_t * GGML_RESTRICT q, int16_t * GGML_RESTRICT sc, float * GGML_RESTRICT d);
+void ggml_row8_dot_avx2(enum ggml_type vdt, const int8_t * GGML_RESTRICT q, const int16_t * GGML_RESTRICT sc, const float * GGML_RESTRICT d,
+        const void * const * ys, int k, int64_t n, float * GGML_RESTRICT out);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

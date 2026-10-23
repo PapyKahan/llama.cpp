@@ -419,6 +419,44 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
     return &type_traits_cpu[type];
 }
 
+bool ggml_cpu_row8_supported(enum ggml_type type) {
+#if defined(__AVX2__)
+    switch (type) {
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q2_0:
+            return type_traits_cpu[type].vec_dot_type == GGML_TYPE_Q8_K || type_traits_cpu[type].vec_dot_type == GGML_TYPE_Q8_0;
+        default:
+            return false;
+    }
+#else
+    GGML_UNUSED(type);
+    return false;
+#endif
+}
+
+bool ggml_cpu_row8_unpack(enum ggml_type type, const void * row, int64_t n, int8_t * q, int16_t * sc, float * d) {
+#if defined(__AVX2__)
+    return ggml_row8_unpack_avx2(type, row, n, q, sc, d);
+#else
+    GGML_UNUSED(type); GGML_UNUSED(row); GGML_UNUSED(n); GGML_UNUSED(q); GGML_UNUSED(sc); GGML_UNUSED(d);
+    return false;
+#endif
+}
+
+void ggml_cpu_row8_dot(enum ggml_type vdt, const int8_t * q, const int16_t * sc, const float * d,
+                       const void * const * ys, int k, int64_t n, float * out) {
+#if defined(__AVX2__)
+    ggml_row8_dot_avx2(vdt, q, sc, d, ys, k, n, out);
+#else
+    GGML_UNUSED(vdt); GGML_UNUSED(q); GGML_UNUSED(sc); GGML_UNUSED(d); GGML_UNUSED(ys); GGML_UNUSED(k); GGML_UNUSED(n); GGML_UNUSED(out);
+    GGML_ABORT("fatal error");
+#endif
+}
+
 //
 // Threading defs
 //

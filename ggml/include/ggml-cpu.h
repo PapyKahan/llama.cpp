@@ -123,6 +123,16 @@ extern "C" {
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
 
+    // A row of n weights unpacked once for several dot products: its signed int8 weights q[n], an integer scale per 16
+    // weights sc[n/16] and a float scale per 32 d[n/32], w[i] = d[i/32]*sc[i/16]*q[i]. False if the type has no unpacker
+    // on this CPU.
+    GGML_BACKEND_API bool ggml_cpu_row8_supported(enum ggml_type type);
+    GGML_BACKEND_API bool ggml_cpu_row8_unpack(enum ggml_type type, const void * row, int64_t n, int8_t * q, int16_t * sc, float * d);
+    // out[j], j < k: the dot product of an unpacked row with the n activations ys[j], quantized to vdt, the vec_dot_type
+    // of its type (Q8_K or Q8_0)
+    GGML_BACKEND_API void ggml_cpu_row8_dot(enum ggml_type vdt, const int8_t * q, const int16_t * sc, const float * d,
+                                            const void * const * ys, int k, int64_t n, float * out);
+
     GGML_BACKEND_API void ggml_cpu_init(void);
 
     //
