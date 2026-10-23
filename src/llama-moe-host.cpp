@@ -115,6 +115,8 @@ llama_moe_host::mailbox_layout llama_moe_host::layout(int32_t max_tokens, int32_
     res.off_x     = take((size_t) max_tokens*n_embd*sizeof(float));
     res.off_y     = take((size_t) max_tokens*n_embd*sizeof(float));
     res.off_table = take((size_t) n_layer*n_expert*sizeof(int32_t));
+    res.off_yh    = take((size_t) max_tokens*n_embd*sizeof(ggml_fp16_t));
+    res.off_yflag = take((size_t) max_tokens*sizeof(int32_t));
     res.size      = off;
     return res;
 }
@@ -176,6 +178,35 @@ struct llama_moe_host::impl {
     };
     std::vector<row8_buf> r8;
 
+    // whole large batches (add_batch_mailbox): the entries of each expert the host computes, its busiest experts first,
+    // each worker taking an expert and passing over its rows once per batch_chunk entries; a token's row of y is
+    // written by the first expert that reaches it and added to by the others, under the token's lock
+    static constexpr int32_t batch_chunk = 64;
+    int32_t                  max_batch = 0;
+    std::vector<int32_t>     b_cnt;     // [n_expert]
+    std::vector<int32_t>     b_first;   // [n_expert]
+    std::vector<int32_t>     b_experts;
+    std::vector<int32_t>     b_items;   // expert*n_chunks_max + chunk, the busiest experts' chunks first
+    std::vector<int32_t>     b_tok;     // [entries]
+    std::vector<float>       b_w;       // [entries]
+    std::vector<uint8_t>     b_has;     // [max_batch]
+    std::vector<int32_t>     b_toks;    // tokens with entries
+    std::vector<uint8_t>     b_qx[2];   // [max_batch][qx_row]
+    std::unique_ptr<std::atomic<uint8_t>[]> b_lock; // [max_batch]
+    std::vector<uint8_t>     b_touched; // [max_batch]
+    struct batch_buf {
+        std::vector<float>   g;  // [batch_chunk][n_ff]
+        std::vector<float>   u;  // [batch_chunk][n_ff]
+        std::vector<uint8_t> qa; // [batch_chunk][qh_row]
+        std::vector<float>   o;  // [batch_chunk][n_embd]
+    };
+    std::vector<batch_buf>   bb;        // per thread
+    std::atomic<int32_t>     b_next[3];
+    ggml_from_float_t        q80_from_float = nullptr;
+    ggml_fp16_t *            cur_yh = nullptr;
+    bool                     cur_batch = false;
+    uint64_t st_breq = 0, st_bexperts = 0, st_bentries = 0, st_bns = 0;
+
     // the request being computed
     const moe_host_layer * cur   = nullptr;
     const float *          cur_x = nullptr;
@@ -205,6 +236,7 @@ struct llama_moe_host::impl {
     static constexpr int max_mailboxes = 16;
     std::thread                  service;
     char *                       mailboxes[max_mailboxes] = {};
+    bool                         is_batch[max_mailboxes]  = {};
     int32_t                      last_seq[max_mailboxes]  = {};
     std::atomic<int>             n_mailboxes{0};
     std::atomic<bool>            quit{false};
@@ -307,8 +339,8 @@ struct llama_moe_host::impl {
             b.q.resize(n);
             b.sc.resize(n/16);
             b.d.resize(n/32);
-            b.ys.resize(max_tokens);
-            b.out.resize(max_tokens);
+            b.ys.resize(std::max(max_tokens, batch_chunk));
+            b.out.resize(std::max(max_tokens, batch_chunk));
         }
         for (auto & n : next) {
             n.store(0);
@@ -396,6 +428,10 @@ struct llama_moe_host::impl {
     }
 
     void run_job(int ith) {
+        if (cur_batch) {
+            run_job_batch(ith);
+            return;
+        }
         const moe_host_layer & l = *cur;
         const int n_x = l.n_x;
 
@@ -494,6 +530,247 @@ struct llama_moe_host::impl {
                 }
             }
         }
+    }
+
+    // one row of m for the entries [q0, q0 + k), whose inputs are ys; out[j] for entry q0 + j
+    // q80: the inputs are Q8_0 whatever the type, for its unpacked rows
+    static void batch_rows(const moe_host_mat & m, const char * w, int32_t n_in, int32_t r0, int32_t r1, const void ** ys,
+            int32_t k, row8_buf & b, float * dst, int32_t dst_stride, bool q80 = false) {
+        const bool unpack = q80 || (m.row8_min > 0 && k >= m.row8_min);
+        for (int32_t r = r0; r < r1; ++r) {
+            const char * wr = w + (size_t) r*m.nb1;
+            if (unpack) {
+                ggml_cpu_row8_unpack(m.type, wr, n_in, b.q.data(), b.sc.data(), b.d.data());
+                ggml_cpu_row8_dot(q80 ? GGML_TYPE_Q8_0 : m.vdt, b.q.data(), b.sc.data(), b.d.data(), ys, k, n_in, b.out.data());
+                for (int32_t j = 0; j < k; ++j) {
+                    dst[(size_t) j*dst_stride + r] = b.out[j];
+                }
+            } else {
+                for (int32_t j = 0; j < k; ++j) {
+                    float v;
+                    m.dot(n_in, &v, 0, wr, 0, ys[j], 0, 1);
+                    dst[(size_t) j*dst_stride + r] = v;
+                }
+            }
+        }
+    }
+
+    void run_job_batch(int ith) {
+        const moe_host_layer & l = *cur;
+        const int n_x = l.n_x;
+
+        // the inputs of the tokens with entries, quantized for gate and up: to Q8_0 when both unpack their rows, whose
+        // scale per 32 inputs is closer to the device's activations than the vec_dot types' per 256
+        const bool    q80 = l.m[0].row8_min > 0 && l.m[1].row8_min > 0;
+        const int     n_xq = q80 ? 1 : n_x;
+        const int32_t n_q  = (int32_t) b_toks.size()*n_xq;
+        for (int32_t i; (i = b_next[0].fetch_add(1, std::memory_order_relaxed)) < n_q; ) {
+            const int     xs = i % n_xq;
+            const int32_t t  = b_toks[i / n_xq];
+            if (q80) {
+                q80_from_float(cur_x + (size_t) t*n_embd, b_qx[0].data() + (size_t) t*qx_row, n_embd);
+                continue;
+            }
+            const moe_host_mat & m = l.m[xs == l.x_slot[0] ? 0 : 1];
+            m.quantize(cur_x + (size_t) t*n_embd, b_qx[xs].data() + (size_t) t*qx_row, n_embd);
+        }
+        bar.wait();
+
+        row8_buf  & b  = r8[ith];
+        batch_buf & bf = bb[ith];
+        const void * ys[batch_chunk];
+        const int32_t n_chunks_max = (max_batch + batch_chunk - 1)/batch_chunk;
+        for (int32_t i; (i = b_next[1].fetch_add(1, std::memory_order_relaxed)) < (int32_t) b_items.size(); ) {
+            const int32_t e     = b_items[i] / n_chunks_max;
+            const int32_t c0    = (b_items[i] % n_chunks_max)*batch_chunk;
+            const int32_t count = b_cnt[e];
+            {
+                const int32_t k  = std::min(batch_chunk, count - c0);
+                const int32_t q0 = b_first[e] + c0;
+
+                // gate and up
+                for (int mi = 0; mi < 2; ++mi) {
+                    const moe_host_mat & m = l.m[mi];
+                    const uint8_t * qxs = b_qx[q80 ? 0 : l.x_slot[mi]].data();
+                    for (int32_t j = 0; j < k; ++j) {
+                        ys[j] = qxs + (size_t) b_tok[q0 + j]*qx_row;
+                    }
+                    batch_rows(m, m.data + (size_t) e*m.nb2, n_embd, 0, n_ff, ys, k, b, mi == 0 ? bf.g.data() : bf.u.data(), n_ff, q80);
+                }
+
+                // the activation, quantized for down
+                const moe_host_mat & md = l.m[2];
+                for (int32_t j = 0; j < k; ++j) {
+                    float       * gq = bf.g.data() + (size_t) j*n_ff;
+                    const float * uq = bf.u.data() + (size_t) j*n_ff;
+                    if (l.limit > 0.0f) {
+                        for (int32_t r = 0; r < n_ff; ++r) {
+                            gq[r] = std::min(silu(gq[r]), l.limit)*std::clamp(uq[r], -l.limit, l.limit);
+                        }
+                    } else {
+                        for (int32_t r = 0; r < n_ff; ++r) {
+                            gq[r] = silu(gq[r])*uq[r];
+                        }
+                    }
+                    md.quantize(gq, bf.qa.data() + (size_t) j*qh_row, n_ff);
+                    ys[j] = bf.qa.data() + (size_t) j*qh_row;
+                }
+
+                // down, then into the rows of y
+                batch_rows(md, md.data + (size_t) e*md.nb2, n_ff, 0, n_embd, ys, k, b, bf.o.data(), n_embd);
+                for (int32_t j = 0; j < k; ++j) {
+                    const int32_t t = b_tok[q0 + j];
+                    const float   w = b_w[q0 + j];
+                    const float * o = bf.o.data() + (size_t) j*n_embd;
+                    float       * y = cur_y + (size_t) t*n_embd;
+                    std::atomic<uint8_t> & lk = b_lock[t];
+                    while (lk.exchange(1, std::memory_order_acquire)) {
+                        LLAMA_MOE_HOST_PAUSE();
+                    }
+                    if (b_touched[t]) {
+                        for (int32_t r = 0; r < n_embd; ++r) {
+                            y[r] += w*o[r];
+                        }
+                    } else {
+                        for (int32_t r = 0; r < n_embd; ++r) {
+                            y[r] = w*o[r];
+                        }
+                        b_touched[t] = 1;
+                    }
+                    lk.store(0, std::memory_order_release);
+                }
+            }
+        }
+        bar.wait();
+
+        // the answer of the tokens with entries, in half precision: the device reads only the rows the host flags
+        for (int32_t i; (i = b_next[2].fetch_add(1, std::memory_order_relaxed)) < (int32_t) b_toks.size(); ) {
+            const int32_t t = b_toks[i];
+            ggml_cpu_fp32_to_fp16(cur_y + (size_t) t*n_embd, cur_yh + (size_t) t*n_embd, n_embd);
+        }
+    }
+
+    // a whole large batch: the entries the device marks -1, grouped by expert; no tail skip, a prompt is computed whole
+    int32_t serve_batch(char * mb, int32_t seq) {
+        int32_t * hdr = (int32_t *) mb;
+        const int32_t il       = hdr[GGML_MOE_HOST_REQ_LAYER];
+        const int32_t n_tokens = hdr[GGML_MOE_HOST_REQ_N_TOKENS];
+        auto answer = [&](int32_t has_y) {
+            hdr[GGML_MOE_HOST_RESP_HAS_Y] = has_y;
+            __atomic_store_n(hdr + GGML_MOE_HOST_RESP_SEQ, seq, __ATOMIC_RELEASE);
+        };
+        if (il < 0 || il >= n_layer || !layers[il].on || n_tokens <= 0 || n_tokens > max_batch || hdr[GGML_MOE_HOST_REQ_N_USED] != n_used) {
+            if (!warned) {
+                LLAMA_LOG_ERROR("llama_moe_host: invalid batch request: layer %d, %d tokens, %d experts per token\n", il, n_tokens, hdr[GGML_MOE_HOST_REQ_N_USED]);
+                warned = true;
+            }
+            answer(0);
+            return -1;
+        }
+        const mailbox_layout bl = layout(max_batch, n_used, n_embd, n_layer, n_expert);
+        const int32_t * ids   = (const int32_t *) (mb + bl.off_ids);
+        const int32_t * slots = (const int32_t *) (mb + bl.off_slots);
+        const float   * w     = (const float   *) (mb + bl.off_w);
+        const int32_t   n     = n_tokens*n_used;
+
+        if (b_lock == nullptr) {
+            q80_from_float = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0)->from_float;
+            GGML_ASSERT(ggml_row_size(GGML_TYPE_Q8_0, n_embd) <= qx_row);
+            b_lock.reset(new std::atomic<uint8_t>[max_batch]);
+            for (int32_t t = 0; t < max_batch; ++t) {
+                b_lock[t].store(0);
+            }
+            b_touched.resize(max_batch);
+            b_has.resize(max_batch);
+            b_cnt.resize(n_expert);
+            b_first.resize(n_expert);
+            b_tok.resize((size_t) max_batch*n_used);
+            b_w.resize((size_t) max_batch*n_used);
+            for (auto & q : b_qx) {
+                q.resize((size_t) max_batch*qx_row);
+            }
+            bb.resize(n_workers + 1);
+            for (batch_buf & bf : bb) {
+                bf.g.resize((size_t) batch_chunk*n_ff);
+                bf.u.resize((size_t) batch_chunk*n_ff);
+                bf.qa.resize((size_t) batch_chunk*qh_row);
+                bf.o.resize((size_t) batch_chunk*n_embd);
+            }
+        }
+
+        // a counting sort of the entries by expert
+        std::fill(b_cnt.begin(), b_cnt.end(), 0);
+        int32_t n_ent = 0;
+        for (int32_t i = 0; i < n; ++i) {
+            if (slots[i] < 0) {
+                b_cnt[ids[i]]++;
+                n_ent++;
+            }
+        }
+        if (n_ent == 0) {
+            answer(0);
+            return il;
+        }
+        b_experts.clear();
+        for (int32_t e = 0, pos = 0; e < n_expert; ++e) {
+            b_first[e] = pos;
+            pos += b_cnt[e];
+            if (b_cnt[e] > 0) {
+                b_experts.push_back(e);
+            }
+        }
+        std::sort(b_experts.begin(), b_experts.end(), [&](int32_t a, int32_t c) { return b_cnt[a] > b_cnt[c]; });
+        // a chunk of an expert per work item: a busy expert spreads over several threads, each passing over its rows
+        const int32_t n_chunks_max = (max_batch + batch_chunk - 1)/batch_chunk;
+        b_items.clear();
+        for (int32_t e : b_experts) {
+            for (int32_t c = 0; c*batch_chunk < b_cnt[e]; ++c) {
+                b_items.push_back(e*n_chunks_max + c);
+            }
+        }
+        std::fill(b_cnt.begin(), b_cnt.end(), 0);
+        std::fill_n(b_has.begin(), n_tokens, 0);
+        for (int32_t i = 0; i < n; ++i) {
+            if (slots[i] < 0) {
+                const int32_t e = ids[i];
+                const int32_t q = b_first[e] + b_cnt[e]++;
+                b_tok[q] = i / n_used;
+                b_w[q]   = w[i];
+                b_has[i / n_used] = 1;
+            }
+        }
+        b_toks.clear();
+        int32_t * yflag = (int32_t *) (mb + bl.off_yflag);
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            if (b_has[t]) {
+                b_toks.push_back(t);
+            }
+            yflag[t]     = b_has[t];
+            b_touched[t] = 0;
+        }
+
+        // the host sums the experts of a token in single precision in y, then writes the flagged rows in half
+        cur          = &layers[il];
+        cur_x        = (const float *) (mb + bl.off_x);
+        cur_y        = (float *) (mb + bl.off_y);
+        cur_yh       = (ggml_fp16_t *) (mb + bl.off_yh);
+        cur_n_tokens = n_tokens;
+        cur_batch    = true;
+        for (auto & nx : b_next) {
+            nx.store(0, std::memory_order_relaxed);
+        }
+
+        const int64_t t0 = moe_host_now_ns();
+        run_all();
+        cur_batch = false;
+
+        st_breq++;
+        st_bexperts += b_experts.size();
+        st_bentries += n_ent;
+        st_bns      += moe_host_now_ns() - t0;
+
+        answer(1);
+        return il;
     }
 
     // returns the layer of the request, -1 if it is invalid
@@ -659,6 +936,12 @@ struct llama_moe_host::impl {
                         st_turn_ns += t_seen - t_answer;
                         st_turn_n++;
                     }
+                    if (is_batch[m]) {
+                        serve_batch(mailboxes[m], seq);
+                        t_answer = moe_host_now_ns();
+                        got = true;
+                        continue;
+                    }
                     const int32_t il = serve(mailboxes[m], seq);
                     t_answer = moe_host_now_ns();
                     st_serve_ns += t_answer - t_seen;
@@ -724,6 +1007,17 @@ void llama_moe_host::add_mailbox(void * mailbox) {
     pimpl->n_mailboxes.store(n + 1, std::memory_order_release);
 }
 
+void llama_moe_host::add_batch_mailbox(void * mailbox, int32_t max_batch) {
+    const int n = pimpl->n_mailboxes.load();
+    GGML_ASSERT(n < impl::max_mailboxes);
+    GGML_ASSERT(pimpl->max_batch == 0 || pimpl->max_batch == max_batch);
+    pimpl->max_batch    = max_batch;
+    pimpl->mailboxes[n] = (char *) mailbox;
+    pimpl->is_batch[n]  = true;
+    pimpl->last_seq[n]  = ((const int32_t *) mailbox)[GGML_MOE_HOST_REQ_SEQ];
+    pimpl->n_mailboxes.store(n + 1, std::memory_order_release);
+}
+
 void llama_moe_host::wake() {
     pimpl->wake();
 }
@@ -758,5 +1052,9 @@ void llama_moe_host::log_stats() const {
         LLAMA_LOG_INFO("llama_moe_host: %llu requests with CPU work: %.2f experts, %.2f entries, %.1f us each on average, %.1f us at most\n",
             (unsigned long long) p.st_req_cpu, (double) p.st_experts/p.st_req_cpu, (double) p.st_entries/p.st_req_cpu,
             p.st_ns/1e3/p.st_req_cpu, p.st_max_ns/1e3);
+    }
+    if (p.st_breq > 0) {
+        LLAMA_LOG_INFO("llama_moe_host: %llu batch requests: %.1f experts, %.1f entries, %.2f ms each on average\n",
+            (unsigned long long) p.st_breq, (double) p.st_bexperts/p.st_breq, (double) p.st_bentries/p.st_breq, p.st_bns/1e6/p.st_breq);
     }
 }

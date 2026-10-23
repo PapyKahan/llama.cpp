@@ -58,12 +58,26 @@ public:
         void *         mailbox   = nullptr;
         int32_t        offs[5]   = {};      // the ids, slots, weights, input and slot table in the mailbox
         int32_t        off_y     = 0;       // the answer in the mailbox
+        int32_t        off_yh    = 0;       // batches: the answer in half precision, and the flags of its rows
+        int32_t        off_yflag = 0;
         int32_t        n_expert  = 0;
         int32_t        zero_base = 0;       // the first zero slot of the bank of the layer
     };
 
     // false if layer il does not run in host mode for n_tokens
     bool get_host_part(int32_t il, int64_t n_tokens, host_part & hp) const;
+
+    // host mode with phases: large batches of up to max_batch tokens may share the experts the core lacks with the host
+    void init_batch(int32_t max_batch);
+
+    // before the graph of a large batch of n_tokens (0 before any other graph): which experts the host computes for it
+    void begin_batch(int64_t n_tokens);
+
+    // false if layer il does not share its batch of n_tokens with the host; the part posts with ggml_moe_host_post_batch
+    bool get_batch_part(int32_t il, int64_t n_tokens, host_part & hp) const;
+
+    // whether the host computes expert e of the host weight w in the current large batch, so it is not uploaded
+    bool host_computes(const ggml_tensor * w, int64_t e) const;
 
     // phases (LLAMA_MOE_CACHE_PREFILL_MIB): the cache lends part of its memory while large batches run
     bool has_phases() const;

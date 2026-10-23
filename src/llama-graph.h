@@ -1095,6 +1095,10 @@ struct llm_graph_context {
     };
     mutable std::map<int, moe_host_wait_info> moe_host_pending;
 
+    // the ids of the layer being built whose negative entries are the experts the host computes for a large batch:
+    // the mul_mat_id that read them leave those rows zero
+    mutable ggml_tensor * moe_negative_ids = nullptr;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;

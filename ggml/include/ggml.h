@@ -1512,6 +1512,10 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // a, the result of ggml_mul_mat_id, may have negative ids: those rows of a are zero (the CPU backend does it for
+    // any negative id, the others only for a result marked so)
+    GGML_API void ggml_mul_mat_id_set_negative_ids(struct ggml_tensor * a);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
@@ -2802,6 +2806,20 @@ extern "C" {
             int32_t               layer,
             int32_t               zero_base);
 
+    // post for a whole large batch: the slot table marks the experts the host computes with -1, the device computes the
+    // others; returns the selected experts with -1 for those the host computes (see ggml_mul_mat_id_set_negative_ids),
+    // writes the ids, weights and table entries from many blocks and copies x to the mailbox asynchronously
+    GGML_API struct ggml_tensor * ggml_moe_host_post_batch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            void                * mailbox,
+            const int32_t       * offsets,
+            int32_t               n_expert,
+            int32_t               layer);
+
     // wait: waits until the host answers the last post, then adds the answer: res = a + y
     //   a:     [n_embd, n_tokens] f32
     //   off_y: byte offset of y [n_embd, n_tokens] in the mailbox
@@ -2812,6 +2830,18 @@ extern "C" {
             struct ggml_tensor  * state,
             void                * mailbox,
             int32_t               off_y);
+
+    // wait for a ggml_moe_host_post_batch: x is its input, read until the asynchronous copy is done; the host sums in
+    // f32 at off_y, the answer is f16 [n_embd, n_tokens] at off_yh, for the tokens whose i32 at off_yflag is not 0
+    GGML_API struct ggml_tensor * ggml_moe_host_wait_batch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            void                * mailbox,
+            int32_t               off_y,
+            int32_t               off_yh,
+            int32_t               off_yflag);
 
     // custom operators
 

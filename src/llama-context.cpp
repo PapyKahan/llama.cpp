@@ -598,6 +598,7 @@ llama_context::llama_context(
                 moe_ubatch_small = std::min(moe_ubatch_small, moe_ubatch_large);
                 LLAMA_LOG_INFO("%s: MoE cache phases: batches of more than %u tokens run in ubatches of %u, the others in ubatches of %u\n",
                     __func__, moe_phase_tokens, moe_ubatch_large, moe_ubatch_small);
+                moe_cache->init_batch((int32_t) moe_ubatch_large);
             }
         }
 
@@ -720,16 +721,22 @@ struct llama_context::expert_prefetch {
             s.t = ggml_new_tensor(s.ctx, src->type, GGML_MAX_DIMS, src->ne);
             ggml_backend_tensor_alloc(s.buf, s.t, ggml_backend_buffer_get_base(s.buf));
 
-            // MMQ reads past the last row of a used expert into the next one: a routed slot leaves the experts the
-            // batch does not use as they were, possibly another quantization type whose bytes decode to NaN scales,
-            // so it is zeroed first
-            if (s.routed) {
-                ggml_backend_tensor_memset(s.t, 0, 0, ggml_nbytes(s.t));
-            }
             const int64_t n_expert    = src->ne[2];
             const size_t  expert_size = src->nb[2];
+            // the experts the host computes for this batch are not uploaded (llama_moe_cache::begin_batch)
+            bool any_host = false;
+            for (int64_t e = 0; e < n_expert && cache != nullptr && !any_host; ++e) {
+                any_host = cache->host_computes(src, e);
+            }
+            // MMQ reads past the last row of a used expert into the next one: a routed slot, or one whose host experts
+            // are not uploaded, leaves experts as they were, possibly another quantization type whose bytes decode to
+            // NaN scales, so it is zeroed first
+            if (s.routed || any_host) {
+                ggml_backend_tensor_memset(s.t, 0, 0, ggml_nbytes(s.t));
+            }
             auto in_cache = [&](int64_t e) {
-                return (s.routed && !s.used[e]) || (cache != nullptr && cache->cached(backend, src, e));
+                return (s.routed && !s.used[e]) ||
+                    (cache != nullptr && (cache->cached(backend, src, e) || (any_host && cache->host_computes(src, e))));
             };
             for (int64_t first = 0; first < n_expert; ) {
                 if (in_cache(first)) {
@@ -951,7 +958,10 @@ struct llama_context::expert_prefetch {
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
+                GGML_ASSERT(id < n_expert);
+                if (id < 0) {
+                    continue; // computed by the host
+                }
                 used[id] = true;
             }
         }
@@ -1989,6 +1999,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // which experts of a large batch the host computes, before the graph is built or reused
+    if (moe_cache) {
+        moe_cache->begin_batch(moe_phase_large ? (int64_t) ubatch.n_tokens : 0);
     }
 
     auto * res = get_gf_res_prev();
@@ -3702,7 +3717,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
+                GGML_ASSERT(id < n_expert);
+                if (id < 0) {
+                    continue; // computed by the host
+                }
                 st.used[id] = true;
             }
         }

@@ -5693,6 +5693,36 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID with skipped entries: negative ids, whose rows of the result are zero (ggml_mul_mat_id_set_negative_ids)
+struct test_mul_mat_id_neg : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",neg=1"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_mul_mat_id_set_negative_ids(out);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                ggml_backend_tensor_get(t, data.data(), r*t->nb[1], t->ne[0]*sizeof(int32_t));
+                for (auto & id : data) {
+                    if (rng() % 5 < 2) {
+                        id = -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r*t->nb[1], t->ne[0]*sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -12162,6 +12192,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
             }
+        }
+    }
+    // experts skipped for the host (negative ids): gate/up broadcast their input, down does not; per-expert scan and sort
+    for (ggml_type type_a : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0}) {
+        for (int n : {64, 600}) {
+            test_cases.emplace_back(new test_mul_mat_id_neg(type_a, GGML_TYPE_F32, 128, 10, true,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_neg(type_a, GGML_TYPE_F32, 128, 10, false, 640, n, 2560));
         }
     }
     // the four-head indexer reading its keys in place by row index: decoding, a verify batch and prefill chunks

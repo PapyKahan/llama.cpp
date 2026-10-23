@@ -3442,6 +3442,11 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_negative_ids(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 0, 1);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -6678,12 +6683,13 @@ struct ggml_tensor * ggml_moe_host_post(
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
 
-    int32_t params[10];
+    int32_t params[11];
     memcpy(params, &mailbox, sizeof(mailbox));
     params[2] = layer;
     params[3] = zero_base;
     memcpy(params + 4, offsets, 5*sizeof(int32_t));
-    params[9] = n_expert;
+    params[9]  = n_expert;
+    params[10] = 0; // a few tokens
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_MOE_HOST_POST;
@@ -6692,6 +6698,21 @@ struct ggml_tensor * ggml_moe_host_post(
     result->src[2] = x;
     result->src[3] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_host_post_batch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * state,
+        void                * mailbox,
+        const int32_t       * offsets,
+        int32_t               n_expert,
+        int32_t               layer) {
+    struct ggml_tensor * result = ggml_moe_host_post(ctx, ids, weights, x, state, mailbox, offsets, n_expert, layer, 0);
+    ggml_set_op_params_i32(result, 10, 1); // a whole batch
     return result;
 }
 
@@ -6710,15 +6731,36 @@ struct ggml_tensor * ggml_moe_host_wait(
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
 
-    int32_t params[3];
+    int32_t params[4];
     memcpy(params, &mailbox, sizeof(mailbox));
     params[2] = off_y;
+    params[3] = 0; // a few tokens
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_MOE_HOST_WAIT;
     result->src[0] = a;
     result->src[1] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_host_wait_batch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * state,
+        void                * mailbox,
+        int32_t               off_y,
+        int32_t               off_yh,
+        int32_t               off_yflag) {
+    struct ggml_tensor * result = ggml_moe_host_wait(ctx, a, state, mailbox, off_y);
+    int32_t params[6];
+    memcpy(params, result->op_params, 3*sizeof(int32_t));
+    params[3] = 1; // a whole batch
+    params[4] = off_yh;
+    params[5] = off_yflag;
+    ggml_set_op_params(result, params, sizeof(params));
+    result->src[2] = x;
     return result;
 }
 

@@ -466,6 +466,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     int64_t  host_begin_ns   = 0; // spent before the graphs, publishing and planning
     int64_t  host_n_plans    = 0;
     int32_t  host_n_expert   = 0;
+    int32_t  host_n_embd     = 0;
     std::unique_ptr<llama_moe_host> host;
     llama_moe_host::mailbox_layout  host_lay;
     struct host_device {
@@ -474,6 +475,14 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         void (*mailbox_free)(void *) = nullptr;
         int32_t * table_host = nullptr; // [n_layer*n_expert] in the mailbox, read by the graphs started afterwards
         size_t in_flight = 0;           // experts being uploaded
+
+        // large batches shared with the host (init_batch): their own mailbox, state and table, -1 for the experts the
+        // host computes
+        ggml_context_ptr        batch_ctx;
+        ggml_backend_buffer_ptr batch_buf;
+        ggml_tensor *           batch_state   = nullptr;
+        void *                  batch_mailbox = nullptr;
+        int32_t *               batch_table   = nullptr;
     };
     std::vector<host_device> hdev;
 
@@ -507,6 +516,21 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     bool    prefill      = true; // the current phase, a context starts with large batches
     std::vector<publication> lent; // the experts of the lent slots, admitted again into them when small batches return
     size_t  n_readmitted = 0;
+
+    // large batches shared with the host (LLAMA_MOE_BATCH_CPU, host mode with phases): for the graph of a large batch
+    // the host computes the least selected of the experts the core lacks, for all the tokens of the batch, while the
+    // device uploads and computes the others; the share balances the host's rate against the upload rate
+    llama_moe_host::mailbox_layout batch_lay;
+    int32_t              batch_max     = 0;
+    int64_t              batch_tokens  = 0;     // the batch the host takes part in, 0 if none
+    float                batch_force   = -1.0f; // LLAMA_MOE_BATCH_CPU=<share>: a fixed share of the experts the core lacks
+    float                batch_cap     = 0.25f; // LLAMA_MOE_BATCH_CPU_MAX: the largest share, the host's experts round
+                                                // their inputs otherwise than the device's MMQ and the gap grows with it
+    int                  batch_threads = 1;
+    std::vector<uint8_t> batch_cpu;             // [n_layer*n_expert] the host computes the expert in the current batch
+    size_t               batch_n_cpu   = 0;
+    uint64_t             batch_graphs  = 0;
+    double               batch_share   = 0.0;   // sum of the shares, for the log
 
     // LLAMA_MOE_CACHE_PROFILE=<file>, host mode: the selection counts of the past sessions; the cache starts with the
     // experts they count most, and the counts of this session are added to the file when the cache is destroyed
@@ -1135,6 +1159,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         host_decay      = std::clamp(env_f("LLAMA_MOE_HOST_DECAY", host_decay), 0.0f, 1.0f);
         host_hyst       = std::max(1.0f, env_f("LLAMA_MOE_HOST_HYST", host_hyst));
         const int n_threads = std::max(1, env_i("LLAMA_MOE_HOST_THREADS", std::max(1, (int) std::thread::hardware_concurrency()/2 - 1)));
+        batch_threads = n_threads;
 
         const int32_t n_layer = (int32_t) layers.size();
         int32_t n_embd = 0;
@@ -1153,6 +1178,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             }
         }
         host_lay = llama_moe_host::layout(host_max_tokens, n_expert_used, n_embd, n_layer, host_n_expert);
+        host_n_embd = n_embd;
 
         for (size_t id = 0; id < hdev.size(); ++id) {
             host_device & hd = hdev[id];
@@ -1511,6 +1537,172 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         svc_pos = 0;
     }
 
+    void init_batch(int32_t max_batch) {
+        if (!host || !phases || max_batch <= host_max_tokens) {
+            return;
+        }
+        if (const char * v = getenv("LLAMA_MOE_BATCH_CPU"); v != nullptr && *v != '\0') {
+            batch_force = std::clamp((float) atof(v), 0.0f, 1.0f);
+            if (batch_force == 0.0f) {
+                return;
+            }
+        }
+        if (const char * v = getenv("LLAMA_MOE_BATCH_CPU_MAX"); v != nullptr && *v != '\0') {
+            batch_cap = std::clamp((float) atof(v), 0.0f, 1.0f);
+        }
+        const int32_t n_layer = (int32_t) layers.size();
+        batch_lay = llama_moe_host::layout(max_batch, n_expert_used, host_n_embd, n_layer, host_n_expert);
+        for (size_t id = 0; id < hdev.size(); ++id) {
+            host_device & hd = hdev[id];
+            if (hd.mailbox == nullptr) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[id].backend));
+            auto * alloc_fn = (void * (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_alloc");
+            hd.batch_mailbox = alloc_fn != nullptr ? alloc_fn(batch_lay.size) : nullptr;
+            if (hd.batch_mailbox == nullptr) {
+                LLAMA_LOG_WARN("%s: no mapped host memory for the batches shared with the host\n", __func__);
+                return;
+            }
+            hd.batch_table = (int32_t *) ((char *) hd.batch_mailbox + batch_lay.off_table);
+            std::fill(hd.batch_table, hd.batch_table + (size_t) n_layer*host_n_expert, 0);
+
+            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            hd.batch_ctx.reset(ggml_init(params));
+            hd.batch_state = ggml_new_tensor_1d(hd.batch_ctx.get(), GGML_TYPE_I32, 8);
+            ggml_format_name(hd.batch_state, "moe_cache.batch_state");
+            hd.batch_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(hd.batch_ctx.get(), devices[id].buft));
+            if (!hd.batch_buf) {
+                LLAMA_LOG_WARN("%s: no device memory for the state of the batches shared with the host\n", __func__);
+                return;
+            }
+            ggml_backend_buffer_clear(hd.batch_buf.get(), 0);
+            host->add_batch_mailbox(hd.batch_mailbox, max_batch);
+        }
+        batch_max = max_batch;
+        batch_cpu.assign((size_t) n_layer*host_n_expert, 0);
+        LLAMA_LOG_INFO("%s: large batches of up to %d tokens share the experts the core lacks with the host (%.1f MiB of mapped host memory)\n",
+            __func__, max_batch, batch_lay.size/1024.0/1024.0);
+    }
+
+    // the share of the n_lacking experts the core lacks in a layer that the host computes for a batch of n_tokens: an
+    // expert the host takes saves its upload, so the share balances the uploads against the host's time for the experts
+    // (each unpacked once per chunk of tokens, then multiplied per token), and stops where the device's own compute
+    // becomes the longer part: beyond that the host only adds memory traffic
+    float batch_share_for(int64_t n_tokens, size_t n_lacking, size_t expert_bytes) const {
+        if (batch_force >= 0.0f) {
+            return batch_force;
+        }
+        if (n_lacking == 0) {
+            return 0.0f;
+        }
+        const double t_e     = (double) n_tokens*n_expert_used/host_n_expert;               // tokens per expert, on average
+        const double host_e  = (0.36e-3*std::ceil(t_e/64.0) + 0.09e-3*t_e)/batch_threads; // s per expert on the host
+        const double upload  = (double) n_lacking*expert_bytes/15e9;                      // s per layer
+        const double compute = (double) n_tokens*0.5e-3/layers.size();                    // s per layer on the device
+        if (compute >= upload) {
+            return 0.0f;
+        }
+        const double balance = upload/(upload + n_lacking*host_e);
+        return (float) std::min({ balance, 1.0 - compute/upload, (double) batch_cap });
+    }
+
+    void begin_batch(int64_t n_tokens) {
+        batch_tokens = 0;
+        if (batch_max == 0 || !(phases && prefill) || n_tokens <= host_max_tokens || n_tokens > batch_max) {
+            return;
+        }
+        const int32_t ne = host_n_expert;
+        std::fill(batch_cpu.begin(), batch_cpu.end(), 0);
+        batch_n_cpu = 0;
+        std::vector<int32_t> lacking;
+        float share = 0.0f;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            size_t expert_bytes = 0;
+            for (const ggml_tensor * t : g.ref) {
+                expert_bytes += t->nb[2];
+            }
+            for (int32_t il : g.layers) {
+                int32_t * table = hdev[g.id].batch_table;
+                if (table == nullptr) {
+                    continue;
+                }
+                const int32_t * slots = g.slru.slot_map[il];
+                lacking.clear();
+                for (int32_t e = 0; e < ne; ++e) {
+                    table[(size_t) il*ne + e] = 0;
+                    if (slots[e] >= g.slru.n_slots) {
+                        lacking.push_back(e);
+                    }
+                }
+                // the least selected first: they cost the host the least per expert, an upload costs the same for all
+                const auto pop = [&](int32_t e) {
+                    const size_t key = (size_t) il*ne + e;
+                    return !profile.empty() ? profile[key] : host_score[key];
+                };
+                const float share_il = batch_share_for(n_tokens, lacking.size(), expert_bytes);
+                share = std::max(share, share_il);
+                const size_t n_cpu = std::min(lacking.size(), (size_t) std::lround(share_il*lacking.size()));
+                std::partial_sort(lacking.begin(), lacking.begin() + n_cpu, lacking.end(),
+                    [&](int32_t a, int32_t b) { return pop(a) < pop(b); });
+                for (size_t i = 0; i < n_cpu; ++i) {
+                    const size_t key = (size_t) il*ne + lacking[i];
+                    batch_cpu[key] = 1;
+                    table[key] = -1;
+                }
+                batch_n_cpu += n_cpu;
+            }
+        }
+        // the graph of a batch shares it with the host whenever the share is positive, so a graph reused for a batch of
+        // the same size has the same posts even if no expert goes to the host this time
+        if (share <= 0.0f) {
+            return;
+        }
+        batch_tokens = n_tokens;
+        batch_graphs++;
+        batch_share += share;
+    }
+
+    bool get_batch_part(int32_t il, int64_t n_tokens, llama_moe_cache::host_part & hp) const {
+        if (batch_tokens == 0 || n_tokens != batch_tokens || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return false;
+        }
+        const group & g = groups[layers[il].ig];
+        const host_device & hd = hdev[g.id];
+        if (hd.batch_mailbox == nullptr) {
+            return false;
+        }
+        hp.backend   = devices[g.id].backend;
+        hp.state     = hd.batch_state;
+        hp.mailbox   = hd.batch_mailbox;
+        hp.offs[0]   = batch_lay.off_ids;
+        hp.offs[1]   = batch_lay.off_slots;
+        hp.offs[2]   = batch_lay.off_w;
+        hp.offs[3]   = batch_lay.off_x;
+        hp.offs[4]   = batch_lay.off_table;
+        hp.off_y     = batch_lay.off_y;
+        hp.off_yh    = batch_lay.off_yh;
+        hp.off_yflag = batch_lay.off_yflag;
+        hp.n_expert  = host_n_expert;
+        hp.zero_base = 0;
+        return true;
+    }
+
+    bool host_computes(const ggml_tensor * w, int64_t e) const {
+        if (batch_tokens == 0) {
+            return false;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return false;
+        }
+        return batch_cpu[(size_t) it->second.il*host_n_expert + e] != 0;
+    }
+
     bool get_host_part(int32_t il, int64_t n_tokens, llama_moe_cache::host_part & hp) const {
         if (!host || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens <= 0 || n_tokens > host_max_tokens) {
             return false;
@@ -1757,11 +1949,18 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %zu admitted again after large batches, %lld graphs, %.1f us before each graph\n",
                     host_n_fills + svc_n_fills, host_n_swaps + svc_n_swaps, n_readmitted, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
             }
+            if (batch_graphs > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: %llu large batches shared with the host, %.0f%% of the experts the core lacks on average\n",
+                    (unsigned long long) batch_graphs, 100.0*batch_share/batch_graphs);
+            }
             host.reset();
         }
         for (host_device & hd : hdev) {
             if (hd.mailbox != nullptr && hd.mailbox_free != nullptr) {
                 hd.mailbox_free(hd.mailbox);
+            }
+            if (hd.batch_mailbox != nullptr && hd.mailbox_free != nullptr) {
+                hd.mailbox_free(hd.batch_mailbox);
             }
         }
         for (ggml_backend_buffer_t buf : bank_bufs) {
@@ -2139,6 +2338,22 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
     return pimpl->cached(backend, w, e);
+}
+
+void llama_moe_cache::init_batch(int32_t max_batch) {
+    pimpl->init_batch(max_batch);
+}
+
+void llama_moe_cache::begin_batch(int64_t n_tokens) {
+    pimpl->begin_batch(n_tokens);
+}
+
+bool llama_moe_cache::get_batch_part(int32_t il, int64_t n_tokens, host_part & hp) const {
+    return pimpl->get_batch_part(il, n_tokens, hp);
+}
+
+bool llama_moe_cache::host_computes(const ggml_tensor * w, int64_t e) const {
+    return pimpl->host_computes(w, e);
 }
 
 bool llama_moe_cache::get_host_part(int32_t il, int64_t n_tokens, host_part & hp) const {

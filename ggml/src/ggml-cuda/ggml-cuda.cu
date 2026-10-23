@@ -2136,7 +2136,41 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// the rows of the entries whose expert id is negative were skipped: they are zero, as the CPU backend leaves them
+static __global__ void k_mul_mat_id_zero_negative(
+        const char * __restrict__ ids, const int64_t ids_nb0, const int64_t ids_nb1,
+        char * __restrict__ dst, const int64_t nb1, const int64_t nb2, const int ne0, const int n_used, const int n) {
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        const int k = i % n_used;
+        const int t = i / n_used;
+        if (*(const int32_t *) (ids + k*ids_nb0 + t*ids_nb1) >= 0) {
+            continue;
+        }
+        float * row = (float *) (dst + k*nb1 + t*nb2);
+        for (int j = threadIdx.x; j < ne0; j += blockDim.x) {
+            row[j] = 0.0f;
+        }
+    }
+}
+
+static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_id_impl(ctx, dst);
+    // ggml_mul_mat_id_set_negative_ids
+    if (ggml_get_op_params_i32(dst, 0) != 0) {
+        const ggml_tensor * ids = dst->src[2];
+        const int64_t n = ids->ne[0]*ids->ne[1];
+        GGML_ASSERT(n < INT_MAX && ids->ne[2] == 1 && ids->ne[3] == 1 && dst->ne[3] == 1);
+        const int n_blocks = (int) std::min<int64_t>(n, 8*ggml_cuda_info().devices[ctx.device].nsm);
+        k_mul_mat_id_zero_negative<<<n_blocks, 128, 0, ctx.stream()>>>(
+            (const char *) ids->data, ids->nb[0], ids->nb[1], (char *) dst->data, dst->nb[1], dst->nb[2], (int) dst->ne[0],
+            (int) ids->ne[0], (int) n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2813,6 +2847,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        // a batch post copies on a stream of its own, outside of the graph's
+        if (node->op == GGML_OP_MOE_HOST_POST && ggml_get_op_params_i32(node, 10) != 0) {
+            use_cuda_graph = false;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]

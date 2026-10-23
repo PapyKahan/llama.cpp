@@ -28,6 +28,8 @@ public:
         int32_t off_x;     // f32 [max_tokens*n_embd]
         int32_t off_y;     // f32 [max_tokens*n_embd]
         int32_t off_table; // i32 [n_layer*n_expert], the slot of each expert in the device cache, -1 if not cached
+        int32_t off_yh;    // f16 [max_tokens*n_embd], batch requests: the answer of the tokens it flags
+        int32_t off_yflag; // i32 [max_tokens], batch requests: 1 if the host computed part of the token, 0 if not
         size_t  size;
     };
 
@@ -44,6 +46,10 @@ public:
 
     // serves a mailbox of the given layout from now on; it must stay allocated until the destruction
     void add_mailbox(void * mailbox);
+
+    // serves a mailbox of layout(max_batch, ...) from now on, for whole large batches (ggml_moe_host_post_batch): the
+    // host computes the entries the device marks -1, one expert at a time for all its tokens
+    void add_batch_mailbox(void * mailbox, int32_t max_batch);
 
     // makes the service thread poll without sleeping for a while: call before a graph that posts requests
     void wake();

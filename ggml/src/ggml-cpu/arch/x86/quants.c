@@ -4354,16 +4354,17 @@ static void row8_dot_q8_K_##K(const int8_t * q, const int16_t * sc, const float 
     }                                                                                                                  \
     for (int u = 0; u < K; ++u) out[u] = hsum_float_8(accf[u]);                                                        \
 }                                                                                                                      \
-static void row8_dot_q8_0_##K(const int8_t * q, const float * d, const block_q8_0 * const * y, int64_t n, float * out) { \
-    const __m256i ones = _mm256_set1_epi16(1);                                                                         \
+static void row8_dot_q8_0_##K(const int8_t * q, const int16_t * sc, const float * d, const block_q8_0 * const * y,     \
+        int64_t n, float * out) {                                                                                      \
     __m256 accf[K];                                                                                                    \
     for (int u = 0; u < K; ++u) accf[u] = _mm256_setzero_ps();                                                         \
     for (int64_t i = 0; i < n/QK8_0; ++i) {                                                                            \
-        const __m256i vq = _mm256_loadu_si256((const __m256i *) (q + 32*i));                                           \
-        const __m256i aq = _mm256_sign_epi8(vq, vq);                                                                   \
+        const __m256i vq  = _mm256_loadu_si256((const __m256i *) (q + 32*i));                                          \
+        const __m256i aq  = _mm256_sign_epi8(vq, vq);                                                                  \
+        const __m256i s16 = _mm256_set_m128i(_mm_set1_epi16(sc[2*i + 1]), _mm_set1_epi16(sc[2*i]));                    \
         for (int u = 0; u < K; ++u) {                                                                                  \
             const __m256i vy = _mm256_loadu_si256((const __m256i *) y[u][i].qs);                                       \
-            const __m256i p  = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(vy, vq)), ones);            \
+            const __m256i p  = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(vy, vq)), s16);             \
             accf[u] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d[i]*GGML_CPU_FP16_TO_FP32(y[u][i].d)), accf[u]); \
         }                                                                                                              \
     }                                                                                                                  \
@@ -4391,10 +4392,10 @@ void ggml_row8_dot_avx2(enum ggml_type vdt, const int8_t * GGML_RESTRICT q, cons
             GGML_ASSERT(vdt == GGML_TYPE_Q8_0);
             const block_q8_0 * const * y = (const block_q8_0 * const *) (ys + j);
             switch (kk) {
-                case 1: row8_dot_q8_0_1(q, d, y, n, out + j); break;
-                case 2: row8_dot_q8_0_2(q, d, y, n, out + j); break;
-                case 3: row8_dot_q8_0_3(q, d, y, n, out + j); break;
-                default: row8_dot_q8_0_4(q, d, y, n, out + j); break;
+                case 1: row8_dot_q8_0_1(q, sc, d, y, n, out + j); break;
+                case 2: row8_dot_q8_0_2(q, sc, d, y, n, out + j); break;
+                case 3: row8_dot_q8_0_3(q, sc, d, y, n, out + j); break;
+                default: row8_dot_q8_0_4(q, sc, d, y, n, out + j); break;
             }
         }
     }

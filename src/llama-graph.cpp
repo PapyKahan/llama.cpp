@@ -1812,6 +1812,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+    if (slots == nullptr && ids != nullptr && ids == moe_negative_ids) {
+        ggml_mul_mat_id_set_negative_ids(res);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2455,13 +2458,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // in host mode, the device computes the experts of the layer that it caches and the host the others: the device posts
     // the request first, so that the host computes while the device does
     llama_moe_cache::host_part host_part;
-    const bool host = moe_cache != nullptr && type_op == LLM_FFN_SILU && gate_exps != nullptr && gate_up_exps == nullptr &&
+    const bool host_ok = moe_cache != nullptr && type_op == LLM_FFN_SILU && gate_exps != nullptr && gate_up_exps == nullptr &&
         !weight_before_ffn && loras->empty() && up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
         up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr && post_exp_norm == nullptr &&
         moe_cache->get_experts(up_exps) != nullptr && moe_cache->get_experts(gate_exps) != nullptr &&
         moe_cache->get_experts(down_exps) != nullptr &&
-        std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; }) &&
-        moe_cache->get_host_part(il, n_tokens, host_part);
+        std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; });
+    const bool host = host_ok && moe_cache->get_host_part(il, n_tokens, host_part);
+
+    // a large batch: the host computes, for all its tokens, the experts the cache marks for it, the device the others
+    llama_moe_cache::host_part batch_part;
+    const bool batch = host_ok && !host && moe_cache->get_batch_part(il, n_tokens, batch_part);
+    ggml_tensor * batch_x = nullptr;
+    moe_negative_ids = nullptr;
+    if (batch) {
+        ggml_tensor * w2d = ggml_reshape_2d(ctx0, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), n_expert_used, n_tokens);
+        batch_x = cur;
+        ggml_tensor * ids_dev = ggml_moe_host_post_batch(ctx0, selected_experts, w2d, cur, batch_part.state, batch_part.mailbox,
+            batch_part.offs, batch_part.n_expert, il);
+        ggml_backend_sched_set_tensor_backend(sched, ids_dev, batch_part.backend);
+        cb(ids_dev, "ffn_moe_host_post_batch", il);
+        ggml_build_forward_expand(gf, ids_dev);
+        selected_experts = ids_dev;
+        moe_negative_ids = ids_dev;
+    }
 
     ggml_tensor * slots = nullptr;
     if (host) {
@@ -2747,6 +2767,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (!moe_host_defer) {
             moe_out = build_moe_host_wait(moe_out, il);
         }
+    }
+
+    if (batch) {
+        moe_negative_ids = nullptr;
+        moe_out = ggml_moe_host_wait_batch(ctx0, moe_out, batch_x, batch_part.state, batch_part.mailbox, batch_part.off_y,
+            batch_part.off_yh, batch_part.off_yflag);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, batch_part.backend);
+        cb(moe_out, "ffn_moe_host_wait_batch", il);
     }
 
     return moe_out;
