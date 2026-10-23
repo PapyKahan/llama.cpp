@@ -73,7 +73,7 @@ public:
     // before the graph of a large batch of n_tokens (0 before any other graph): which experts the host computes for it
     void begin_batch(int64_t n_tokens);
 
-    // false if layer il does not share its batch of n_tokens with the host; the part posts with ggml_moe_host_post_batch
+    // false if layer il does not share its n_tokens with the host; the part posts with ggml_moe_host_post_batch
     bool get_batch_part(int32_t il, int64_t n_tokens, host_part & hp) const;
 
     // whether the host computes expert e of the host weight w in the current large batch, so it is not uploaded

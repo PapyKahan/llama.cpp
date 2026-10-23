@@ -524,8 +524,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     int32_t              batch_max     = 0;
     int64_t              batch_tokens  = 0;     // the batch the host takes part in, 0 if none
     float                batch_force   = -1.0f; // LLAMA_MOE_BATCH_CPU=<share>: a fixed share of the experts the core lacks
-    float                batch_cap     = 0.25f; // LLAMA_MOE_BATCH_CPU_MAX: the largest share, the host's experts round
-                                                // their inputs otherwise than the device's MMQ and the gap grows with it
+    float                batch_cap     = 1.0f;  // LLAMA_MOE_BATCH_CPU_MAX: the largest share
     int                  batch_threads = 1;
     std::vector<uint8_t> batch_cpu;             // [n_layer*n_expert] the host computes the expert in the current batch
     size_t               batch_n_cpu   = 0;
@@ -1667,8 +1666,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         batch_share += share;
     }
 
+    // every cached layer of a shared batch posts to the host, whatever its own tokens: the prefetch does not upload the
+    // host's experts of any layer, so a layer that computed them on the device (the last one, cropped to the outputs)
+    // would lose them
     bool get_batch_part(int32_t il, int64_t n_tokens, llama_moe_cache::host_part & hp) const {
-        if (batch_tokens == 0 || n_tokens != batch_tokens || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (batch_tokens == 0 || n_tokens <= 0 || n_tokens > batch_max || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         const group & g = groups[layers[il].ig];
