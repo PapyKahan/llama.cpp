@@ -13,6 +13,10 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <vector>
 
 namespace {
@@ -43,6 +47,10 @@ struct moe_cache_slru {
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
 
+    // asynchronous admission: slots being uploaded, by key of their expert; not mapped and never victims until published
+    std::vector<bool> pending;
+    std::unordered_map<int32_t, int32_t> pend; // il*n_expert + expert -> slot
+
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
@@ -59,6 +67,7 @@ struct moe_cache_slru {
         tail[0] = n_slots - 1;
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
+        pending.assign(n_slots, false);
     }
 
     // move slot s to the most recently used end of a segment
@@ -100,6 +109,9 @@ struct moe_cache_slru {
     int32_t victim(int32_t il) const {
         for (int segment = 0; segment < 2; ++segment) {
             for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                if (pending[s]) {
+                    continue;
+                }
                 const int32_t key = key_of[s];
                 // keep every expert selected by this request, including earlier fills
                 if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
@@ -123,9 +135,11 @@ struct moe_cache_slru {
     // returns false if the ids select more distinct experts than there are slots
     template <typename F>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, int32_t skip_rank,
-            F && n_cpu, uint64_t & rng, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip) {
+            F && n_cpu, uint64_t & rng, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip,
+            size_t max_admit, std::vector<fill> & admits) {
         fills.clear();
         cpu.clear();
+        admits.clear();
         n_hit  = 0;
         n_skip = 0;
 
@@ -207,8 +221,12 @@ struct moe_cache_slru {
             }
         }
 
-        // the misses left to the CPU are picked at random, so that every expert can enter the cache
-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+        // the misses left to the CPU are picked at random, so that every expert can enter the cache; with asynchronous
+        // admission all of them go to the CPU, and the share that would be filled is admitted in the background
+        const bool    async   = max_admit > 0;
+        const size_t  n_share = std::min(n_cpu(misses.size()), misses.size());
+        const size_t  n_c     = async ? misses.size() : n_share;
+        size_t        n_admit = async ? std::min(misses.size() - n_share, max_admit) : 0;
         for (size_t i = 0; i < n_c; ++i) {
             rng = rng*6364136223846793005ull + 1442695040888963407ull;
             std::swap(misses[i], misses[i + (rng >> 33) % (misses.size() - i)]);
@@ -229,9 +247,39 @@ struct moe_cache_slru {
             misses.erase(misses.begin(), misses.begin() + n_keep);
         }
 
+        // admit some of the experts left to the CPU: each takes a victim slot now, pending until its upload is done
+        for (size_t i = cpu.size(); i-- > 0 && n_admit > 0; ) {
+            const int32_t e   = cpu[i].expert;
+            const int32_t key = il*n_expert + e;
+            if (pend.count(key) > 0) {
+                continue;
+            }
+            const int32_t s = victim(il);
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+            } else {
+                n_filled++;
+            }
+            key_of[s]  = key;
+            pending[s] = true;
+            pend[key]  = s;
+            move(s, false);
+            admits.push_back({ e, s });
+            n_admit--;
+        }
+
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
+            // an expert still being admitted is filled into its own slot, with the same bytes
+            if (const auto it = pend.find(il*n_expert + e); it != pend.end()) {
+                const int32_t s = it->second;
+                pending[s] = false;
+                pend.erase(it);
+                slots[e] = s;
+                fills.push_back({ e, s });
+                continue;
+            }
             const int32_t s = victim(il);
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
@@ -244,6 +292,18 @@ struct moe_cache_slru {
             fills.push_back({ e, s });
         }
         return true;
+    }
+
+    // an admitted expert whose upload is done becomes a hit, unless it was filled since
+    void publish(int32_t il, int32_t e, int32_t s) {
+        const int32_t key = il*n_expert + e;
+        const auto it = pend.find(key);
+        if (it == pend.end() || it->second != s || !pending[s] || key_of[s] != key) {
+            return;
+        }
+        pending[s] = false;
+        pend.erase(it);
+        slot_map[il][e] = s;
     }
 };
 
@@ -341,6 +401,8 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+    size_t n_admitted  = 0; // experts admitted in the background
+    size_t async_bytes = 0;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -351,6 +413,36 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
     std::vector<moe_cache_slru::fill> cpu;
+    std::vector<moe_cache_slru::fill> admits;
+
+    // asynchronous admission (LLAMA_MOE_CACHE_ASYNC): uploads into pending slots on a second stream of each device
+    struct upload {
+        int32_t       dev;
+        ggml_tensor * bank;
+        const void  * src;
+        size_t        offs;
+        size_t        size;
+    };
+    struct publication {
+        int32_t ig, il, expert, slot;
+    };
+    struct admit_job {
+        int32_t                  dev;
+        std::vector<upload>      uploads;
+        std::vector<publication> pubs;
+    };
+    bool    async_admit = false;
+    size_t  async_max   = 96;   // experts in flight
+    size_t  in_flight   = 0;
+    std::vector<ggml_backend_t>       side;     // per device
+    std::vector<ggml_backend_event_t> gate_ev;  // per device, recorded on the compute stream before an admission
+    std::vector<ggml_backend_event_t> done_ev;  // per device, recorded on the side stream after one
+    std::thread                       worker;
+    std::mutex                        mtx;
+    std::condition_variable           cv;
+    std::deque<admit_job>             jobs;
+    std::vector<publication>          done;
+    bool                              quit = false;
 
     float    cpu_share = 0.0f;
     int32_t  skip_rank = 0; // LLAMA_MOE_CACHE_TAIL_SKIP, 0 = off
@@ -474,6 +566,25 @@ struct llama_moe_cache::impl {
 
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         cpu_share_q = (uint32_t) std::lround(cpu_share*65536.0f);
+        if (const char * v = getenv("LLAMA_MOE_CACHE_ASYNC"); v != nullptr && atoi(v) != 0) {
+            if (n_zero == 0) {
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_ASYNC needs --moe-cache-cpu-share > 0, ignored\n", __func__);
+            } else {
+                async_admit = true;
+                if (const char * m = getenv("LLAMA_MOE_CACHE_ASYNC_MAX"); m != nullptr) {
+                    async_max = std::max(1, atoi(m));
+                }
+                for (const device & d : devices) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+                    side.push_back(ggml_backend_dev_init(dev, nullptr));
+                    gate_ev.push_back(ggml_backend_event_new(dev));
+                    done_ev.push_back(ggml_backend_event_new(dev));
+                    GGML_ASSERT(side.back() != nullptr && gate_ev.back() != nullptr && done_ev.back() != nullptr);
+                }
+                worker = std::thread([this] { run_admissions(); });
+                LLAMA_LOG_INFO("%s: asynchronous admission, up to %zu experts in flight\n", __func__, async_max);
+            }
+        }
         if (const char * v = getenv("LLAMA_MOE_CACHE_TAIL_SKIP"); v != nullptr && *v != '\0') {
             skip_rank = std::max(0, atoi(v));
             if (skip_rank > 0 && n_zero == 0) {
@@ -682,7 +793,45 @@ struct llama_moe_cache::impl {
         fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
     }
 
+    void run_admissions() {
+        for (;;) {
+            admit_job job;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] { return quit || !jobs.empty(); });
+                if (jobs.empty()) {
+                    return;
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            // the victims may still be read by work queued on the compute stream before the plan
+            ggml_backend_event_wait(side[job.dev], gate_ev[job.dev]);
+            for (const upload & u : job.uploads) {
+                ggml_backend_tensor_set_async(side[job.dev], u.bank, u.src, u.offs, u.size);
+            }
+            ggml_backend_event_record(done_ev[job.dev], side[job.dev]);
+            ggml_backend_event_synchronize(done_ev[job.dev]);
+            std::lock_guard<std::mutex> lk(mtx);
+            done.insert(done.end(), job.pubs.begin(), job.pubs.end());
+        }
+    }
+
     ~impl() {
+        if (worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                quit = true;
+            }
+            cv.notify_all();
+            worker.join();
+            for (size_t i = 0; i < side.size(); ++i) {
+                ggml_backend_synchronize(side[i]);
+                ggml_backend_event_free(gate_ev[i]);
+                ggml_backend_event_free(done_ev[i]);
+                ggml_backend_free(side[i]);
+            }
+        }
         log_stats();
         if (trace != nullptr) {
             fclose(trace);
@@ -876,6 +1025,20 @@ struct llama_moe_cache::impl {
             write_trace(il, it_cpu != cpu_parts.end() ? it_cpu->second.n_used : n_expert_used);
         }
 
+        // admissions uploaded since the last plan become hits; after the synchronization above, so the slot maps
+        // uploaded earlier from host memory are no longer read
+        if (async_admit) {
+            std::vector<publication> ready;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                ready.swap(done);
+            }
+            for (const publication & pb : ready) {
+                groups[pb.ig].slru.publish(pb.il, pb.expert, pb.slot);
+            }
+            in_flight -= std::min(in_flight, ready.size());
+        }
+
         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
         const uint32_t share_q = has_cpu && g.slru.n_filled == g.slru.n_slots ? cpu_share_q : 0;
         auto n_cpu = [&](size_t n_miss) {
@@ -885,8 +1048,9 @@ struct llama_moe_cache::impl {
         };
         size_t n_hit = 0;
         size_t n_skip = 0;
+        const size_t max_admit = async_admit && has_cpu ? async_max - std::min(async_max, in_flight) : 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, has_cpu ? skip_rank : 0,
-                n_cpu, rng, fills, cpu, n_hit, n_skip)) {
+                n_cpu, rng, fills, cpu, n_hit, n_skip, max_admit, admits)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -918,6 +1082,29 @@ struct llama_moe_cache::impl {
             }
         }
 
+        // the admitted experts are uploaded in the background
+        if (!admits.empty()) {
+            admit_job job;
+            job.dev = g.id;
+            for (const auto & a : admits) {
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    job.uploads.push_back({ g.id, g.banks[ip], (const uint8_t *) w->data + a.expert*expert_size, a.slot*expert_size, expert_size });
+                    async_bytes += expert_size;
+                }
+                job.pubs.push_back({ l.ig, il, a.expert, a.slot });
+            }
+            in_flight += admits.size();
+            n_admitted += admits.size();
+            ggml_backend_event_record(gate_ev[g.id], backend);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                jobs.push_back(std::move(job));
+            }
+            cv.notify_one();
+        }
+
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size() + cpu.size() + n_skip;
@@ -942,6 +1129,9 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (n_admitted > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: admitted in the background: %zu experts, %.2f MiB\n", n_admitted, async_bytes/1024.0/1024.0);
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
