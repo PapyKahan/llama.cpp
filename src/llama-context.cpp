@@ -869,6 +869,12 @@ struct llama_context::expert_prefetch {
             i_next = SIZE_MAX;
             return false;
         }
+        // the routing of a layer is computed before its first tensor is needed: read it before waiting for that
+        // tensor's upload, so the later tensors of the layer queue right behind it on the upload stream
+        if (group[i_next] == i_next) {
+            read_routing(ids, src->ne[2], i_next);
+            enqueue();
+        }
         const int k = staged.front();
         slot & s = slots[k];
         {
@@ -881,9 +887,6 @@ struct llama_context::expert_prefetch {
         s.done_recorded = true;
         staged.pop_front();
         free_slots.push_back(k);
-        if (group[i_next] == i_next) {
-            read_routing(ids, src->ne[2], i_next);
-        }
         i_next++;
         enqueue();
         return true;
