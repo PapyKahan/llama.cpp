@@ -700,6 +700,12 @@ struct llama_context::expert_prefetch {
             s.t = ggml_new_tensor(s.ctx, src->type, GGML_MAX_DIMS, src->ne);
             ggml_backend_tensor_alloc(s.buf, s.t, ggml_backend_buffer_get_base(s.buf));
 
+            // MMQ reads past the last row of a used expert into the next one: a routed slot leaves the experts the
+            // batch does not use as they were, possibly another quantization type whose bytes decode to NaN scales,
+            // so it is zeroed first
+            if (s.routed) {
+                ggml_backend_tensor_memset(s.t, 0, 0, ggml_nbytes(s.t));
+            }
             const int64_t n_expert    = src->ne[2];
             const size_t  expert_size = src->nb[2];
             auto in_cache = [&](int64_t e) {
