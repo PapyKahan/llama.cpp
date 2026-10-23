@@ -4361,8 +4361,13 @@ private:
                         const char * v = getenv("LLAMA_SERVER_BALANCED_CHUNKS");
                         return v == nullptr || atoi(v) != 0;
                     }();
-                    // the checkpoint before the end of the prompt, fixed at first use like the offsets below
-                    static const int32_t n_ckpt_tail = 4 + n_ubatch;
+                    // the checkpoint before the end of the prompt, fixed at first use like the offsets below; the tail
+                    // after it runs as a batch of its own, LLAMA_SERVER_CKPT_TAIL=<n> keeps it at n tokens whatever
+                    // the ubatch size
+                    static const int32_t n_ckpt_tail = [&] {
+                        const char * v = getenv("LLAMA_SERVER_CKPT_TAIL");
+                        return 4 + (v != nullptr && atoi(v) > 0 ? atoi(v) : (int32_t) n_ubatch);
+                    }();
                     int32_t n_batch_slot = n_batch;
                     if (balanced_chunks && batch.size() == 0) {
                         const int32_t n_end  = slot.task->n_tokens() - (do_checkpoint ? n_ckpt_tail : 0);
