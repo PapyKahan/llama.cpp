@@ -122,6 +122,8 @@ struct llama_moe_host::impl {
     int32_t n_ff;
     int32_t max_tokens;
     int32_t skip_rank;
+    float   skip_share = 0.0f; // LLAMA_MOE_CACHE_TAIL_SKIP_W: a miss below this share of every token's weight is skipped
+    std::vector<float> tok_wsum;
 
     mailbox_layout lay;
     std::vector<moe_host_layer> layers;
@@ -132,6 +134,7 @@ struct llama_moe_host::impl {
         int32_t first;
         int32_t count;
         int32_t min_rank;
+        float   max_share; // the largest share of a token's routing weight it gets
     };
     std::vector<cpu_expert> experts;
     std::vector<int32_t>    ent_tok;
@@ -190,6 +193,8 @@ struct llama_moe_host::impl {
 
     // selection counts since the last take_counts, [n_layer*n_expert]
     std::vector<std::atomic<uint32_t>> counts;
+
+    listener * lis = nullptr;
 
     // LLAMA_MOE_HOST_TRACE: per request, i32 layer, tokens, experts per token, then the selected experts and their slots
     FILE * trace = nullptr;
@@ -252,6 +257,14 @@ struct llama_moe_host::impl {
         index.assign(n_expert, -1);
         experts.reserve(max_entries);
 
+        if (const char * v = getenv("LLAMA_MOE_CACHE_TAIL_SKIP_W"); v != nullptr && *v != '\0') {
+            skip_share = std::max(0.0f, (float) atof(v));
+        }
+        tok_wsum.resize(max_tokens);
+        if (skip_rank > 0 || skip_share > 0.0f) {
+            LLAMA_LOG_INFO("llama_moe_host: tail skip: a missing expert that every token ranks %d-th or later and gives less than %.1f%% of its routing weight is skipped\n",
+                skip_rank > 0 ? skip_rank + 1 : 1, skip_share > 0.0f ? 100.0*skip_share : 100.0);
+        }
         if (const char * path = getenv("LLAMA_MOE_HOST_TRACE"); path != nullptr && *path != '\0') {
             trace = fopen(path, "wb");
         }
@@ -419,14 +432,18 @@ struct llama_moe_host::impl {
         }
     }
 
-    void serve(char * mb, int32_t seq) {
+    // returns the layer of the request, -1 if it is invalid
+    int32_t serve(char * mb, int32_t seq) {
         int32_t * hdr = (int32_t *) mb;
+        const int32_t il = hdr[GGML_MOE_HOST_REQ_LAYER];
         auto answer = [&](int32_t has_y) {
+            if (lis != nullptr && il >= 0 && il < n_layer && layers[il].on) {
+                lis->before_answer(il);
+            }
             hdr[GGML_MOE_HOST_RESP_HAS_Y] = has_y;
             __atomic_store_n(hdr + GGML_MOE_HOST_RESP_SEQ, seq, __ATOMIC_RELEASE);
         };
 
-        const int32_t il       = hdr[GGML_MOE_HOST_REQ_LAYER];
         const int32_t n_tokens = hdr[GGML_MOE_HOST_REQ_N_TOKENS];
         if (il < 0 || il >= n_layer || !layers[il].on || n_tokens <= 0 || n_tokens > max_tokens || hdr[GGML_MOE_HOST_REQ_N_USED] != n_used) {
             if (!warned) {
@@ -434,7 +451,7 @@ struct llama_moe_host::impl {
                 warned = true;
             }
             answer(0);
-            return;
+            return -1;
         }
 
         const int32_t * ids   = (const int32_t *) (mb + lay.off_ids);
@@ -459,7 +476,15 @@ struct llama_moe_host::impl {
             c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         }
 
-        // the missing experts and the lowest rank each one has in the tokens that select it
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            float sum = 0.0f;
+            for (int32_t k = 0; k < n_used; ++k) {
+                sum += w[t*n_used + k];
+            }
+            tok_wsum[t] = sum > 0.0f ? sum : 1.0f;
+        }
+
+        // the missing experts, the lowest rank and the largest weight share each one has in the tokens that select it
         if (++stamp_gen == 0) {
             std::fill(stamp.begin(), stamp.end(), 0);
             stamp_gen = 1;
@@ -476,11 +501,12 @@ struct llama_moe_host::impl {
             if (stamp[e] != stamp_gen) {
                 stamp[e] = stamp_gen;
                 index[e] = (int32_t) experts.size();
-                experts.push_back({ e, 0, 0, k });
+                experts.push_back({ e, 0, 0, k, 0.0f });
             }
             cpu_expert & ce = experts[index[e]];
             ce.count++;
-            ce.min_rank = std::min(ce.min_rank, k);
+            ce.min_rank  = std::min(ce.min_rank, k);
+            ce.max_share = std::max(ce.max_share, w[i]/tok_wsum[i / n_used]);
         }
         st_misses += n_miss;
 
@@ -489,7 +515,10 @@ struct llama_moe_host::impl {
         size_t kept = 0;
         for (size_t j = 0; j < experts.size(); ++j) {
             cpu_expert ce = experts[j];
-            if (skip_rank > 0 && ce.min_rank >= skip_rank) {
+            const bool skip = (skip_rank > 0 || skip_share > 0.0f) &&
+                (skip_rank   <= 0    || ce.min_rank  >= skip_rank) &&
+                (skip_share  <= 0.0f || ce.max_share <  skip_share);
+            if (skip) {
                 index[ce.e] = -1;
                 st_skipped += ce.count;
                 continue;
@@ -503,7 +532,7 @@ struct llama_moe_host::impl {
         experts.resize(kept);
         if (experts.empty()) {
             answer(0);
-            return;
+            return il;
         }
 
         std::fill(tok_has.begin(), tok_has.begin() + n_tokens, 0);
@@ -548,6 +577,7 @@ struct llama_moe_host::impl {
         st_max_ns   = std::max(st_max_ns, dt);
 
         answer(1);
+        return il;
     }
 
     void service_loop() {
@@ -565,9 +595,12 @@ struct llama_moe_host::impl {
                         st_turn_ns += t_seen - t_answer;
                         st_turn_n++;
                     }
-                    serve(mailboxes[m], seq);
+                    const int32_t il = serve(mailboxes[m], seq);
                     t_answer = moe_host_now_ns();
                     st_serve_ns += t_answer - t_seen;
+                    if (lis != nullptr && il >= 0) {
+                        lis->after_answer(il);
+                    }
                     got = true;
                 }
             }
@@ -621,6 +654,10 @@ void llama_moe_host::add_mailbox(void * mailbox) {
 
 void llama_moe_host::wake() {
     pimpl->wake();
+}
+
+void llama_moe_host::set_listener(listener * l) {
+    pimpl->lis = l;
 }
 
 void llama_moe_host::take_counts(std::vector<float> & counts, float decay) {

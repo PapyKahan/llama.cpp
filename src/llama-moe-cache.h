@@ -65,6 +65,13 @@ public:
     // false if layer il does not run in host mode for n_tokens
     bool get_host_part(int32_t il, int64_t n_tokens, host_part & hp) const;
 
+    // phases (LLAMA_MOE_CACHE_PREFILL_MIB): the cache lends part of its memory while large batches run
+    bool has_phases() const;
+
+    // before the batches of the other phase: large batches run with the core of the cache and the memory it lends,
+    // small ones in host mode with the whole cache; the context then reserves its compute buffers for the phase
+    void set_phase(bool large);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

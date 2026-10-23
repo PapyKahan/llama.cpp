@@ -789,12 +789,33 @@ struct ggml_backend_cuda_buffer_context {
     void * dev_ptr = nullptr;
     std::string name;
 
+#if defined(GGML_USE_VMM)
+    // a buffer of ggml_backend_cuda_vmm_buffer_alloc: its virtual range is reserved whole, and physical memory is
+    // mapped in chunks from its start up to the committed size (ggml_backend_cuda_vmm_buffer_commit)
+    size_t vmm_reserved = 0;
+    size_t vmm_chunk    = 0;
+    std::vector<size_t> vmm_mapped; // sizes of the mapped chunks, in order from the start
+#endif
+
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM)
+        if (vmm_reserved > 0) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            size_t off = 0;
+            for (size_t size : vmm_mapped) {
+                CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + off, size));
+                off += size;
+            }
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_reserved));
+            return;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -1333,8 +1354,48 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+// GGML_CUDA_HOST_BUFFER_CACHE: freed page-locked buffers of 64 MiB and more are kept for the next allocations they fit,
+// so a context that recreates its compute buffers often (MoE cache phases) does not lock and unlock their pages again
+static std::mutex                             ggml_cuda_host_cache_mtx;
+static std::vector<std::pair<void *, size_t>> ggml_cuda_host_cache;  // free buffers
+static std::unordered_map<void *, size_t>     ggml_cuda_host_sizes;  // buffers in use that go back to the cache
+
+static bool ggml_cuda_host_cache_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_HOST_BUFFER_CACHE") != nullptr;
+    return enabled;
+}
+
+static constexpr size_t GGML_CUDA_HOST_CACHE_MIN = 64ull << 20;
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (ggml_cuda_host_cache_enabled()) {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
+        const auto it = ggml_cuda_host_sizes.find(buffer->context);
+        if (it != ggml_cuda_host_sizes.end()) {
+            ggml_cuda_host_cache.push_back({ it->first, it->second });
+            ggml_cuda_host_sizes.erase(it);
+            if (ggml_cuda_host_cache.size() > 2) {
+                CUDA_CHECK(cudaFreeHost(ggml_cuda_host_cache.front().first));
+                ggml_cuda_host_cache.erase(ggml_cuda_host_cache.begin());
+            }
+            return;
+        }
+    }
     CUDA_CHECK(cudaFreeHost(buffer->context));
+}
+
+// a cached buffer of at least size and at most twice that, nullptr if there is none
+static void * ggml_cuda_host_cache_take(size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
+    for (size_t i = 0; i < ggml_cuda_host_cache.size(); ++i) {
+        const auto [ptr, cap] = ggml_cuda_host_cache[i];
+        if (cap >= size && cap <= 2*size) {
+            ggml_cuda_host_cache.erase(ggml_cuda_host_cache.begin() + i);
+            ggml_cuda_host_sizes[ptr] = cap;
+            return ptr;
+        }
+    }
+    return nullptr;
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
@@ -1356,7 +1417,15 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    const bool cache = ggml_cuda_host_cache_enabled() && size >= GGML_CUDA_HOST_CACHE_MIN;
+    void * ptr = cache ? ggml_cuda_host_cache_take(size) : nullptr;
+    if (ptr == nullptr) {
+        ptr = ggml_cuda_host_malloc(size);
+        if (ptr != nullptr && cache) {
+            std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
+            ggml_cuda_host_sizes[ptr] = size;
+        }
+    }
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -6185,6 +6254,84 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_VMM)
+// maps physical memory from the start of a VMM buffer up to `size` bytes, rounded up to whole chunks, and releases the
+// chunks past it; the caller makes sure that no queued work reads or writes the released range
+static size_t ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, size_t size) {
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    GGML_ASSERT(ctx->vmm_reserved > 0);
+    ggml_cuda_set_device(ctx->device);
+
+    size_t mapped = 0;
+    for (size_t s : ctx->vmm_mapped) {
+        mapped += s;
+    }
+    size = std::min(size, ctx->vmm_reserved);
+
+    // release the chunks that end past the new size
+    while (!ctx->vmm_mapped.empty() && mapped - ctx->vmm_mapped.back() >= size) {
+        const size_t s = ctx->vmm_mapped.back();
+        mapped -= s;
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + mapped, s));
+        ctx->vmm_mapped.pop_back();
+    }
+
+    // map chunks until the new size is covered
+    const int physical_device = ggml_cuda_get_physical_device(ctx->device);
+    while (mapped < size) {
+        const size_t s = std::min(ctx->vmm_chunk, ctx->vmm_reserved - mapped);
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical_device;
+        CUmemGenericAllocationHandle handle;
+        if (cuMemCreate(&handle, s, &prop, 0) != CUDA_SUCCESS) {
+            GGML_LOG_ERROR("%s: failed to map %.2f MiB more\n", __func__, s/1024.0/1024.0);
+            break;
+        }
+        CU_CHECK(cuMemMap((CUdeviceptr) ctx->dev_ptr + mapped, s, 0, handle, 0));
+        CU_CHECK(cuMemRelease(handle));
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id   = physical_device;
+        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_CHECK(cuMemSetAccess((CUdeviceptr) ctx->dev_ptr + mapped, s, &access, 1));
+        ctx->vmm_mapped.push_back(s);
+        mapped += s;
+    }
+    return mapped;
+}
+
+// a device buffer of `size` bytes whose physical memory can be released from its end and mapped again, initially
+// mapped up to `committed` bytes
+static ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(int device, size_t size, size_t committed) {
+    if (!ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+    ggml_cuda_set_device(device);
+    const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
+    // chunks of 32 MiB: the committed size moves by whole chunks
+    const size_t chunk = granularity * std::max<size_t>(1, (32u << 20) / granularity);
+    const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
+
+    CUdeviceptr addr = 0;
+    if (cuMemAddressReserve(&addr, reserved, 0, 0, 0) != CUDA_SUCCESS) {
+        GGML_LOG_ERROR("%s: failed to reserve %.2f MiB of address space\n", __func__, reserved/1024.0/1024.0);
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, (void *) addr);
+    ctx->vmm_reserved = reserved;
+    ctx->vmm_chunk    = chunk;
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
+    if (ggml_backend_cuda_vmm_buffer_commit(buffer, committed) < std::min(committed, size)) {
+        ggml_backend_buffer_free(buffer);
+        return nullptr;
+    }
+    return buffer;
+}
+#endif
+
 // page-locked host memory that the devices read and write directly, at the same address on the host and the devices
 static void * ggml_backend_cuda_host_mapped_alloc(size_t size) {
     void * ptr = nullptr;
@@ -6216,6 +6363,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_host_mapped_alloc") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_alloc;
     }
+#if defined(GGML_USE_VMM)
+    if (strcmp(name, "ggml_backend_vmm_buffer_alloc") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_alloc;
+    }
+    if (strcmp(name, "ggml_backend_vmm_buffer_commit") == 0) {
+        return (void *)ggml_backend_cuda_vmm_buffer_commit;
+    }
+#endif
     if (strcmp(name, "ggml_backend_host_mapped_free") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_free;
     }

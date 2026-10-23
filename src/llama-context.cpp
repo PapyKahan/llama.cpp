@@ -528,7 +528,10 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            // LLAMA_HOST_COMPUTE_PAGEABLE=1: the CPU compute buffers in pageable memory, which a context that recreates its
+            // compute buffers often (MoE cache phases) allocates and frees without locking pages
+            const char * pageable = getenv("LLAMA_HOST_COMPUTE_PAGEABLE");
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && (pageable == nullptr || atoi(pageable) == 0)) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -582,6 +585,19 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            if (moe_cache->has_phases()) {
+                // the context starts with large batches, the core of the cache and the compute buffers of n_ubatch
+                moe_ubatch_large = cparams.n_ubatch;
+                if (const char * v = getenv("LLAMA_MOE_PHASE_UBATCH"); v != nullptr && *v != '\0') {
+                    moe_ubatch_small = (uint32_t) std::max(1, atoi(v));
+                }
+                if (const char * v = getenv("LLAMA_MOE_PHASE_TOKENS"); v != nullptr && *v != '\0') {
+                    moe_phase_tokens = (uint32_t) std::max(1, atoi(v));
+                }
+                moe_ubatch_small = std::min(moe_ubatch_small, moe_ubatch_large);
+                LLAMA_LOG_INFO("%s: MoE cache phases: batches of more than %u tokens run in ubatches of %u, the others in ubatches of %u\n",
+                    __func__, moe_phase_tokens, moe_ubatch_large, moe_ubatch_small);
+            }
         }
 
         sched_reserve();
@@ -761,6 +777,34 @@ struct llama_context::expert_prefetch {
         return true;
     }
 
+    // the memory of the staging slots, given back while the MoE cache has it (MoE cache phases)
+    void release_slots() {
+        drain();
+        for (auto & s : slots) {
+            if (s.done != nullptr && s.done_recorded) {
+                ggml_backend_event_synchronize(s.done);
+            }
+            if (s.ready != nullptr) {
+                ggml_backend_event_free(s.ready);
+            }
+            if (s.done != nullptr) {
+                ggml_backend_event_free(s.done);
+            }
+            if (s.ctx != nullptr) {
+                ggml_free(s.ctx);
+            }
+            ggml_backend_buffer_free(s.buf);
+        }
+        slots.clear();
+        free_slots.clear();
+    }
+
+    void restore_slots() {
+        if (learned && depth > 0 && slots.empty() && !alloc_slots()) {
+            depth = 0;
+        }
+    }
+
     // wait until every staged tensor is uploaded, and give the slots back
     void drain() {
         {
@@ -799,10 +843,20 @@ struct llama_context::expert_prefetch {
         known = SIZE_MAX;
     }
 
+    // LLAMA_MOE_PREFETCH_ROUTED=0: every tensor is staged whole, without waiting for the routing of its layer
+    static bool use_routing() {
+        static const bool res = [] {
+            const char * v = getenv("LLAMA_MOE_PREFETCH_ROUTED");
+            return v == nullptr || atoi(v) != 0;
+        }();
+        return res;
+    }
+
     void enqueue() {
+        const bool routing = use_routing();
         while (!free_slots.empty() && i_fetch < order.size()) {
             // a tensor after the first of its layer waits for the routing of that layer
-            const bool first = group[i_fetch] == i_fetch;
+            const bool first = !routing || group[i_fetch] == i_fetch;
             if (!first && group[i_fetch] != known) {
                 break;
             }
@@ -857,7 +911,9 @@ struct llama_context::expert_prefetch {
                 active  = true;
                 i_next  = 1;
                 i_fetch = 1;
-                read_routing(ids, src->ne[2], 0);
+                if (use_routing()) {
+                    read_routing(ids, src->ne[2], 0);
+                }
                 enqueue();
             }
             return false;
@@ -871,7 +927,7 @@ struct llama_context::expert_prefetch {
         }
         // the routing of a layer is computed before its first tensor is needed: read it before waiting for that
         // tensor's upload, so the later tensors of the layer queue right behind it on the upload stream
-        if (group[i_next] == i_next) {
+        if (group[i_next] == i_next && use_routing()) {
             read_routing(ids, src->ne[2], i_next);
             enqueue();
         }
@@ -1138,7 +1194,8 @@ void llama_context::sched_reserve() {
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
-    if (cparams.training) {
+    // a change of MoE cache phase reserves only the pp graph: the larger of the two
+    if (cparams.training || sched_reserve_pp_only) {
         // no tg graph for training
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
@@ -1155,7 +1212,7 @@ void llama_context::sched_reserve() {
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
-    {
+    if (!sched_reserve_pp_only) {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
@@ -2255,6 +2312,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    if (moe_cache && moe_cache->has_phases()) {
+        moe_set_phase(n_tokens_all > moe_phase_tokens);
+    }
 
     sched_reserve();
 
@@ -3413,6 +3474,54 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::moe_set_phase(bool large) {
+    if (large == moe_phase_large) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    synchronize();
+    int64_t t_cache = 0;
+    int64_t t_sched = 0;
+    int64_t t_slots = 0;
+    if (large) {
+        // the cache gives its memory back first, the compute buffers and the staging slots then take it
+        int64_t t = ggml_time_us();
+        moe_cache->set_phase(true);
+        t_cache = ggml_time_us() - t;
+        t = ggml_time_us();
+        cparams.n_ubatch      = moe_ubatch_large;
+        sched_need_reserve    = true;
+        sched_reserve_pp_only = true;
+        sched_reserve();
+        sched_reserve_pp_only = false;
+        t_sched = ggml_time_us() - t;
+        t = ggml_time_us();
+        if (prefetch) {
+            prefetch->restore_slots();
+        }
+        t_slots = ggml_time_us() - t;
+    } else {
+        int64_t t = ggml_time_us();
+        if (prefetch) {
+            prefetch->release_slots();
+        }
+        t_slots = ggml_time_us() - t;
+        t = ggml_time_us();
+        cparams.n_ubatch      = moe_ubatch_small;
+        sched_need_reserve    = true;
+        sched_reserve_pp_only = true;
+        sched_reserve();
+        sched_reserve_pp_only = false;
+        t_sched = ggml_time_us() - t;
+        t = ggml_time_us();
+        moe_cache->set_phase(false);
+        t_cache = ggml_time_us() - t;
+    }
+    moe_phase_large = large;
+    LLAMA_LOG_INFO("%s: %s batches: %.1f ms (cache %.1f, compute buffers %.1f, staging slots %.1f)\n", __func__,
+        large ? "large" : "small", (ggml_time_us() - t0)/1e3, t_cache/1e3, t_sched/1e3, t_slots/1e3);
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {

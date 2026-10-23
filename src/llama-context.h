@@ -286,6 +286,15 @@ private:
     bool prefetch_off = false;
     expert_prefetch * prefetch_for(ggml_backend_t backend);
 
+    // MoE cache phases (LLAMA_MOE_CACHE_PREFILL_MIB): a batch of more than moe_phase_tokens tokens runs in ubatches of
+    // moe_ubatch_large with the memory the cache lends, the others in ubatches of moe_ubatch_small with the whole cache
+    bool     sched_reserve_pp_only = false; // reserve the compute buffers for the pp graph only
+    bool     moe_phase_large  = true;
+    uint32_t moe_ubatch_large = 0;
+    uint32_t moe_ubatch_small = 32;
+    uint32_t moe_phase_tokens = 256;
+    void moe_set_phase(bool large);
+
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 

@@ -48,6 +48,18 @@ public:
     // makes the service thread poll without sleeping for a while: call before a graph that posts requests
     void wake();
 
+    // called by the service thread for each request: before_answer while the device waits for the answer, so the
+    // device reads no slot table and no slot meanwhile except the slots of layer il, then after_answer, while the
+    // device runs on to the next request
+    struct listener {
+        virtual ~listener() = default;
+        virtual void before_answer(int32_t il) = 0;
+        virtual void after_answer(int32_t il)  = 0;
+    };
+
+    // before the first request
+    void set_listener(listener * l);
+
     // adds the selection counts of each expert since the last call to counts [n_layer*n_expert], then resets them
     void take_counts(std::vector<float> & counts, float decay);
 
