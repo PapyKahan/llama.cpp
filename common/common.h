@@ -12,6 +12,7 @@
 #include <list>
 #include <set>
 #include <sstream>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1066,6 +1067,15 @@ enum common_context_seq_rm_type {
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
+// background work on a context (the MTP draft catch-up): wait() finishes it and busy() tells whether some runs; a null
+// wait removes the context. common_context_wait() is called before anything else reads or edits that context's state;
+// common_context_defer() runs a memory edit now, or queues it while background work runs, in order, to run when it
+// finishes (common_context_run_deferred(), from wait()), which is where a synchronous decode would have left it
+void common_context_set_wait(const llama_context * ctx, std::function<void()> wait, std::function<bool()> busy);
+void common_context_wait(const llama_context * ctx);
+void common_context_defer(const llama_context * ctx, std::function<void()> op);
+void common_context_run_deferred(const llama_context * ctx);
 
 struct common_memory {
     llama_context * ctx_tgt = nullptr;

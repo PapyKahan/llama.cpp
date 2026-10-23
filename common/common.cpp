@@ -15,6 +15,8 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -1640,24 +1642,85 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
     this->ctx_dft = ctx_dft;
 }
 
+struct common_context_waiter {
+    std::function<void()> wait;
+    std::function<bool()> busy;
+    std::vector<std::function<void()>> deferred;
+};
+
+static std::mutex g_context_wait_mtx;
+static std::unordered_map<const llama_context *, common_context_waiter> g_context_wait;
+
+void common_context_set_wait(const llama_context * ctx, std::function<void()> wait, std::function<bool()> busy) {
+    std::lock_guard<std::mutex> lock(g_context_wait_mtx);
+    if (wait) {
+        g_context_wait[ctx] = { std::move(wait), std::move(busy), {} };
+    } else {
+        g_context_wait.erase(ctx);
+    }
+}
+
+void common_context_wait(const llama_context * ctx) {
+    std::function<void()> wait;
+    {
+        std::lock_guard<std::mutex> lock(g_context_wait_mtx);
+        const auto it = g_context_wait.find(ctx);
+        if (it == g_context_wait.end()) {
+            return;
+        }
+        wait = it->second.wait;
+    }
+    wait();
+}
+
+void common_context_defer(const llama_context * ctx, std::function<void()> op) {
+    {
+        std::lock_guard<std::mutex> lock(g_context_wait_mtx);
+        const auto it = g_context_wait.find(ctx);
+        if (it != g_context_wait.end() && it->second.busy && it->second.busy()) {
+            it->second.deferred.push_back(std::move(op));
+            return;
+        }
+    }
+    op();
+}
+
+void common_context_run_deferred(const llama_context * ctx) {
+    std::vector<std::function<void()>> ops;
+    {
+        std::lock_guard<std::mutex> lock(g_context_wait_mtx);
+        const auto it = g_context_wait.find(ctx);
+        if (it == g_context_wait.end()) {
+            return;
+        }
+        ops.swap(it->second.deferred);
+    }
+    for (auto & op : ops) {
+        op();
+    }
+}
+
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        llama_context * ctx = ctx_dft;
+        common_context_defer(ctx, [ctx, seq_id, p0, p1] { common_context_seq_rm(ctx, seq_id, p0, p1); });
     }
 }
 
 void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
     common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
     if (ctx_dft) {
-        common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+        llama_context * ctx = ctx_dft;
+        common_context_defer(ctx, [ctx, seq_id_src, seq_id_dst, p0, p1] { common_context_seq_cp(ctx, seq_id_src, seq_id_dst, p0, p1); });
     }
 }
 
 void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
     common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
     if (ctx_dft) {
-        common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
+        llama_context * ctx = ctx_dft;
+        common_context_defer(ctx, [ctx, seq_id, p0, p1, delta] { common_context_seq_add(ctx, seq_id, p0, p1, delta); });
     }
 }
 
@@ -2409,6 +2472,7 @@ void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
+    common_context_wait(ctx);
     if (ctx == nullptr) {
         return;
     }
@@ -2443,6 +2507,7 @@ bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
+    common_context_wait(ctx);
     if (ctx == nullptr) {
         return true;
     }

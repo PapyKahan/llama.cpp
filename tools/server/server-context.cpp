@@ -344,6 +344,7 @@ struct server_slot {
             return false;
         }
 
+        common_context_wait(ctx_dft);
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -2874,6 +2875,7 @@ private:
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
         if (ctx_dft != nullptr) {
+            common_context_wait(ctx_dft);
             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
@@ -2905,6 +2907,7 @@ private:
     // the draft starts empty unless the file holds a draft state that fits the draft context
     size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
         if (ctx_dft != nullptr) {
+            common_context_wait(ctx_dft);
             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
         }
         std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
@@ -3817,6 +3820,7 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                common_context_wait(ctx_dft);
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
@@ -4350,8 +4354,27 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // a long prompt goes in chunks of equal size up to the checkpoint before its end: a large ubatch
+                    // of a model whose experts stream from host memory uploads them all whatever its size, so a short
+                    // last chunk costs as much as a full one (LLAMA_SERVER_BALANCED_CHUNKS=0: chunks of n_batch)
+                    static const bool balanced_chunks = [] {
+                        const char * v = getenv("LLAMA_SERVER_BALANCED_CHUNKS");
+                        return v == nullptr || atoi(v) != 0;
+                    }();
+                    // the checkpoint before the end of the prompt, fixed at first use like the offsets below
+                    static const int32_t n_ckpt_tail = 4 + n_ubatch;
+                    int32_t n_batch_slot = n_batch;
+                    if (balanced_chunks && batch.size() == 0) {
+                        const int32_t n_end  = slot.task->n_tokens() - (do_checkpoint ? n_ckpt_tail : 0);
+                        const int32_t n_left = n_end - slot.prompt.n_tokens();
+                        if (n_left > n_batch) {
+                            const int32_t n_chunks = (n_left + n_batch - 1)/n_batch;
+                            n_batch_slot = (n_left + n_chunks - 1)/n_chunks;
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4405,7 +4428,7 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            static const int checkpoint_offsets[] = {n_ckpt_tail, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

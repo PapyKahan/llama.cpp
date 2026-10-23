@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <thread>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1524,6 +1525,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_SPEC_ASYNC_PROCESS: the catch-up decode of process() runs in the background, on the draft device, while the
+    // target decodes its next batch; every other use of ctx_dft waits for it first (a single head only)
+    bool               async_on = false;
+    std::thread        async_thr;
+    int32_t            async_rc = 0;
+    std::vector<float> async_h; // the target rows of the batch, the target overwrites its own with its next batch
+
+    void join() {
+        if (async_thr.joinable()) {
+            async_thr.join();
+            if (async_rc != 0) {
+                SPC_ERR("llama_process(ctx_dft) failed in the background rc=%d\n", (int) async_rc);
+                async_rc = 0;
+            }
+            // the memory edits queued meanwhile run where a synchronous decode would have left them
+            common_context_run_deferred(this->params.ctx_dft);
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1548,6 +1568,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
         batch = common_batch(ctx_dft);
+
+        if (const char * v = getenv("LLAMA_SPEC_ASYNC_PROCESS"); v != nullptr && atoi(v) != 0) {
+            async_on = true;
+            // whatever else reads or edits the draft context waits for the background decode first
+            common_context_set_wait(this->params.ctx_dft, [this] { join(); }, [this] { return async_thr.joinable(); });
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1601,6 +1627,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        join();
+        if (async_on) {
+            common_context_set_wait(this->params.ctx_dft, nullptr, nullptr);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1615,6 +1645,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        join();
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -1636,6 +1667,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        join();
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1678,6 +1710,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            // the background decode keeps the token ids and hidden rows of the batch, not vision embeddings
+            bool async = async_on && !chain_heads;
+            for (int k = 0; k < n_tokens && async; ++k) {
+                async = batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
+            }
+            if (async) {
+                async_h.resize((size_t) n_tokens * n_embd);
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
@@ -1692,10 +1733,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
+                if (async) {
+                    float * dst = async_h.data() + (size_t) k * n_embd;
+                    std::memcpy(dst, h_row, row_bytes);
+                    h_row = dst;
+                }
+
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // the decode goes in pieces of the draft's ubatch size: a batch copies the rows it is given, so a long
+            // prompt chunk at once would hold several copies of all its hidden rows
+            const int32_t n_step = std::max<int32_t>(1, (int32_t) llama_n_ubatch(ctx_dft));
+            auto decode_pieces = [this, ctx_dft, n_tokens, n_step]() -> int32_t {
+                for (int32_t k0 = 0; k0 < n_tokens; k0 += n_step) {
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
+                            batch.get_sub_batch(k0, std::min(n_step, n_tokens - k0)));
+                    if (rc != 0) {
+                        return rc;
+                    }
+                }
+                return 0;
+            };
+
+            if (async) {
+                // the rows of the next draft() are taken now, then the decode runs while the target goes on
+                stash_verify_rows(batch_in, ctx_tgt, row_bytes);
+                async_thr = std::thread([this, decode_pieces] {
+                    async_rc = decode_pieces();
+                });
+                return true;
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
@@ -1710,7 +1780,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const int32_t rc = decode_pieces();
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -1727,28 +1797,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        stash_verify_rows(batch_in, ctx_tgt, row_bytes);
+
+        return true;
+    }
+
+    // the target rows of each sequence of the batch, for the next draft(), and the last one for the next process()
+    void stash_verify_rows(const common_batch & /*batch_in*/, llama_context * ctx_tgt, size_t row_bytes) {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // a verification batch keeps all its rows for accept(); a prompt chunk only its last one, the row the
+            // next draft continues from
+            const int32_t i_first = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 > 64 ? i_batch_end[seq_id] : i_batch_beg[seq_id];
+            const int32_t n_rows  = i_batch_end[seq_id] - i_first + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_first + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
-
-        return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        join();
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -1915,6 +1994,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        join();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
