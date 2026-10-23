@@ -1096,6 +1096,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "MOE_HOST_POST",
+    "MOE_HOST_WAIT",
 
     "UNARY",
 
@@ -1113,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1212,6 +1214,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "moe_host_post(ids, weights, x, state)",
+    "moe_host_wait(a, state)",
 
     "unary(x)",
 
@@ -1229,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6628,6 +6632,78 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_moe_host_post
+
+struct ggml_tensor * ggml_moe_host_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * state,
+        void                * mailbox,
+        const int32_t       * offsets,
+        int32_t               n_expert,
+        int32_t               layer,
+        int32_t               zero_base) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] == n_used && weights->ne[1] == n_tokens && weights->ne[2] == 1 && weights->ne[3] == 1);
+    GGML_ASSERT(x->ne[1] == n_tokens && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(mailbox != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+
+    int32_t params[10];
+    memcpy(params, &mailbox, sizeof(mailbox));
+    params[2] = layer;
+    params[3] = zero_base;
+    memcpy(params + 4, offsets, 5*sizeof(int32_t));
+    params[9] = n_expert;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_HOST_POST;
+    result->src[0] = ids;
+    result->src[1] = weights;
+    result->src[2] = x;
+    result->src[3] = state;
+
+    return result;
+}
+
+// ggml_moe_host_wait
+
+struct ggml_tensor * ggml_moe_host_wait(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * state,
+        void                * mailbox,
+        int32_t               off_y) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(mailbox != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
+
+    int32_t params[3];
+    memcpy(params, &mailbox, sizeof(mailbox));
+    params[2] = off_y;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_HOST_WAIT;
+    result->src[0] = a;
+    result->src[1] = state;
 
     return result;
 }

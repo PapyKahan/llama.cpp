@@ -50,6 +50,21 @@ public:
     // whether expert e of the host weight w is in the cache of the device of backend
     bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const;
 
+    // host mode (LLAMA_MOE_HOST): for small batches the device computes the cached experts of a layer and the host the
+    // others (llama-moe-host), a layer posts its request and waits for the answer with these
+    struct host_part {
+        ggml_backend_t backend   = nullptr;
+        ggml_tensor *  state     = nullptr; // I32 on the device, the state of the mailbox
+        void *         mailbox   = nullptr;
+        int32_t        offs[5]   = {};      // the ids, slots, weights, input and slot table in the mailbox
+        int32_t        off_y     = 0;       // the answer in the mailbox
+        int32_t        n_expert  = 0;
+        int32_t        zero_base = 0;       // the first zero slot of the bank of the layer
+    };
+
+    // false if layer il does not run in host mode for n_tokens
+    bool get_host_part(int32_t il, int64_t n_tokens, host_part & hp) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

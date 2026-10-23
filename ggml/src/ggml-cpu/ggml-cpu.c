@@ -2138,6 +2138,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_MOE_HOST_POST:
+        case GGML_OP_MOE_HOST_WAIT:
+            {
+                GGML_ABORT("%s is not supported on the CPU", ggml_op_name(tensor->op));
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);

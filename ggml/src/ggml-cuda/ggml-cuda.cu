@@ -71,6 +71,8 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/moe-host.cuh"
+#include "ggml-cuda/mmvf-rows.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1993,6 +1995,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    if (ggml_cuda_should_use_mmvf_rows(src0, src1, dst)) {
+        ggml_cuda_mul_mat_vec_f_rows(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2573,6 +2579,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_MOE_HOST_POST:
+            ggml_cuda_op_moe_host_post(ctx, dst);
+            break;
+        case GGML_OP_MOE_HOST_WAIT:
+            ggml_cuda_op_moe_host_wait(ctx, dst);
             break;
         default:
             return false;
@@ -6009,6 +6021,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_HOST_POST:
+        case GGML_OP_MOE_HOST_WAIT:
+            return true;
 
         default:
             return false;
@@ -6170,8 +6185,40 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// page-locked host memory that the devices read and write directly, at the same address on the host and the devices
+static void * ggml_backend_cuda_host_mapped_alloc(size_t size) {
+    void * ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of mapped host memory: %s\n", __func__, size/1024.0/1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    void * dev = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&dev, ptr, 0));
+    if (dev != ptr) {
+        GGML_LOG_ERROR("%s: mapped host memory has another address on the device\n", __func__);
+        CUDA_CHECK(cudaFreeHost(ptr));
+        return nullptr;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+static void ggml_backend_cuda_host_mapped_free(void * ptr) {
+    if (ptr != nullptr) {
+        CUDA_CHECK(cudaFreeHost(ptr));
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_host_mapped_alloc") == 0) {
+        return (void *)ggml_backend_cuda_host_mapped_alloc;
+    }
+    if (strcmp(name, "ggml_backend_host_mapped_free") == 0) {
+        return (void *)ggml_backend_cuda_host_mapped_free;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

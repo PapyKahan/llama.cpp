@@ -1082,6 +1082,19 @@ struct llm_graph_context {
     const llama_cross            * cross;
     llama_moe_cache              * moe_cache;
 
+    // set by a model around build_moe_ffn when it adds the host's experts itself with build_moe_host_wait, after more
+    // work for the device; otherwise build_moe_ffn waits for them right after the device's experts
+    mutable bool moe_host_defer = false;
+
+    // the layers whose host experts are still to be waited for
+    struct moe_host_wait_info {
+        ggml_tensor *  state;
+        void *         mailbox;
+        int32_t        off_y;
+        ggml_backend_t backend;
+    };
+    mutable std::map<int, moe_host_wait_info> moe_host_pending;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
@@ -1244,6 +1257,9 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
+
+    // in host mode, waits for the experts the host computes for layer il (see build_moe_ffn) and adds them to cur
+    ggml_tensor * build_moe_host_wait(ggml_tensor * cur, int il) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

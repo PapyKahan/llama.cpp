@@ -2437,17 +2437,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    const std::array<ggml_tensor *, 4> exps = { up_exps, gate_exps, down_exps, gate_up_exps };
+
+    // in host mode, the device computes the experts of the layer that it caches and the host the others: the device posts
+    // the request first, so that the host computes while the device does
+    llama_moe_cache::host_part host_part;
+    const bool host = moe_cache != nullptr && type_op == LLM_FFN_SILU && gate_exps != nullptr && gate_up_exps == nullptr &&
+        !weight_before_ffn && loras->empty() && up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+        up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr && post_exp_norm == nullptr &&
+        moe_cache->get_experts(up_exps) != nullptr && moe_cache->get_experts(gate_exps) != nullptr &&
+        moe_cache->get_experts(down_exps) != nullptr &&
+        std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; }) &&
+        moe_cache->get_host_part(il, n_tokens, host_part);
+
+    ggml_tensor * slots = nullptr;
+    if (host) {
+        ggml_tensor * w2d   = ggml_reshape_2d(ctx0, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), n_expert_used, n_tokens);
+        slots = ggml_moe_host_post(ctx0, selected_experts, w2d, cur, host_part.state, host_part.mailbox, host_part.offs,
+            host_part.n_expert, il, host_part.zero_base);
+        ggml_backend_sched_set_tensor_backend(sched, slots, host_part.backend);
+        cb(slots, "ffn_moe_host_post", il);
+        ggml_build_forward_expand(gf, slots);
+    } else {
+        // the experts of host-resident layers may be read from the MoE cache
+        slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     // part of the misses of the MoE cache can be computed on the CPU, from the host experts
     ggml_tensor * cpu_ids = nullptr; // [n_expert_used, n_tokens], -1 for the experts computed on the device
     ggml_tensor * sel2d   = nullptr;
-    ggml_tensor * lookup  = slots != nullptr ? slots->view_src : nullptr; // see build_moe_cache_slots
-    const std::array<ggml_tensor *, 4> exps = { up_exps, gate_exps, down_exps, gate_up_exps };
-    if (slots != nullptr) {
+    ggml_tensor * lookup  = slots != nullptr && !host ? slots->view_src : nullptr; // see build_moe_cache_slots
+    if (lookup != nullptr) {
         ggml_tensor * sel = lookup->src[1];
         if (moe_cache->cpu_share() > 0.0f && !weight_before_ffn && loras->empty() &&
             std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; })) {
@@ -2707,7 +2729,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cb(moe_out, "ffn_moe_out", il);
 
+    if (host) {
+        moe_host_pending[il] = { host_part.state, host_part.mailbox, host_part.off_y, host_part.backend };
+        if (!moe_host_defer) {
+            moe_out = build_moe_host_wait(moe_out, il);
+        }
+    }
+
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_host_wait(ggml_tensor * cur, int il) const {
+    const auto it = moe_host_pending.find(il);
+    if (it == moe_host_pending.end()) {
+        return cur;
+    }
+    const moe_host_wait_info wi = it->second;
+    moe_host_pending.erase(it);
+
+    cur = ggml_moe_host_wait(ctx0, cur, wi.state, wi.mailbox, wi.off_y);
+    ggml_backend_sched_set_tensor_backend(sched, cur, wi.backend);
+    cb(cur, "ffn_moe_host_wait", il);
+
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(

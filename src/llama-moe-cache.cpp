@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-host.h"
 
 #include "ggml-cpp.h"
 
@@ -444,6 +445,37 @@ struct llama_moe_cache::impl {
     std::vector<publication>          done;
     bool                              quit = false;
 
+    // host mode (LLAMA_MOE_HOST): the device posts the experts it does not cache to the host, see llama-moe-host
+    // the cache then follows the selection counts the host gathers: every host_period graphs, the experts selected most
+    // that are not cached are uploaded in the background, into free slots or over cached experts selected less
+    bool     host_mode       = false;
+    int32_t  host_max_tokens = 32;
+    int32_t  host_period     = 4;     // graphs between two plans
+    int32_t  host_max_swaps  = 32;    // cached experts replaced per plan
+    int32_t  host_max_fills  = 1024;  // experts admitted into free slots per plan
+    float    host_decay      = 0.97f; // of the selection counts, per plan
+    float    host_hyst       = 1.25f; // a replaced expert was selected this many times less than its successor
+    uint64_t host_n_begin    = 0;
+    size_t   host_n_swaps    = 0;
+    size_t   host_n_fills    = 0;
+    int64_t  host_begin_ns   = 0; // spent before the graphs, publishing and planning
+    int64_t  host_n_plans    = 0;
+    int32_t  host_n_expert   = 0;
+    std::unique_ptr<llama_moe_host> host;
+    llama_moe_host::mailbox_layout  host_lay;
+    struct host_device {
+        ggml_tensor * state   = nullptr;
+        void *        mailbox = nullptr;
+        void (*mailbox_free)(void *) = nullptr;
+        int32_t * table_host = nullptr; // [n_layer*n_expert] in the mailbox, read by the graphs started afterwards
+        size_t in_flight = 0;           // experts being uploaded
+    };
+    std::vector<host_device> hdev;
+    std::vector<float>   host_score; // [n_layer*n_expert] decayed selection counts
+    std::vector<int32_t> host_cand;
+    std::vector<int32_t> host_vict;
+    std::vector<int32_t> host_free;
+
     float    cpu_share = 0.0f;
     int32_t  skip_rank = 0; // LLAMA_MOE_CACHE_TAIL_SKIP, 0 = off
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
@@ -522,9 +554,13 @@ struct llama_moe_cache::impl {
             return;
         }
 
+        if (const char * v = getenv("LLAMA_MOE_HOST"); v != nullptr && atoi(v) != 0 && !model.hparams.no_alloc) {
+            host_mode = host_supported(model);
+        }
+
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
         // one extra slot at the end, CUDA MMQ can read past the last expert
-        n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
+        n_zero = cpu_share > 0.0f || host_mode ? std::min<int32_t>(n_expert_used, 64) : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
@@ -566,7 +602,7 @@ struct llama_moe_cache::impl {
 
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         cpu_share_q = (uint32_t) std::lround(cpu_share*65536.0f);
-        if (const char * v = getenv("LLAMA_MOE_CACHE_ASYNC"); v != nullptr && atoi(v) != 0) {
+        if (const char * v = getenv("LLAMA_MOE_CACHE_ASYNC"); v != nullptr && atoi(v) != 0 && !host_mode) {
             if (n_zero == 0) {
                 LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_ASYNC needs --moe-cache-cpu-share > 0, ignored\n", __func__);
             } else {
@@ -574,16 +610,18 @@ struct llama_moe_cache::impl {
                 if (const char * m = getenv("LLAMA_MOE_CACHE_ASYNC_MAX"); m != nullptr) {
                     async_max = std::max(1, atoi(m));
                 }
-                for (const device & d : devices) {
-                    ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
-                    side.push_back(ggml_backend_dev_init(dev, nullptr));
-                    gate_ev.push_back(ggml_backend_event_new(dev));
-                    done_ev.push_back(ggml_backend_event_new(dev));
-                    GGML_ASSERT(side.back() != nullptr && gate_ev.back() != nullptr && done_ev.back() != nullptr);
-                }
-                worker = std::thread([this] { run_admissions(); });
                 LLAMA_LOG_INFO("%s: asynchronous admission, up to %zu experts in flight\n", __func__, async_max);
             }
+        }
+        if (async_admit || host_mode) {
+            for (const device & d : devices) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+                side.push_back(ggml_backend_dev_init(dev, nullptr));
+                gate_ev.push_back(ggml_backend_event_new(dev));
+                done_ev.push_back(ggml_backend_event_new(dev));
+                GGML_ASSERT(side.back() != nullptr && gate_ev.back() != nullptr && done_ev.back() != nullptr);
+            }
+            worker = std::thread([this] { run_admissions(); });
         }
         if (const char * v = getenv("LLAMA_MOE_CACHE_TAIL_SKIP"); v != nullptr && *v != '\0') {
             skip_rank = std::max(0, atoi(v));
@@ -622,6 +660,14 @@ struct llama_moe_cache::impl {
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+        }
+        if (host_mode) {
+            hdev.resize(devices.size());
+            for (size_t id = 0; id < devices.size(); ++id) {
+                if (n_tensors[id] > 0) {
+                    n_tensors[id] += 1; // mailbox state
+                }
+            }
         }
 
         auto init_ctx = [](size_t n_tensors) {
@@ -681,6 +727,14 @@ struct llama_moe_cache::impl {
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
+        host_n_expert = groups[0].ref[0]->ne[2];
+        for (size_t id = 0; id < hdev.size(); ++id) {
+            if (!devices[id].ctx) {
+                continue;
+            }
+            hdev[id].state = ggml_new_tensor_1d(devices[id].ctx.get(), GGML_TYPE_I32, 8);
+            ggml_format_name(hdev[id].state, "moe_cache.host_state");
+        }
 
         if (model.hparams.no_alloc) {
             // only used to measure the memory use, see llama_context::memory_breakdown
@@ -725,6 +779,10 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+
+            if (host_mode) {
+                host_init(model);
+            }
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -749,6 +807,251 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    // whether the host can compute the experts of every cached layer
+    bool host_supported(const llama_model & model) const {
+        const auto & hp = model.hparams;
+        // these clamp the activation of their experts in another way
+        const bool other_clamp = model.arch == LLM_ARCH_MAPLE || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM5_NEXT ||
+            model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_HY_V4;
+        for (const group & g : groups) {
+            for (int32_t il : g.layers) {
+                const llama_layer & ly = model.layers[il];
+                const bool plain = ly.ffn_gate_up_exps == nullptr && ly.ffn_gate_exps_b == nullptr && ly.ffn_up_exps_b == nullptr &&
+                    ly.ffn_down_exps_b == nullptr && ly.ffn_gate_exps_s == nullptr && ly.ffn_up_exps_s == nullptr &&
+                    ly.ffn_down_exps_s == nullptr && ly.ffn_gate_exps_in_s == nullptr && ly.ffn_up_exps_in_s == nullptr &&
+                    ly.ffn_down_exps_in_s == nullptr;
+                const llama_moe_host::layer l = { ly.ffn_gate_exps, ly.ffn_up_exps, ly.ffn_down_exps, 0.0f };
+                if (!plain || (other_clamp && hp.swiglu_clamp_exp[il] > 1e-6f) || ly.ffn_gate_exps == nullptr ||
+                    !llama_moe_host::supported(l, ly.ffn_gate_exps->ne[0], ly.ffn_gate_exps->ne[1])) {
+                    LLAMA_LOG_WARN("%s: the host cannot compute the experts of layer %d, host mode is disabled\n", __func__, il);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // the slot tables, the mailboxes and the host part
+    void host_init(const llama_model & model) {
+        auto env_i = [](const char * name, int32_t def) {
+            const char * v = getenv(name);
+            return v != nullptr && *v != '\0' ? atoi(v) : def;
+        };
+        auto env_f = [](const char * name, float def) {
+            const char * v = getenv(name);
+            return v != nullptr && *v != '\0' ? (float) atof(v) : def;
+        };
+        host_max_tokens = std::max(1, env_i("LLAMA_MOE_HOST_MAX_TOKENS", host_max_tokens));
+        host_period     = std::max(1, env_i("LLAMA_MOE_HOST_PERIOD",     host_period));
+        host_max_swaps  = std::max(0, env_i("LLAMA_MOE_HOST_MAX_SWAPS",  host_max_swaps));
+        host_max_fills  = std::max(0, env_i("LLAMA_MOE_HOST_MAX_FILLS",  host_max_fills));
+        host_decay      = std::clamp(env_f("LLAMA_MOE_HOST_DECAY", host_decay), 0.0f, 1.0f);
+        host_hyst       = std::max(1.0f, env_f("LLAMA_MOE_HOST_HYST", host_hyst));
+        const int n_threads = std::max(1, env_i("LLAMA_MOE_HOST_THREADS", std::max(1, (int) std::thread::hardware_concurrency()/2 - 1)));
+
+        const int32_t n_layer = (int32_t) layers.size();
+        int32_t n_embd = 0;
+        int32_t n_ff   = 0;
+        std::vector<llama_moe_host::layer> hl(n_layer);
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                const llama_layer & ly = model.layers[il];
+                const float limit = model.hparams.swiglu_clamp_exp[il];
+                hl[il] = { ly.ffn_gate_exps, ly.ffn_up_exps, ly.ffn_down_exps, limit > 1e-6f ? limit : 0.0f };
+                n_embd = ly.ffn_gate_exps->ne[0];
+                n_ff   = ly.ffn_gate_exps->ne[1];
+            }
+        }
+        host_lay = llama_moe_host::layout(host_max_tokens, n_expert_used, n_embd, n_layer, host_n_expert);
+
+        for (size_t id = 0; id < hdev.size(); ++id) {
+            host_device & hd = hdev[id];
+            if (hd.state == nullptr) {
+                continue;
+            }
+
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[id].backend));
+            auto * alloc_fn = (void * (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_alloc");
+            auto * free_fn  = (void   (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_mapped_free");
+            hd.mailbox      = alloc_fn != nullptr ? alloc_fn(host_lay.size) : nullptr;
+            hd.mailbox_free = free_fn;
+            if (hd.mailbox == nullptr || free_fn == nullptr) {
+                LLAMA_LOG_WARN("%s: %s has no mapped host memory, host mode is disabled\n", __func__, ggml_backend_name(devices[id].backend));
+                host_mode = false;
+                return;
+            }
+            hd.table_host = (int32_t *) ((char *) hd.mailbox + host_lay.off_table);
+            std::fill(hd.table_host, hd.table_host + (size_t) n_layer*host_n_expert, -1);
+        }
+
+        host = std::make_unique<llama_moe_host>(std::move(hl), host_n_expert, n_expert_used, n_embd, n_ff, host_max_tokens, n_threads, skip_rank);
+        for (const host_device & hd : hdev) {
+            if (hd.mailbox != nullptr) {
+                host->add_mailbox(hd.mailbox);
+            }
+        }
+        host_score.assign((size_t) n_layer*host_n_expert, 0.0f);
+
+        LLAMA_LOG_INFO("%s: host mode: up to %d tokens, %d threads, a plan every %d graphs (%d fills, %d swaps), decay %.3f, hysteresis %.2f\n",
+            __func__, host_max_tokens, n_threads, host_period, host_max_fills, host_max_swaps, host_decay, host_hyst);
+    }
+
+    bool get_host_part(int32_t il, int64_t n_tokens, llama_moe_cache::host_part & hp) const {
+        if (!host || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens <= 0 || n_tokens > host_max_tokens) {
+            return false;
+        }
+        const group & g = groups[layers[il].ig];
+        const host_device & hd = hdev[g.id];
+        if (hd.mailbox == nullptr) {
+            return false;
+        }
+        hp.backend   = devices[g.id].backend;
+        hp.state     = hd.state;
+        hp.mailbox   = hd.mailbox;
+        hp.offs[0]   = host_lay.off_ids;
+        hp.offs[1]   = host_lay.off_slots;
+        hp.offs[2]   = host_lay.off_w;
+        hp.offs[3]   = host_lay.off_x;
+        hp.offs[4]   = host_lay.off_table;
+        hp.off_y     = host_lay.off_y;
+        hp.n_expert  = host_n_expert;
+        hp.zero_base = g.n_slots;
+        return true;
+    }
+
+    // admits the experts of group ig selected most that are not cached, into free slots or over cached ones selected less
+    void host_plan(size_t ig, admit_job & job) {
+        group & g = groups[ig];
+        moe_cache_slru & sl = g.slru;
+        host_device & hd = hdev[g.id];
+        const int32_t ne = sl.n_expert;
+
+        host_free.clear();
+        host_vict.clear();
+        for (int32_t s = 0; s < sl.n_slots; ++s) {
+            if (sl.pending[s]) {
+                continue;
+            }
+            (sl.key_of[s] < 0 ? host_free : host_vict).push_back(s);
+        }
+        host_cand.clear();
+        for (int32_t il : g.layers) {
+            const int32_t * slots = sl.slot_map[il];
+            for (int32_t e = 0; e < ne; ++e) {
+                const int32_t key = il*ne + e;
+                if (slots[e] >= sl.n_slots && host_score[key] > 0.0f && sl.pend.count(key) == 0) {
+                    host_cand.push_back(key);
+                }
+            }
+        }
+
+        const size_t n_fill = std::min(host_free.size(), (size_t) host_max_fills);
+        const size_t n_cand = std::min(host_cand.size(), n_fill + host_max_swaps);
+        const size_t n_vict = std::min(host_vict.size(), (size_t) host_max_swaps);
+        std::partial_sort(host_cand.begin(), host_cand.begin() + n_cand, host_cand.end(),
+            [&](int32_t a, int32_t b) { return host_score[a] > host_score[b]; });
+        std::partial_sort(host_vict.begin(), host_vict.begin() + n_vict, host_vict.end(),
+            [&](int32_t a, int32_t b) { return host_score[sl.key_of[a]] < host_score[sl.key_of[b]]; });
+
+        size_t i_fill = 0;
+        size_t i_vict = 0;
+        for (size_t c = 0; c < n_cand; ++c) {
+            const int32_t key = host_cand[c];
+            int32_t s;
+            if (i_fill < n_fill) {
+                s = host_free[i_fill++];
+                sl.n_filled++;
+                host_n_fills++;
+            } else {
+                if (i_vict >= n_vict) {
+                    break;
+                }
+                const int32_t v    = host_vict[i_vict];
+                const int32_t vkey = sl.key_of[v];
+                if (host_score[key] <= host_score[vkey]*host_hyst + 1.0f) {
+                    break;
+                }
+                i_vict++;
+                // the device computes the evicted expert as a miss from the next graph on, and its slot is overwritten
+                // after the work queued before
+                sl.slot_map[vkey / ne][vkey % ne] = sl.empty;
+                hd.table_host[vkey] = -1;
+                s = v;
+                host_n_swaps++;
+            }
+            sl.key_of[s]  = key;
+            sl.pending[s] = true;
+            sl.pend[key]  = s;
+
+            const int32_t il = key / ne;
+            const int32_t e  = key % ne;
+            const layer & l = layers[il];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                const size_t es = w->nb[2];
+                job.uploads.push_back({ g.id, g.banks[ip], (const uint8_t *) w->data + e*es, s*es, es });
+                async_bytes += es;
+            }
+            job.pubs.push_back({ (int32_t) ig, il, e, s });
+        }
+    }
+
+    // before each graph: publish the uploads done, plan the cache now and then, update the slot tables of the devices
+    void host_begin() {
+        const int64_t t0 = ggml_time_us()*1000;
+        host->wake();
+
+        std::vector<publication> ready;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            ready.swap(done);
+        }
+        for (const publication & pb : ready) {
+            group & g = groups[pb.ig];
+            host_device & hd = hdev[g.id];
+            hd.in_flight--;
+            const int32_t key = pb.il*g.slru.n_expert + pb.expert;
+            if (g.slru.key_of[pb.slot] != key || !g.slru.pending[pb.slot]) {
+                continue;
+            }
+            g.slru.publish(pb.il, pb.expert, pb.slot);
+            hd.table_host[key] = pb.slot;
+            n_admitted++;
+        }
+
+        if (++host_n_begin % host_period == 0) {
+            host->take_counts(host_score, host_decay);
+            for (size_t id = 0; id < devices.size(); ++id) {
+                if (id >= hdev.size() || hdev[id].state == nullptr || hdev[id].in_flight > 0) {
+                    continue;
+                }
+                admit_job job;
+                job.dev = (int32_t) id;
+                for (size_t ig = 0; ig < groups.size(); ++ig) {
+                    if (groups[ig].id == (int32_t) id && groups[ig].n_slots > 0) {
+                        host_plan(ig, job);
+                    }
+                }
+                if (job.pubs.empty()) {
+                    continue;
+                }
+                hdev[id].in_flight += job.pubs.size();
+                ggml_backend_event_record(gate_ev[id], devices[id].backend);
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    jobs.push_back(std::move(job));
+                }
+                cv.notify_one();
+            }
+        }
+
+        host_begin_ns += ggml_time_us()*1000 - t0;
+        host_n_plans++;
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -818,6 +1121,19 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (host) {
+            host->log_stats();
+            if (host_n_fills + host_n_swaps > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %lld graphs, %.1f us before each graph\n",
+                    host_n_fills, host_n_swaps, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
+            }
+            host.reset();
+        }
+        for (host_device & hd : hdev) {
+            if (hd.mailbox != nullptr && hd.mailbox_free != nullptr) {
+                hd.mailbox_free(hd.mailbox);
+            }
+        }
         if (worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(mtx);
@@ -843,6 +1159,11 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+
+        // in host mode, the host computes the misses of small batches instead
+        if (host_mode) {
+            return nullptr;
+        }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
@@ -946,6 +1267,9 @@ struct llama_moe_cache::impl {
 
     void begin() {
         stash.clear();
+        if (host) {
+            host_begin();
+        }
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -1182,6 +1506,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
     return pimpl->cached(backend, w, e);
+}
+
+bool llama_moe_cache::get_host_part(int32_t il, int64_t n_tokens, host_part & hp) const {
+    return pimpl->get_host_part(il, n_tokens, hp);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

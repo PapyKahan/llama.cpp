@@ -862,6 +862,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
+                // with few rows, MMF has too few tiles to fill the device, MMVF runs a block per row
+                if (getenv("GGML_CUDA_MMVF_FEW_ROWS") != nullptr && src0_ne[1] <= 1024 && src0_ne[2]*src0_ne[3] == 1) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }

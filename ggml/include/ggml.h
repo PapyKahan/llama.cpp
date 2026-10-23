@@ -586,6 +586,8 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_MOE_HOST_POST,
+        GGML_OP_MOE_HOST_WAIT,
 
         GGML_OP_UNARY,
 
@@ -2753,6 +2755,53 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // a MoE layer whose cached experts the device computes while the host computes the others, see llama-moe-host
+    // the device and the host meet in a mailbox in mapped host memory, op_params give its address and layout
+    // the mailbox starts with a header of int32 words, the request and the answer on separate cache lines
+    enum ggml_moe_host_mailbox {
+        GGML_MOE_HOST_REQ_SEQ      = 0,  // written last by the device
+        GGML_MOE_HOST_REQ_LAYER    = 1,
+        GGML_MOE_HOST_REQ_N_TOKENS = 2,
+        GGML_MOE_HOST_REQ_N_USED   = 3,
+        GGML_MOE_HOST_RESP_SEQ     = 16, // written last by the host
+        GGML_MOE_HOST_RESP_HAS_Y   = 17, // 0 if the host computed nothing, y is then not read
+        GGML_MOE_HOST_RESP_TIMEOUT = 18, // set by the device when it gave up waiting for an answer
+        GGML_MOE_HOST_HDR_WORDS    = 32,
+    };
+    //
+    // post: writes the selected experts of a layer, their weights, their slots and its input to the mailbox, then
+    //       publishes a new sequence number; returns the slot of each selected expert in the device cache
+    //   ids:     [n_used, n_tokens] i32, the selected experts
+    //   weights: [n_used, n_tokens] f32, their weights
+    //   x:       [n_embd, n_tokens] f32, the input of the experts
+    //   state:   [n_state]          i32, device state of the mailbox, state[0] is the last sequence number
+    //   res:     [n_used, n_tokens] i32, the slot of each selected expert, zero_base + k for an uncached expert of rank k
+    //   offsets: byte offsets in the mailbox of the ids, slots, weights and input it writes, and of the slot table it
+    //            reads: i32 [n_layer][n_expert], the slot of each expert in the device cache, -1 if it is not cached
+    //
+    GGML_API struct ggml_tensor * ggml_moe_host_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * state,
+            void                * mailbox,
+            const int32_t       * offsets,
+            int32_t               n_expert,
+            int32_t               layer,
+            int32_t               zero_base);
+
+    // wait: waits until the host answers the last post, then adds the answer: res = a + y
+    //   a:     [n_embd, n_tokens] f32
+    //   off_y: byte offset of y [n_embd, n_tokens] in the mailbox
+    //
+    GGML_API struct ggml_tensor * ggml_moe_host_wait(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * state,
+            void                * mailbox,
+            int32_t               off_y);
 
     // custom operators
 
