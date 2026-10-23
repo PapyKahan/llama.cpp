@@ -1011,6 +1011,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * q_chunk = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], chunk.n, q->nb[1], q->nb[2], chunk.t0*q->nb[2]);
 
         ggml_tensor * out = build_attn_mha(q_chunk, k, v, nullptr, sel, nullptr, nullptr, inp_kpool->n_sel, kq_scale, il);
+        if (inp_kpool->chunks.size() > 1) {
+            // the attention node also holds the F16 copy of the whole quantized K/V as scratch, freed only with its
+            // output: copy the output and schedule the copy now, so each chunk's scratch is released before the next
+            out = ggml_cont(ctx0, out);
+            ggml_build_forward_expand(gf, out);
+        }
         cur = cur ? ggml_concat(ctx0, cur, out, 1) : out;
     }
     cb(cur, "kqv_out", il);
