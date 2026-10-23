@@ -9078,8 +9078,10 @@ struct test_lightning_indexer : public test_case {
 
     const ggml_type type_K;
 
+    const int64_t n_cells; // > 0: the keys are rows picked by index from the second half of [2*hsk, 1, n_cells]
+
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, n_cells);
     }
 
     double max_nmse_err() override {
@@ -9091,17 +9093,31 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16,
+            int64_t n_cells = 0)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), n_cells(n_cells) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
         ggml_set_param(q);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
-        ggml_set_param(k);
-        ggml_set_name(k, "k");
+        ggml_tensor * k    = nullptr;
+        ggml_tensor * rows = nullptr;
+        if (n_cells > 0) {
+            ggml_tensor * k_all = ggml_new_tensor_3d(ctx, type_K, 2*hsk, 1, n_cells);
+            ggml_set_name(k_all, "k");
+
+            k = ggml_view_3d(ctx, k_all, hsk, 1, n_cells, k_all->nb[1], k_all->nb[1], ggml_row_size(type_K, hsk));
+            ggml_set_name(k, "k_view");
+
+            rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+            ggml_set_name(rows, "rows");
+        } else {
+            k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+            ggml_set_param(k);
+            ggml_set_name(k, "k");
+        }
 
         ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
         ggml_set_param(w);
@@ -9111,7 +9127,7 @@ struct test_lightning_indexer : public test_case {
         ggml_set_param(m);
         ggml_set_name(m, "m");
 
-        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_tensor * out = ggml_lightning_indexer_ext(ctx, q, k, w, m, rows);
         ggml_set_name(out, "out");
 
         return out;
@@ -9119,8 +9135,17 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "rows") == 0) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (auto & r : data) {
+                    r = rand() % n_cells;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -12137,6 +12162,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
             }
+        }
+    }
+    // the four-head indexer reading its keys in place by row index: decoding, a verify batch and prefill chunks
+    for (int bs : {1, 4, 64, 777}) {
+        for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, 5003, bs, 1, 1, type_K, 20011));
         }
     }
     // sparse decoding over a quantized cache: the compact gather of the listed cells, one query and a verify batch

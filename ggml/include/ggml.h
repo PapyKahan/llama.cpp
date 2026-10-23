@@ -2687,6 +2687,16 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // as ggml_lightning_indexer, key i being row rows[i] of k (rows: I32 [n_kv]), so a gathered set of keys is
+    // scored where it is stored
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rows);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

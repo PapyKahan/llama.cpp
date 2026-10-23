@@ -675,6 +675,10 @@ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_pooled(ggml_
     return ggml_get_rows(ctx, pooled, idxs);
 }
 
+ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::pooled_by_cell() const {
+    return ggml_view_3d(ctx, pooled, pooled->ne[0], 1, pooled->ne[1], pooled->nb[1], pooled->nb[1], 0);
+}
+
 llama_memory_hybrid_idx_context::kpool_access llama_memory_hybrid_idx_context::get_kpool_access(
         ggml_context * ctx, int32_t il, int64_t n_embd) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);

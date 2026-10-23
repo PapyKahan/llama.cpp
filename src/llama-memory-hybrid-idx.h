@@ -137,6 +137,8 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // the pooled key of every cell as [n_embd, 1, n_cells], for an op that reads them by cell in place
+        ggml_tensor * pooled_by_cell() const;
 
     private:
         friend class llama_memory_hybrid_idx_context;

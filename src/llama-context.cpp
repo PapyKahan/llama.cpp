@@ -2059,7 +2059,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t t_end = ggml_time_us();
         synchronize();
         if (profile_all) {
-            LLAMA_LOG_INFO("%s: build %.2f ms\n", __func__, (t_inputs - t_begin)/1e3);
+            LLAMA_LOG_INFO("%s: build %.2f ms (context %p)\n", __func__, (t_inputs - t_begin)/1e3, (void *) this);
         }
         LLAMA_LOG_INFO("%s: %u tokens: inputs %.1f ms, graph %.1f ms, then waiting for the devices %.1f ms\n", __func__,
             ubatch.n_tokens, (t_compute - t_inputs)/1e3, (t_end - t_compute)/1e3, (ggml_time_us() - t_end)/1e3);
