@@ -416,6 +416,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool vocab_subset; // [EXPERIMENTAL] draft contexts: compute only the lowest token ids of the LM head, see n_vocab_dynamic_rows
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -426,6 +427,12 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // [EXPERIMENTAL] with vocab_subset: also compute this many best-scoring other ids per output (0 = only the lowest ids)
+        uint32_t n_vocab_dynamic_rows;
+
+        // [EXPERIMENTAL] rank of the projection that scores those others (0 = default 512, at most the head width), only used when n_vocab_dynamic_rows > 0
+        uint32_t vocab_dynamic_rank;
     };
 
     struct llama_model_tensor_override {
