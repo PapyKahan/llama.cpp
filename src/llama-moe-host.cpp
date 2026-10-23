@@ -216,6 +216,10 @@ struct llama_moe_host::impl {
     int64_t  t_answer    = 0;
     bool     warned      = false;
 
+    // LLAMA_MOE_HOST_STATS=<n>: the misses of every n requests, to follow the hit rate along a conversation
+    uint64_t st_every    = 0;
+    uint64_t st_prev[5]  = {}; // requests, tokens, entries, misses, skipped at the last report
+
     // a missing expert is computed while the device answer waits, so the pool spins between the requests of a graph
     static constexpr int64_t spin_ns = 50*1000*1000;
 
@@ -267,6 +271,9 @@ struct llama_moe_host::impl {
         }
         if (const char * path = getenv("LLAMA_MOE_HOST_TRACE"); path != nullptr && *path != '\0') {
             trace = fopen(path, "wb");
+        }
+        if (const char * v = getenv("LLAMA_MOE_HOST_STATS"); v != nullptr && *v != '\0') {
+            st_every = strtoull(v, nullptr, 10);
         }
 
         n_workers = std::max(0, n_threads - 1);
@@ -601,6 +608,14 @@ struct llama_moe_host::impl {
                     if (lis != nullptr && il >= 0) {
                         lis->after_answer(il);
                     }
+                    if (st_every > 0 && st_req - st_prev[0] >= st_every) {
+                        const uint64_t ids = st_ids - st_prev[2];
+                        LLAMA_LOG_INFO("llama_moe_host: last %llu requests (%.1f tokens): %.2f%% of the selected experts missing, %.2f%% skipped\n",
+                            (unsigned long long) (st_req - st_prev[0]), (double) (st_tokens - st_prev[1])/(st_req - st_prev[0]),
+                            100.0*(st_misses - st_prev[3])/ids, 100.0*(st_skipped - st_prev[4])/ids);
+                        const uint64_t cur[5] = { st_req, st_tokens, st_ids, st_misses, st_skipped };
+                        std::copy(cur, cur + 5, st_prev);
+                    }
                     got = true;
                 }
             }
@@ -660,10 +675,15 @@ void llama_moe_host::set_listener(listener * l) {
     pimpl->lis = l;
 }
 
-void llama_moe_host::take_counts(std::vector<float> & counts, float decay) {
+void llama_moe_host::take_counts(std::vector<float> & counts, float decay, std::vector<float> * total) {
     GGML_ASSERT(counts.size() == pimpl->counts.size());
+    GGML_ASSERT(total == nullptr || total->size() == counts.size());
     for (size_t i = 0; i < counts.size(); ++i) {
-        counts[i] = counts[i]*decay + (float) pimpl->counts[i].exchange(0, std::memory_order_relaxed);
+        const float c = (float) pimpl->counts[i].exchange(0, std::memory_order_relaxed);
+        counts[i] = counts[i]*decay + c;
+        if (total != nullptr) {
+            (*total)[i] += c;
+        }
     }
 }
 

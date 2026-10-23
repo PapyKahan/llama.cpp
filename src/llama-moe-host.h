@@ -61,7 +61,8 @@ public:
     void set_listener(listener * l);
 
     // adds the selection counts of each expert since the last call to counts [n_layer*n_expert], then resets them
-    void take_counts(std::vector<float> & counts, float decay);
+    // total, if not null: also adds them there, undecayed
+    void take_counts(std::vector<float> & counts, float decay, std::vector<float> * total = nullptr);
 
     void log_stats() const;
 

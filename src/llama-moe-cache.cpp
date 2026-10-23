@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -504,6 +505,14 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     // bank, to the compute buffers and the expert prefetch of the large batches
     bool    phases       = false;
     bool    prefill      = true; // the current phase, a context starts with large batches
+    std::vector<publication> lent; // the experts of the lent slots, admitted again into them when small batches return
+    size_t  n_readmitted = 0;
+
+    // LLAMA_MOE_CACHE_PROFILE=<file>, host mode: the selection counts of the past sessions; the cache starts with the
+    // experts they count most, and the counts of this session are added to the file when the cache is destroyed
+    std::string        profile_path;
+    std::vector<float> profile;     // [n_layer*n_expert] read from the file, empty without one
+    std::vector<float> profile_new; // [n_layer*n_expert] counted in this session
     size_t  prefill_size = 0;
     std::vector<ggml_backend_buffer_t> bank_bufs; // one buffer per bank, its physical memory mapped up to the phase's slots
     std::vector<ggml_tensor *>         bank_tensors;
@@ -984,6 +993,16 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 host_collect();
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
+            lent.clear();
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                const moe_cache_slru & sl = groups[ig].slru;
+                for (int32_t s = groups[ig].n_core; s < groups[ig].n_slots; ++s) {
+                    const int32_t key = sl.key_of[s];
+                    if (key >= 0 && !sl.pending[s]) {
+                        lent.push_back({ (int32_t) ig, key / sl.n_expert, key % sl.n_expert, s });
+                    }
+                }
+            }
             for (size_t ig = 0; ig < groups.size(); ++ig) {
                 if (groups[ig].n_slots > 0) {
                     evict_range(ig, groups[ig].n_core, groups[ig].n_slots);
@@ -1010,8 +1029,69 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             for (group & g : groups) {
                 g.n_active = g.n_slots;
             }
+            readmit_lent();
         }
         prefill = large;
+    }
+
+    // the experts the lent slots held go back into them, uploaded by the admission worker while the next graphs run:
+    // until then they are misses, the cache does not start the small batches with a third of its slots empty
+    void readmit_lent() {
+        if (!host || lent.empty()) {
+            lent.clear();
+            return;
+        }
+        std::unique_lock<std::mutex> lk_svc(svc_mtx, std::defer_lock);
+        if (svc_policy) {
+            lk_svc.lock();
+        }
+        // a few experts per job, so that they become hits as they land
+        constexpr size_t per_job = 16;
+        admit_job job;
+        job.gate = false; // nothing queued before reads these slots
+        auto flush = [&]() {
+            if (job.pubs.empty()) {
+                return;
+            }
+            hdev[job.dev].in_flight += job.pubs.size();
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                jobs.push_back(std::move(job));
+            }
+            cv.notify_one();
+            job = admit_job();
+            job.gate = false;
+        };
+        for (const publication & pb : lent) {
+            group & g = groups[pb.ig];
+            moe_cache_slru & sl = g.slru;
+            const int32_t key = pb.il*sl.n_expert + pb.expert;
+            if (sl.key_of[pb.slot] >= 0 || sl.pending[pb.slot] || sl.slot_map[pb.il][pb.expert] < sl.n_slots || sl.pend.count(key) > 0) {
+                continue;
+            }
+            if (!job.pubs.empty() && job.dev != g.id) {
+                flush();
+            }
+            job.dev = g.id;
+            sl.key_of[pb.slot]  = key;
+            sl.pending[pb.slot] = true;
+            sl.pend[key]        = pb.slot;
+            sl.n_filled++;
+            const layer & l = layers[pb.il];
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                const size_t es = w->nb[2];
+                job.uploads.push_back({ g.id, g.banks[ip], (const uint8_t *) w->data + pb.expert*es, pb.slot*es, es });
+                async_bytes += es;
+            }
+            job.pubs.push_back(pb);
+            n_readmitted++;
+            if (job.pubs.size() >= per_job) {
+                flush();
+            }
+        }
+        flush();
+        lent.clear();
     }
 
     // whether the host can compute the experts of every cached layer
@@ -1124,12 +1204,149 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
 
         LLAMA_LOG_INFO("%s: host mode: up to %d tokens, %d threads, a plan every %d graphs (%d fills, %d swaps), decay %.3f, hysteresis %.2f\n",
             __func__, host_max_tokens, n_threads, host_period, host_max_fills, host_max_swaps, host_decay, host_hyst);
+
+        if (const char * path = getenv("LLAMA_MOE_CACHE_PROFILE"); path != nullptr && *path != '\0') {
+            profile_path = path;
+            profile_new.assign(host_score.size(), 0.0f);
+            if (profile_read(n_layer)) {
+                profile_fill();
+            }
+        }
+    }
+
+    static constexpr uint32_t profile_magic = 0x50434d4c; // "LMCP"
+
+    // the file: u32 magic, u32 version 1, i32 n_layer, i32 n_expert, then f32 counts [n_layer*n_expert]
+    bool profile_read(int32_t n_layer) {
+        FILE * f = fopen(profile_path.c_str(), "rb");
+        if (f == nullptr) {
+            LLAMA_LOG_INFO("%s: no MoE cache profile at %s yet, the cache starts empty\n", __func__, profile_path.c_str());
+            return false;
+        }
+        uint32_t hdr[2] = {};
+        int32_t  dims[2] = {};
+        std::vector<float> counts(host_score.size());
+        const bool ok = fread(hdr, sizeof(hdr), 1, f) == 1 && fread(dims, sizeof(dims), 1, f) == 1 &&
+            hdr[0] == profile_magic && hdr[1] == 1 && dims[0] == n_layer && dims[1] == host_n_expert &&
+            fread(counts.data(), sizeof(float), counts.size(), f) == counts.size();
+        fclose(f);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: %s is not a MoE cache profile of this model, ignored\n", __func__, profile_path.c_str());
+            return false;
+        }
+        profile = std::move(counts);
+        return true;
+    }
+
+    // the past counts plus this session's, written to a new file that then replaces the old one
+    void profile_write() {
+        if (profile_path.empty()) {
+            return;
+        }
+        double total = 0.0;
+        for (float c : profile_new) {
+            total += c;
+        }
+        if (total == 0.0) {
+            return;
+        }
+        std::vector<float> counts = profile_new;
+        if (!profile.empty()) {
+            for (size_t i = 0; i < counts.size(); ++i) {
+                counts[i] += profile[i];
+            }
+        }
+        // bounded, so that the recent sessions keep their weight
+        double sum = 0.0;
+        for (float c : counts) {
+            sum += c;
+        }
+        constexpr double max_sum = 1e8;
+        if (sum > max_sum) {
+            for (float & c : counts) {
+                c = (float) (c*(max_sum/sum));
+            }
+        }
+        const std::string tmp = profile_path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("%s: cannot write the MoE cache profile %s\n", __func__, tmp.c_str());
+            return;
+        }
+        const uint32_t hdr[2]  = { profile_magic, 1 };
+        const int32_t  dims[2] = { (int32_t) (counts.size()/host_n_expert), host_n_expert };
+        const bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(dims, sizeof(dims), 1, f) == 1 &&
+            fwrite(counts.data(), sizeof(float), counts.size(), f) == counts.size();
+        if (fclose(f) != 0 || !ok || rename(tmp.c_str(), profile_path.c_str()) != 0) {
+            LLAMA_LOG_WARN("%s: cannot write the MoE cache profile %s\n", __func__, profile_path.c_str());
+            remove(tmp.c_str());
+            return;
+        }
+        LLAMA_LOG_INFO("%s: MoE cache profile %s updated with %.0f selections\n", __func__, profile_path.c_str(), total);
+    }
+
+    // the experts the profile counts most fill the slots: those of the current phase now, the others (lent while large
+    // batches run, a context starts with them) when small batches come
+    void profile_fill() {
+        std::vector<int32_t> keys;
+        size_t n_now   = 0;
+        size_t n_later = 0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            moe_cache_slru & sl = g.slru;
+            host_device & hd = hdev[g.id];
+            const int32_t ne = sl.n_expert;
+            keys.clear();
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; e < ne; ++e) {
+                    if (profile[(size_t) il*ne + e] > 0.0f) {
+                        keys.push_back(il*ne + e);
+                    }
+                }
+            }
+            const size_t n = std::min(keys.size(), (size_t) g.n_slots);
+            std::partial_sort(keys.begin(), keys.begin() + n, keys.end(),
+                [&](int32_t a, int32_t b) { return profile[a] > profile[b]; });
+            for (size_t i = 0; i < n; ++i) {
+                const int32_t s   = (int32_t) i;
+                const int32_t key = keys[i];
+                const int32_t il  = key / ne;
+                const int32_t e   = key % ne;
+                if (sl.key_of[s] >= 0 || sl.slot_map[il][e] < sl.n_slots) {
+                    continue;
+                }
+                if (s >= g.n_active) {
+                    lent.push_back({ (int32_t) ig, il, e, s });
+                    n_later++;
+                    continue;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    const size_t es = w->nb[2];
+                    ggml_backend_tensor_set_async(side[g.id], g.banks[ip], (const uint8_t *) w->data + e*es, s*es, es);
+                }
+                sl.key_of[s]     = key;
+                sl.slot_map[il][e] = s;
+                hd.table_host[key] = s;
+                sl.n_filled++;
+                n_now++;
+            }
+        }
+        for (ggml_backend_t b : side) {
+            ggml_backend_synchronize(b);
+        }
+        LLAMA_LOG_INFO("%s: MoE cache profile %s: %zu experts cached now, %zu when small batches come\n", __func__,
+            profile_path.c_str(), n_now, n_later);
     }
 
     // the swaps of the next graph: admissions into free slots, then replacements of cached experts selected less,
     // the replacements that gain the most first
     void svc_plan_graph() {
-        host->take_counts(host_score, host_decay);
+        host->take_counts(host_score, host_decay, profile_new.empty() ? nullptr : &profile_new);
         svc_plan.clear();
         svc_pos = 0;
         std::vector<svc_move> fills;
@@ -1438,7 +1655,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
 
     void host_plan_all() {
         if (++host_n_begin % host_period == 0) {
-            host->take_counts(host_score, host_decay);
+            host->take_counts(host_score, host_decay, profile_new.empty() ? nullptr : &profile_new);
             for (size_t id = 0; id < devices.size(); ++id) {
                 if (id >= hdev.size() || hdev[id].state == nullptr || hdev[id].in_flight > 0) {
                     continue;
@@ -1534,10 +1751,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
 
     ~impl() {
         if (host) {
+            profile_write();
             host->log_stats();
             if (host_n_fills + host_n_swaps + svc_n_fills + svc_n_swaps > 0) {
-                LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %lld graphs, %.1f us before each graph\n",
-                    host_n_fills + svc_n_fills, host_n_swaps + svc_n_swaps, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
+                LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %zu admitted again after large batches, %lld graphs, %.1f us before each graph\n",
+                    host_n_fills + svc_n_fills, host_n_swaps + svc_n_swaps, n_readmitted, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
             }
             host.reset();
         }
