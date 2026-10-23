@@ -819,7 +819,8 @@ struct llama_context::expert_prefetch {
 
     // the routing of the layer at position i of order, read from ids
     void read_routing(const ggml_tensor * ids, int64_t n_expert, size_t i) {
-        std::vector<int32_t> data(ggml_nelements(ids));
+        // ids is a strided view (the first n_expert_used of each sorted row), read its whole span
+        std::vector<int32_t> data(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
         used.assign(n_expert, false);
