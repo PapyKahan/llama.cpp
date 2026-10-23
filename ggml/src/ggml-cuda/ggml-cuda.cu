@@ -6311,11 +6311,13 @@ static size_t ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, 
     }
     size = std::min(size, ctx->vmm_reserved);
 
-    // release the chunks that end past the new size
+    // release the chunks that end past the new size, once the work queued before is done with them
+    if (!ctx->vmm_mapped.empty() && mapped - ctx->vmm_mapped.back() >= size) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     while (!ctx->vmm_mapped.empty() && mapped - ctx->vmm_mapped.back() >= size) {
         const size_t s = ctx->vmm_mapped.back();
         mapped -= s;
-        CUDA_CHECK(cudaDeviceSynchronize());
         CU_CHECK(cuMemUnmap((CUdeviceptr) ctx->dev_ptr + mapped, s));
         ctx->vmm_mapped.pop_back();
     }
@@ -6354,8 +6356,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(int device, size
     }
     ggml_cuda_set_device(device);
     const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
-    // chunks of 32 MiB: the committed size moves by whole chunks
-    const size_t chunk = granularity * std::max<size_t>(1, (32u << 20) / granularity);
+    // the committed size moves by whole chunks, of GGML_CUDA_VMM_CHUNK_MIB (default 32): each costs a physical
+    // allocation and a mapping when the buffer grows, an unmapping when it shrinks
+    static const size_t chunk_mib = [] {
+        const char * v = getenv("GGML_CUDA_VMM_CHUNK_MIB");
+        return v != nullptr && atoi(v) > 0 ? (size_t) atoi(v) : (size_t) 32;
+    }();
+    const size_t chunk = granularity * std::max<size_t>(1, (chunk_mib << 20) / granularity);
     const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
 
     CUdeviceptr addr = 0;
