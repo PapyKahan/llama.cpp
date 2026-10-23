@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -662,6 +663,9 @@ struct llama_context::expert_prefetch {
     size_t i_next  = 0; // position in order of the next copy expected
     size_t i_fetch = 0; // position in order of the next tensor to stage
 
+    // per graph, for LLAMA_PROFILE_UBATCH
+    std::atomic<int64_t> n_uploaded{0}, n_skipped{0}, bytes_uploaded{0};
+
     std::thread             worker;
     std::mutex              mtx;
     std::condition_variable cv;
@@ -729,6 +733,7 @@ struct llama_context::expert_prefetch {
             };
             for (int64_t first = 0; first < n_expert; ) {
                 if (in_cache(first)) {
+                    n_skipped += cache != nullptr && cache->cached(backend, src, first);
                     first++;
                     continue;
                 }
@@ -738,6 +743,8 @@ struct llama_context::expert_prefetch {
                 }
                 ggml_backend_tensor_set_async(stream, s.t, (const uint8_t *) src->data + first*expert_size,
                         first*expert_size, (last + 1 - first)*expert_size);
+                n_uploaded += last + 1 - first;
+                bytes_uploaded += (last + 1 - first)*expert_size;
                 first = last + 1;
             }
             ggml_backend_event_record(s.ready, stream);
@@ -762,7 +769,8 @@ struct llama_context::expert_prefetch {
             slot & s = slots[k];
             s.buf = ggml_backend_buft_alloc_buffer(buft, size);
             if (s.buf == nullptr) {
-                LLAMA_LOG_WARN("%s: no room for %d staging slots of %.1f MiB, expert prefetch off\n", __func__, depth, size/1024.0/1024.0);
+                LLAMA_LOG_WARN("%s: no room for %d staging slots of %.1f MiB\n", __func__, depth, size/1024.0/1024.0);
+                release_slots();
                 return false;
             }
             ggml_backend_buffer_clear(s.buf, 0);
@@ -800,8 +808,8 @@ struct llama_context::expert_prefetch {
     }
 
     void restore_slots() {
-        if (learned && depth > 0 && slots.empty() && !alloc_slots()) {
-            depth = 0;
+        if (learned && depth > 0 && slots.empty()) {
+            alloc_slots();
         }
     }
 
@@ -828,12 +836,68 @@ struct llama_context::expert_prefetch {
         staged.clear();
     }
 
+    // the order from the graph about to run, before any copy: the host expert tensors of its MUL_MAT_ID nodes in
+    // graph order, the nodes of one layer sharing their ids; a graph whose copies come in another order sends the
+    // prefetch back to learning from the copies
+    bool from_graph = false;
+
+    // the host weights of a MUL_MAT_ID source, which the scheduler has replaced by its copy "<backend>#<name>#<i>"
+    static const ggml_tensor * host_weights(const ggml_tensor * w, const llama_model & model) {
+        if (w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+            return ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? w : nullptr;
+        }
+        const char * a = strchr(w->name, '#');
+        const char * b = strrchr(w->name, '#');
+        if (a == nullptr || b == a) {
+            return nullptr;
+        }
+        const std::string name(a + 1, b);
+        const ggml_tensor * t = model.get_tensor(name.c_str());
+        if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer) ||
+            ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return nullptr;
+        }
+        return t;
+    }
+
+    void learn_graph(ggml_cgraph * gf, ggml_backend_sched_t sched, const llama_model & model) {
+        if (learned || !order.empty()) {
+            return;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT_ID || ggml_backend_sched_get_tensor_backend(sched, node) != backend) {
+                continue;
+            }
+            const ggml_tensor * w = host_weights(node->src[0], model);
+            if (w == nullptr) {
+                continue;
+            }
+            const ggml_tensor * ids = node->src[2];
+            group.push_back(order.empty() || ids != last_ids ? order.size() : group.back());
+            last_ids = ids;
+            order.push_back(w);
+        }
+        from_graph = !order.empty();
+        if (from_graph) {
+            LLAMA_LOG_INFO("%s: expert prefetch: the order of %zu host expert tensors from the graph\n", __func__, order.size());
+        }
+    }
+
     // a new graph: what the previous one copied is the order, and prefetching starts over
-    void begin_graph() {
+    // alloc_ok: the slots may take their memory now (no MoE cache phases, or the phase of large batches); with
+    // phases a failed allocation is tried again at the next phase of large batches, without them never again
+    void begin_graph(bool alloc_ok, bool phases) {
         drain();
+        static const bool profile = getenv("LLAMA_PROFILE_UBATCH") != nullptr;
+        if (profile && n_uploaded > 0) {
+            LLAMA_LOG_INFO("%s: expert prefetch: %" PRId64 " experts uploaded (%.2f GB), %" PRId64 " cached ones skipped\n",
+                    __func__, n_uploaded.load(), bytes_uploaded.load()/1e9, n_skipped.load());
+        }
+        n_uploaded = 0; n_skipped = 0; bytes_uploaded = 0;
         if (!learned && !order.empty()) {
             learned = true;
-            if (!alloc_slots()) {
+            if (alloc_ok && !alloc_slots() && !phases) {
                 depth = 0;
             }
         }
@@ -897,6 +961,10 @@ struct llama_context::expert_prefetch {
     // true if src was staged: it has been queued for copy into dst, the cached experts are left to the caller
     bool copy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * ids, int64_t n_tokens) {
         if (!learned) {
+            // a batch below the prefetch's size may copy another set of tensors: learn from large ones only
+            if (n_tokens < min_tokens) {
+                return false;
+            }
             group.push_back(order.empty() || ids != last_ids ? order.size() : group.back());
             last_ids = ids;
             order.push_back(src);
@@ -923,6 +991,16 @@ struct llama_context::expert_prefetch {
             drain();
             active = false;
             i_next = SIZE_MAX;
+            if (from_graph) {
+                // the copies come in another order than the graph's nodes: learn it from the copies of the next graph
+                LLAMA_LOG_WARN("%s: expert prefetch: the copies do not follow the graph, learning their order\n", __func__);
+                release_slots();
+                order.clear();
+                group.clear();
+                last_ids   = nullptr;
+                learned    = false;
+                from_graph = false;
+            }
             return false;
         }
         // the routing of a layer is computed before its first tensor is needed: read it before waiting for that
@@ -1906,6 +1984,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t t_begin = ggml_time_us();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1958,6 +2037,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    // LLAMA_PROFILE_UBATCH: the host time of the large ubatches, =2 of every ubatch
+    static const char * profile_env = getenv("LLAMA_PROFILE_UBATCH");
+    static const bool   profile     = profile_env != nullptr;
+    static const bool   profile_all = profile && atoi(profile_env) == 2;
+    const int64_t t_inputs = ggml_time_us();
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1968,7 +2053,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (profile && (profile_all || ubatch.n_tokens > 256)) {
+        const int64_t t_end = ggml_time_us();
+        synchronize();
+        if (profile_all) {
+            LLAMA_LOG_INFO("%s: build %.2f ms\n", __func__, (t_inputs - t_begin)/1e3);
+        }
+        LLAMA_LOG_INFO("%s: %u tokens: inputs %.1f ms, graph %.1f ms, then waiting for the devices %.1f ms\n", __func__,
+            ubatch.n_tokens, (t_compute - t_inputs)/1e3, (t_end - t_compute)/1e3, (ggml_time_us() - t_end)/1e3);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2220,6 +2315,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    const int64_t t_decode0 = ggml_time_us();
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2326,6 +2422,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const int64_t t_init0 = ggml_time_us();
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
@@ -2368,6 +2465,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         break;
     }
+    const int64_t t_init1 = ggml_time_us();
 
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
@@ -2621,6 +2719,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    {
+        // LLAMA_PROFILE_UBATCH=2: the host time of the whole call, before the ubatches, and in the memory module
+        static const char * env = getenv("LLAMA_PROFILE_UBATCH");
+        if (env != nullptr && atoi(env) == 2) {
+            const int64_t t_end = ggml_time_us();
+            LLAMA_LOG_INFO("%s: %d tokens: %.2f ms, of which %.2f ms before init_batch, %.2f ms in init_batch\n", __func__,
+                (int) balloc->get_n_tokens(), (t_end - t_decode0)/1e3, (t_init0 - t_decode0)/1e3, (t_init1 - t_init0)/1e3);
+        }
+    }
 
     return 0;
 }
@@ -3459,8 +3567,26 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    // a large graph can give the prefetch its order before it runs, so the first one is prefetched too
+    if (batched && (prefetch == nullptr || !prefetch->learned) && !prefetch_off) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_MUL_MAT_ID || expert_prefetch::host_weights(node->src[0], model) == nullptr) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+            if (backend != nullptr && !ggml_backend_is_cpu(backend)) {
+                auto * pf = prefetch_for(backend);
+                if (pf != nullptr && node->src[2]->ne[1] >= pf->min_tokens) {
+                    pf->learn_graph(gf, sched.get(), model);
+                }
+            }
+            break;
+        }
+    }
     if (prefetch) {
-        prefetch->begin_graph();
+        const bool phases = moe_cache && moe_cache->has_phases();
+        prefetch->begin_graph(!phases || moe_phase_large, phases);
     }
     if (moe_cache) {
         moe_cache->begin();

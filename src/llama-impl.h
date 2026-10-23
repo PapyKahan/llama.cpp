@@ -77,6 +77,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 // Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
+// Mark the host pages of a mapped tensor as randomly accessed, once: a page fault then reads its own page only.
+void llama_advise_random(const ggml_tensor * tensor);
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();

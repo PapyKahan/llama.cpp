@@ -6,11 +6,19 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 struct llama_logger_state {
     ggml_log_callback log_callback = llama_log_callback_default;
@@ -37,6 +45,34 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
     }
 
     llama_prefetch(std::move(mr));
+}
+
+void llama_advise_random(const ggml_tensor * tensor) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return;
+    }
+
+    static std::mutex mtx;
+    static std::unordered_set<const void *> done;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!done.insert(tensor->data).second) {
+        return;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+    const uintptr_t page  = (uintptr_t) page_size;
+    const uintptr_t begin = (uintptr_t) tensor->data / page * page;
+    const uintptr_t end   = ((uintptr_t) tensor->data + ggml_nbytes(tensor) + page - 1) / page * page;
+    if (madvise((void *) begin, end - begin, MADV_RANDOM) != 0) {
+        LLAMA_LOG_WARN("%s: madvise(MADV_RANDOM) failed for %s: %s\n", __func__, tensor->name, strerror(errno));
+    }
+#else
+    GGML_UNUSED(tensor);
+#endif
 }
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}

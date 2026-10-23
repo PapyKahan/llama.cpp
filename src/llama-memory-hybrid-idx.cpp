@@ -389,6 +389,23 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_update() {
     GGML_ASSERT(mem_idx != nullptr);
 
+    // LLAMA_PROFILE_UBATCH=2: how often the layout is rebuilt and what it costs
+    static const char * prof_env = getenv("LLAMA_PROFILE_UBATCH");
+    static const bool   prof     = prof_env != nullptr && atoi(prof_env) == 2;
+    static int64_t prof_calls = 0, prof_full = 0, prof_us = 0;
+    const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+    struct prof_guard {
+        const bool & on; int64_t t0; int64_t & us; int64_t & calls; int64_t & full;
+        ~prof_guard() {
+            if (!on) { return; }
+            us += ggml_time_us() - t0; ++calls;
+            if (calls % 200 == 0) {
+                LLAMA_LOG_INFO("kpool_layout_update: %lld calls, %lld full rebuilds, %.3f ms per call\n",
+                    (long long) calls, (long long) full, us/1e3/calls);
+            }
+        }
+    } prof_g { prof, prof_t0, prof_us, prof_calls, prof_full };
+
     if (!kpool_lay) {
         kpool_lay = std::make_unique<kpool_layout>();
     }
@@ -415,16 +432,38 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
+        const llama_pos stale = mem_idx_stale[s];
+        bool kept = false;
+        if (stale == POS_CLEAN && !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first) {
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
+            }
+        } else if (stale != POS_CLEAN && stale > 0 && !sq.cells.empty() && !sp.empty() &&
+                sq.pos_min == sp.begin()->first) {
+            // an edit leaves the cells below its stale position as they were (a rejected draft removes a tail):
+            // drop the layout from there and append the sequence's cells from there on, the pools that lose a
+            // member go and the scan resumes after the last pool kept
+            size_t n_keep = sq.cells.size();
+            while (n_keep > 0 && sq.cells[n_keep - 1].first >= stale) {
+                --n_keep;
+            }
+            const auto   tail   = sp.lower_bound(std::make_pair(stale, (uint32_t) 0));
+            const size_t n_tail = (size_t) std::distance(tail, sp.end());
+            if (n_keep + n_tail == sp.size()) {
+                sq.cells.resize(n_keep);
+                sq.cells.insert(sq.cells.end(), tail, sp.end());
+                while (!sq.pools.empty() && sq.pools.back() + kpool > n_keep) {
+                    sq.pools.pop_back();
+                }
+                sq.j_next = sq.pools.empty() ? 0 : (size_t) sq.pools.back() + kpool;
+                kept = true;
             }
         }
 
         // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // regroup a sequence without changing its cell count, so a stale sequence rebuilds unless kept above
+        if (sq.cells.size() != sp.size() || (stale != POS_CLEAN && !kept)) {
+            prof_full += prof && !sp.empty();
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -461,6 +500,45 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
         sq.j_next = j;
+
+        // LLAMA_KPOOL_CHECK=1: an incremental update must give the layout a rebuild gives
+        static const bool check = getenv("LLAMA_KPOOL_CHECK") != nullptr;
+        if (check && kept) {
+            std::vector<std::pair<llama_pos, uint32_t>> ref_cells(sp.begin(), sp.end());
+            std::vector<uint32_t> ref_pools;
+            size_t jr = 0;
+            if (hparams_idx.indexer_kpool_by_order) {
+                for (; jr + kpool <= ref_cells.size(); jr += kpool) {
+                    ref_pools.push_back((uint32_t) jr);
+                }
+            } else {
+                while (jr + kpool <= ref_cells.size()) {
+                    const llama_pos p0 = ref_cells[jr].first;
+                    if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
+                        ++jr;
+                        continue;
+                    }
+                    bool ok = true;
+                    for (uint32_t k = 1; k < kpool; ++k) {
+                        if (ref_cells[jr + k].first != p0 + (llama_pos) k) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        ref_pools.push_back((uint32_t) jr);
+                        jr += kpool;
+                    } else {
+                        ++jr;
+                    }
+                }
+            }
+            if (ref_cells != sq.cells || ref_pools != sq.pools) {
+                LLAMA_LOG_ERROR("%s: seq %d: the incremental layout differs from a rebuild (%zu/%zu cells, %zu/%zu pools)\n",
+                    __func__, s, sq.cells.size(), ref_cells.size(), sq.pools.size(), ref_pools.size());
+                GGML_ABORT("k-pool layout mismatch");
+            }
+        }
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
     }

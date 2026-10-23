@@ -1876,10 +1876,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // GGML_SCHED_PROFILE: host time per backend in the input copies and in the compute calls of the splits
+    static const bool profile = getenv("GGML_SCHED_PROFILE") != NULL;
+    int64_t t_in[GGML_SCHED_MAX_BACKENDS]   = {0};
+    int64_t t_comp[GGML_SCHED_MAX_BACKENDS] = {0};
+    int64_t t_split = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (profile) {
+            t_split = ggml_time_us();
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1904,10 +1913,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t t_c = 0;
+        if (profile) {
+            t_c = ggml_time_us();
+            t_in[split_backend_id] += t_c - t_split;
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (profile) {
+                t_comp[split_backend_id] += ggml_time_us() - t_c;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1949,6 +1966,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (profile && sched->n_splits > 16) {
+        char line[512];
+        int  pos = 0;
+        for (int b = 0; b < sched->n_backends && pos < (int) sizeof(line) - 64; b++) {
+            pos += snprintf(line + pos, sizeof(line) - pos, " %s: inputs %.1f ms, compute %.1f ms;",
+                ggml_backend_name(sched->backends[b]), t_in[b]/1e3, t_comp[b]/1e3);
+        }
+        GGML_LOG_INFO("%s: %d splits:%s\n", __func__, sched->n_splits, line);
     }
 
     return GGML_STATUS_SUCCESS;

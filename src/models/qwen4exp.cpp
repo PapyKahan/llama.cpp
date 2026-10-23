@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <thread>
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -993,6 +994,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // a ubatch in several chunks converts a quantized K/V to F16 once for all of them, where the attention of each
+    // chunk would convert the whole cache again (LLAMA_QSA_KV_F16_ONCE=0 keeps the per-chunk conversion)
+    static const bool kv_f16_once = [] { const char * e = getenv("LLAMA_QSA_KV_F16_ONCE"); return e == nullptr || atoi(e) != 0; }();
+    // the CPU backend has no quantized-to-F16 copy: only a cache in device memory is converted ahead
+    const bool kv_on_device = k->view_src != nullptr && k->view_src->buffer != nullptr &&
+        !ggml_backend_buffer_is_host(k->view_src->buffer);
+    if (kv_f16_once && kv_on_device && inp_kpool->chunks.size() > 1) {
+        if (ggml_is_quantized(k->type) && ggml_is_contiguous(k)) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (ggml_is_quantized(v->type) && ggml_is_contiguous(v)) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+    }
+
     // the selection replaces the kq_mask and has its row layout, one chunk of rows at a time
     // it is not allocated without dense layers reading the kq_mask
     const ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -1312,7 +1328,12 @@ public:
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
+    // with raw: the rows of each token, gathered on the host as they are stored, and their positions in raw;
+    // the device converts them, so a large ubatch moves the stored rows, not the F32 ones
+    // without raw: the rows of each token in the table, gathered by a get_rows on the host table
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * raw  = nullptr;   // [ple_head_dim, ple_n_heads * n_tokens] of the table's type
+    std::vector<uint8_t> staging;
 
     const llama_model & model;
 
@@ -1387,9 +1408,49 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
-        if (prefetch) {
-            llama_prefetch_rows(ple, idx.data(), idx.size());
+        // a large raw gather splits the rows over threads, each asking the kernel for its rows' pages first, so the
+        // reads of the pages not in memory are in flight together; MADV_RANDOM keeps a fault from reading the pages
+        // around a row, which a table of rows this small and scattered never reads
+        static const int n_gather = [] { const char * v = getenv("LLAMA_PLE_THREADS"); return v ? std::max(1, atoi(v)) : 16; }();
+        const bool   prefetch  = model.can_prefetch.count(ple) > 0;
+        const size_t n_rows    = idx.size();
+        const int    n_thr     = raw != nullptr ? (int) std::min<size_t>(n_gather, n_rows/2048) : 1;
+
+        if (prefetch && n_thr <= 1) {
+            llama_prefetch_rows(ple, idx.data(), n_rows);
+        }
+
+        if (raw != nullptr) {
+            if (prefetch) {
+                llama_advise_random(ple);
+            }
+            const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
+            staging.resize(n_rows*row_bytes);
+            const char * base = (const char *) ple->data;
+            auto gather = [&](size_t i0, size_t i1) {
+                if (prefetch && n_thr > 1) {
+                    llama_prefetch_rows(ple, idx.data() + i0, i1 - i0);
+                }
+                for (size_t i = i0; i < i1; ++i) {
+                    memcpy(staging.data() + i*row_bytes, base + (size_t) idx[i]*ple->nb[1], row_bytes);
+                    idx[i] = (int32_t) i;
+                }
+            };
+            if (n_thr <= 1) {
+                gather(0, n_rows);
+            } else {
+                std::vector<std::thread> workers;
+                workers.reserve(n_thr - 1);
+                const size_t step = (n_rows + n_thr - 1)/n_thr;
+                for (int t = 1; t < n_thr; ++t) {
+                    workers.emplace_back(gather, std::min(n_rows, t*step), std::min(n_rows, (t + 1)*step));
+                }
+                gather(0, std::min(n_rows, step));
+                for (auto & w : workers) {
+                    w.join();
+                }
+            }
+            ggml_backend_tensor_set(raw, staging.data(), 0, staging.size());
         }
     }
 
@@ -1463,10 +1524,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
+
+    // a large ubatch gathers the stored rows on the host and converts them on the device (LLAMA_PLE_RAW, MoE cache
+    // phases): its F32 rows would fill the host compute buffer and the link to the device
+    ggml_tensor * table = model.per_layer_tok_embd;
+    static const bool ple_raw = [] {
+        const char * v = getenv("LLAMA_PLE_RAW");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (ple_raw && ggml_backend_buffer_is_host(table->buffer) && ggml_is_quantized(table->type)) {
+        ple_inp->raw = ggml_new_tensor_2d(ctx0, table->type, table->ne[0], n_heads * n_tokens);
+        ggml_set_input(ple_inp->raw);
+        table = ple_inp->raw;
+    }
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
