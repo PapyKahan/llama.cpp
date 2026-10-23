@@ -47,6 +47,9 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // whether expert e of the host weight w is in the cache of the device of backend
+    bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

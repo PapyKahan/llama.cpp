@@ -742,6 +742,17 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return false;
+        }
+        const binding & b = it->second;
+        const group & g = groups[layers[b.il].ig];
+        const int32_t * slots = g.slru.slot_map[b.il];
+        return backend == devices[g.id].backend && slots != nullptr && slots[e] < g.n_slots;
+    }
+
     static const ggml_tensor * base_of(const ggml_tensor * t) {
         while (t->view_src != nullptr) {
             t = t->view_src;
@@ -977,6 +988,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
+    return pimpl->cached(backend, w, e);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

@@ -279,6 +279,13 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // LLAMA_MOE_PREFETCH=<slots>: large batches upload the host experts of the next expert tensors on a second
+    // stream while the current ones compute, see sched_copy_experts
+    struct expert_prefetch;
+    std::unique_ptr<expert_prefetch> prefetch;
+    bool prefetch_off = false;
+    expert_prefetch * prefetch_for(ggml_backend_t backend);
+
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 

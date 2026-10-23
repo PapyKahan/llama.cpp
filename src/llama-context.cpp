@@ -14,9 +14,14 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -597,6 +602,260 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+// Large batches read every host expert of a layer (op offload); uploaded on the compute stream, the transfers and
+// the computation alternate. With LLAMA_MOE_PREFETCH=<slots>, a worker uploads the host expert tensors of a large
+// batch in the order the previous large batch copied them, on a second stream of the device, into device staging
+// slots, while the earlier tensors compute; sched_copy_experts then copies a staged tensor into place on the device.
+// Every expert the MoE cache does not hold is uploaded, whatever the routing: a batch of this size reads all of
+// them. The first tensor of each batch, and a batch whose tensors come in another order, take the regular path.
+struct llama_context::expert_prefetch {
+    struct slot {
+        ggml_backend_buffer_t buf   = nullptr;
+        ggml_context        * ctx   = nullptr; // the descriptor of the staged tensor
+        ggml_tensor         * t     = nullptr;
+        ggml_backend_event_t  ready = nullptr; // recorded on the upload stream after the uploads
+        ggml_backend_event_t  done  = nullptr; // recorded on the compute stream after the copy into place
+        bool                  done_recorded = false;
+        const ggml_tensor   * src   = nullptr; // the host tensor staged in the slot
+        bool                  issued = false;  // the worker has issued its uploads
+    };
+
+    ggml_backend_t          backend = nullptr; // the compute backend of the device
+    ggml_backend_t          stream  = nullptr; // a second backend of the same device, for the uploads
+    const llama_moe_cache * cache   = nullptr;
+    int                     depth   = 0;
+    int64_t                 min_tokens = 1024;
+
+    std::vector<slot> slots;
+    std::deque<int>   free_slots;
+    std::deque<int>   staged; // slots in the order of their tensors
+
+    // the host expert tensors of a large batch in the order of their copies, learned from the first large batch
+    std::vector<const ggml_tensor *> order;
+    bool   learned = false;
+    bool   active  = false;
+    size_t i_next  = 0; // position in order of the next copy expected
+    size_t i_fetch = 0; // position in order of the next tensor to stage
+
+    std::thread             worker;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<int>         jobs;
+    bool                    quit = false;
+
+    expert_prefetch(ggml_backend_t backend, const llama_moe_cache * cache, int depth, int64_t min_tokens) :
+            backend(backend), cache(cache), depth(depth), min_tokens(min_tokens) {
+        stream = ggml_backend_dev_init(ggml_backend_get_device(backend), nullptr);
+        if (stream == nullptr) {
+            throw std::runtime_error("failed to create the upload stream of the expert prefetch");
+        }
+        worker = std::thread([this] { run(); });
+    }
+
+    ~expert_prefetch() {
+        drain();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            quit = true;
+        }
+        cv.notify_all();
+        worker.join();
+        for (auto & s : slots) {
+            ggml_backend_event_free(s.ready);
+            ggml_backend_event_free(s.done);
+            ggml_free(s.ctx);
+            ggml_backend_buffer_free(s.buf);
+        }
+        ggml_backend_free(stream);
+    }
+
+    void run() {
+        for (;;) {
+            int k;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] { return quit || !jobs.empty(); });
+                if (jobs.empty()) {
+                    return;
+                }
+                k = jobs.front();
+                jobs.pop_front();
+            }
+            slot & s = slots[k];
+            // a slot is refilled only once its previous tensor was copied into place
+            if (s.done_recorded) {
+                ggml_backend_event_synchronize(s.done);
+            }
+            const ggml_tensor * src = s.src;
+            ggml_reset(s.ctx);
+            s.t = ggml_new_tensor(s.ctx, src->type, GGML_MAX_DIMS, src->ne);
+            ggml_backend_tensor_alloc(s.buf, s.t, ggml_backend_buffer_get_base(s.buf));
+
+            const int64_t n_expert    = src->ne[2];
+            const size_t  expert_size = src->nb[2];
+            auto in_cache = [&](int64_t e) { return cache != nullptr && cache->cached(backend, src, e); };
+            for (int64_t first = 0; first < n_expert; ) {
+                if (in_cache(first)) {
+                    first++;
+                    continue;
+                }
+                int64_t last = first;
+                while (last + 1 < n_expert && !in_cache(last + 1)) {
+                    last++;
+                }
+                ggml_backend_tensor_set_async(stream, s.t, (const uint8_t *) src->data + first*expert_size,
+                        first*expert_size, (last + 1 - first)*expert_size);
+                first = last + 1;
+            }
+            ggml_backend_event_record(s.ready, stream);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                s.issued = true;
+            }
+            cv.notify_all();
+        }
+    }
+
+    // slots the size of the largest learned tensor
+    bool alloc_slots() {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        size_t size = 0;
+        for (const ggml_tensor * t : order) {
+            size = std::max(size, ggml_backend_buft_get_alloc_size(buft, t));
+        }
+        slots.resize(depth);
+        for (int k = 0; k < depth; ++k) {
+            slot & s = slots[k];
+            s.buf = ggml_backend_buft_alloc_buffer(buft, size);
+            if (s.buf == nullptr) {
+                LLAMA_LOG_WARN("%s: no room for %d staging slots of %.1f MiB, expert prefetch off\n", __func__, depth, size/1024.0/1024.0);
+                return false;
+            }
+            ggml_init_params params = { ggml_tensor_overhead()*2, nullptr, true };
+            s.ctx   = ggml_init(params);
+            s.ready = ggml_backend_event_new(dev);
+            s.done  = ggml_backend_event_new(dev);
+            free_slots.push_back(k);
+        }
+        LLAMA_LOG_INFO("%s: expert prefetch: %d staging slots of %.1f MiB for %zu host expert tensors\n", __func__,
+                depth, size/1024.0/1024.0, order.size());
+        return true;
+    }
+
+    // wait until every staged tensor is uploaded, and give the slots back
+    void drain() {
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [&] {
+                if (!jobs.empty()) {
+                    return false;
+                }
+                for (int k : staged) {
+                    if (!slots[k].issued) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+        }
+        ggml_backend_synchronize(stream);
+        for (int k : staged) {
+            free_slots.push_back(k);
+        }
+        staged.clear();
+    }
+
+    // a new graph: what the previous one copied is the order, and prefetching starts over
+    void begin_graph() {
+        drain();
+        if (!learned && !order.empty()) {
+            learned = true;
+            if (!alloc_slots()) {
+                depth = 0;
+            }
+        }
+        active = false;
+        i_next = 0;
+        i_fetch = 0;
+    }
+
+    void enqueue() {
+        while (!free_slots.empty() && i_fetch < order.size()) {
+            const int k = free_slots.front();
+            free_slots.pop_front();
+            slots[k].src    = order[i_fetch++];
+            slots[k].issued = false;
+            staged.push_back(k);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                jobs.push_back(k);
+            }
+            cv.notify_all();
+        }
+    }
+
+    // true if src was staged: it has been queued for copy into dst, the cached experts are left to the caller
+    bool copy(const ggml_tensor * src, ggml_tensor * dst, int64_t n_tokens) {
+        if (!learned) {
+            order.push_back(src);
+            return false;
+        }
+        if (depth == 0 || n_tokens < min_tokens || i_next == SIZE_MAX) {
+            return false;
+        }
+        if (!active) {
+            // the first tensor of a large batch starts the prefetch of the ones after it
+            if (i_next == 0 && !order.empty() && order[0] == src) {
+                active  = true;
+                i_next  = 1;
+                i_fetch = 1;
+                enqueue();
+            }
+            return false;
+        }
+        if (i_next >= order.size() || order[i_next] != src || staged.empty() || slots[staged.front()].src != src) {
+            // not the learned order: no prefetch for the rest of this graph
+            drain();
+            active = false;
+            i_next = SIZE_MAX;
+            return false;
+        }
+        const int k = staged.front();
+        slot & s = slots[k];
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [&] { return s.issued; });
+        }
+        ggml_backend_event_wait(backend, s.ready);
+        ggml_backend_tensor_copy_async(backend, backend, s.t, dst);
+        ggml_backend_event_record(s.done, backend);
+        s.done_recorded = true;
+        staged.pop_front();
+        free_slots.push_back(k);
+        i_next++;
+        enqueue();
+        return true;
+    }
+};
+
+llama_context::expert_prefetch * llama_context::prefetch_for(ggml_backend_t backend) {
+    if (!prefetch) {
+        if (prefetch_off) {
+            return nullptr;
+        }
+        const char * v = getenv("LLAMA_MOE_PREFETCH");
+        const int depth = v != nullptr ? atoi(v) : 0;
+        if (depth <= 0) {
+            prefetch_off = true;
+            return nullptr;
+        }
+        const char * m = getenv("LLAMA_MOE_PREFETCH_MIN");
+        prefetch = std::make_unique<expert_prefetch>(backend, moe_cache.get(), depth, m != nullptr ? atoll(m) : 1024);
+    }
+    return prefetch->backend == backend ? prefetch.get() : nullptr;
 }
 
 llama_context::~llama_context() {
@@ -3087,6 +3346,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (prefetch) {
+        prefetch->begin_graph();
+    }
     if (moe_cache) {
         moe_cache->begin();
     }
@@ -3127,6 +3389,17 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
+        return true;
+    }
+
+    // a staged tensor is copied into place, then the experts of the MoE cache over it
+    if (auto * pf = lctx->prefetch_for(backend); pf != nullptr && pf->copy(src, dst, ids->ne[1])) {
+        if (lctx->moe_cache) {
+            for (int64_t e = 0; e < src->ne[2]; ) {
+                const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, src->ne[2] - 1);
+                e += n > 0 ? n : 1;
+            }
+        }
         return true;
     }
 
