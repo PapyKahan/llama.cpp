@@ -620,6 +620,8 @@ struct llama_context::expert_prefetch {
         bool                  done_recorded = false;
         const ggml_tensor   * src   = nullptr; // the host tensor staged in the slot
         bool                  issued = false;  // the worker has issued its uploads
+        bool                  routed = false;  // only the experts in used are staged
+        std::vector<bool>     used;
     };
 
     ggml_backend_t          backend = nullptr; // the compute backend of the device
@@ -632,9 +634,14 @@ struct llama_context::expert_prefetch {
     std::deque<int>   free_slots;
     std::deque<int>   staged; // slots in the order of their tensors
 
-    // the host expert tensors of a large batch in the order of their copies, learned from the first large batch
+    // the host expert tensors of a large batch in the order of their copies, learned from the first large batch,
+    // and the position of the first tensor of each one's layer, the tensors of a layer sharing one routing
     std::vector<const ggml_tensor *> order;
+    std::vector<size_t>              group;
+    const ggml_tensor *              last_ids = nullptr;
     bool   learned = false;
+    size_t known   = SIZE_MAX; // the group whose routing is in used
+    std::vector<bool> used;
     bool   active  = false;
     size_t i_next  = 0; // position in order of the next copy expected
     size_t i_fetch = 0; // position in order of the next tensor to stage
@@ -695,7 +702,9 @@ struct llama_context::expert_prefetch {
 
             const int64_t n_expert    = src->ne[2];
             const size_t  expert_size = src->nb[2];
-            auto in_cache = [&](int64_t e) { return cache != nullptr && cache->cached(backend, src, e); };
+            auto in_cache = [&](int64_t e) {
+                return (s.routed && !s.used[e]) || (cache != nullptr && cache->cached(backend, src, e));
+            };
             for (int64_t first = 0; first < n_expert; ) {
                 if (in_cache(first)) {
                     first++;
@@ -734,6 +743,7 @@ struct llama_context::expert_prefetch {
                 LLAMA_LOG_WARN("%s: no room for %d staging slots of %.1f MiB, expert prefetch off\n", __func__, depth, size/1024.0/1024.0);
                 return false;
             }
+            ggml_backend_buffer_clear(s.buf, 0);
             ggml_init_params params = { ggml_tensor_overhead()*2, nullptr, true };
             s.ctx   = ggml_init(params);
             s.ready = ggml_backend_event_new(dev);
@@ -780,12 +790,22 @@ struct llama_context::expert_prefetch {
         active = false;
         i_next = 0;
         i_fetch = 0;
+        known = SIZE_MAX;
     }
 
     void enqueue() {
         while (!free_slots.empty() && i_fetch < order.size()) {
+            // a tensor after the first of its layer waits for the routing of that layer
+            const bool first = group[i_fetch] == i_fetch;
+            if (!first && group[i_fetch] != known) {
+                break;
+            }
             const int k = free_slots.front();
             free_slots.pop_front();
+            slots[k].routed = !first;
+            if (!first) {
+                slots[k].used = used;
+            }
             slots[k].src    = order[i_fetch++];
             slots[k].issued = false;
             staged.push_back(k);
@@ -797,9 +817,27 @@ struct llama_context::expert_prefetch {
         }
     }
 
+    // the routing of the layer at position i of order, read from ids
+    void read_routing(const ggml_tensor * ids, int64_t n_expert, size_t i) {
+        std::vector<int32_t> data(ggml_nelements(ids));
+        ggml_backend_tensor_get_async(backend, ids, data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend);
+        used.assign(n_expert, false);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                GGML_ASSERT(id >= 0 && id < n_expert);
+                used[id] = true;
+            }
+        }
+        known = i;
+    }
+
     // true if src was staged: it has been queued for copy into dst, the cached experts are left to the caller
-    bool copy(const ggml_tensor * src, ggml_tensor * dst, int64_t n_tokens) {
+    bool copy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * ids, int64_t n_tokens) {
         if (!learned) {
+            group.push_back(order.empty() || ids != last_ids ? order.size() : group.back());
+            last_ids = ids;
             order.push_back(src);
             return false;
         }
@@ -812,6 +850,7 @@ struct llama_context::expert_prefetch {
                 active  = true;
                 i_next  = 1;
                 i_fetch = 1;
+                read_routing(ids, src->ne[2], 0);
                 enqueue();
             }
             return false;
@@ -835,6 +874,9 @@ struct llama_context::expert_prefetch {
         s.done_recorded = true;
         staged.pop_front();
         free_slots.push_back(k);
+        if (group[i_next] == i_next) {
+            read_routing(ids, src->ne[2], i_next);
+        }
         i_next++;
         enqueue();
         return true;
@@ -3393,7 +3435,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // a staged tensor is copied into place, then the experts of the MoE cache over it
-    if (auto * pf = lctx->prefetch_for(backend); pf != nullptr && pf->copy(src, dst, ids->ne[1])) {
+    if (auto * pf = lctx->prefetch_for(backend); pf != nullptr && pf->copy(src, dst, ids, ids->ne[1])) {
         if (lctx->moe_cache) {
             for (int64_t e = 0; e < src->ne[2]; ) {
                 const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, src->ne[2] - 1);
