@@ -131,6 +131,68 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// The active tiles of a MoE matrix multiplication, in expert order: tile_map[t] = expert << 16 | column tile, -1 from
+// the last active tile to ntiles. One block of 1024 threads, the experts strided over them.
+static __global__ void mmq_build_tile_map(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_map, const int n_expert, const int J,
+        const int ntiles) {
+    __shared__ int warp_sums[32];
+    __shared__ int carry;
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    if (threadIdx.x == 0) {
+        carry = 0;
+    }
+    __syncthreads();
+
+    for (int e0 = 0; e0 < n_expert; e0 += blockDim.x) {
+        const int e = e0 + threadIdx.x;
+        const int n = e < n_expert ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1)/J : 0;
+
+        int incl = n;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFF, incl, offset, WARP_SIZE);
+            if (lane >= offset) {
+                incl += v;
+            }
+        }
+        if (lane == WARP_SIZE - 1) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const int w = lane < (int) (blockDim.x/WARP_SIZE) ? warp_sums[lane] : 0;
+            int wincl = w;
+#pragma unroll
+            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                const int v = __shfl_up_sync(0xFFFFFFFF, wincl, offset, WARP_SIZE);
+                if (lane >= offset) {
+                    wincl += v;
+                }
+            }
+            warp_sums[lane] = wincl - w;
+        }
+        __syncthreads();
+
+        const int start = carry + warp_sums[warp] + incl - n;
+        for (int j = 0; j < n; ++j) {
+            tile_map[start + j] = (e << 16) | j;
+        }
+        __syncthreads();
+        if (threadIdx.x == blockDim.x - 1) {
+            carry = start + n;
+        }
+        __syncthreads();
+    }
+
+    for (int t = carry + threadIdx.x; t < ntiles; t += blockDim.x) {
+        tile_map[t] = -1;
+    }
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -294,8 +356,17 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        // GGML_CUDA_MMID_SORT=0 keeps the per-expert scan for many tokens
+        static const bool sort_on = [] { const char * v = getenv("GGML_CUDA_MMID_SORT"); return v == nullptr || atoi(v) != 0; }();
+        const size_t n_tmp = sort_on ? ggml_cuda_mm_ids_sort_tmp_size(ne02, ne12) : 0;
+        if (n_tmp > 0) {
+            ggml_cuda_pool_alloc<int32_t> tmp(ctx.pool(), n_tmp);
+            ggml_cuda_launch_mm_ids_sort((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), tmp.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        } else {
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -341,13 +412,27 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, J_best};
+
+    // the grid covers every expert as if it had all the tokens: with many tokens, launch the active tiles only
+    // (GGML_CUDA_MMQ_TILE_MAP=0 keeps the full grid)
+    static const bool tile_map_on = [] { const char * v = getenv("GGML_CUDA_MMQ_TILE_MAP"); return v == nullptr || atoi(v) != 0; }();
+    const int64_t ntiles_full = ((ne12 + J_best - 1)/J_best)*ne02;
+    const int64_t ntiles_map  = (ne_get_rows + J_best - 1)/J_best + ne02;
+    ggml_cuda_pool_alloc<int32_t> tile_map(ctx.pool());
+    if (tile_map_on && ne02 < (1 << 15) && ntiles_full > 2*ntiles_map && ntiles_map < (1 << 24)) {
+        tile_map.alloc(ntiles_map);
+        mmq_build_tile_map<<<1, 1024, 0, stream>>>(expert_bounds.get(), tile_map.get(), (int) ne02, J_best, (int) ntiles_map);
+        CUDA_CHECK(cudaGetLastError());
+        args.tile_map   = tile_map.get();
+        args.ntiles_map = ntiles_map;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

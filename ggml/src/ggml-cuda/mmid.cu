@@ -177,3 +177,175 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+// Many tokens: a stable counting sort, the same layout as mm_ids_helper. A warp counts the entries of a segment of
+// MMID_SEG tokens per expert, one block turns the counts into the expert bounds and the first position of each
+// segment's entries of each expert, and each warp then writes its entries in token order.
+static constexpr int MMID_SEG   = 32; // tokens per segment, one warp each
+static constexpr int MMID_WARPS = 8;  // warps per block
+
+static __global__ void mm_ids_sort_count(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ counts, const int n_experts, const int n_tokens,
+        const int n_expert_used, const int si1) {
+    extern __shared__ int mm_ids_sort_count_data[];
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;
+    int * wc = mm_ids_sort_count_data + warp*n_experts;
+
+    for (int e = lane; e < n_experts; e += WARP_SIZE) {
+        wc[e] = 0;
+    }
+    __syncwarp();
+
+    const int seg = blockIdx.x*MMID_WARPS + warp;
+    const int it0 = seg*MMID_SEG;
+    if (it0 >= n_tokens) {
+        return;
+    }
+    const int n_entries = min(MMID_SEG, n_tokens - it0)*n_expert_used;
+    for (int k = lane; k < n_entries; k += WARP_SIZE) {
+        const int e = ids[(it0 + k/n_expert_used)*si1 + k % n_expert_used];
+        if (e >= 0 && e < n_experts) {
+            atomicAdd(&wc[e], 1);
+        }
+    }
+    __syncwarp();
+
+    for (int e = lane; e < n_experts; e += WARP_SIZE) {
+        counts[(size_t) seg*n_experts + e] = wc[e];
+    }
+}
+
+// one thread per expert: the counts of each segment become the position of its first entry
+static __global__ void mm_ids_sort_scan(
+        int32_t * __restrict__ counts, int32_t * __restrict__ expert_bounds, const int n_experts, const int n_seg) {
+    __shared__ int warp_sums[32];
+
+    const int e    = threadIdx.x;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    int tot = 0;
+    if (e < n_experts) {
+        for (int s = 0; s < n_seg; ++s) {
+            tot += counts[(size_t) s*n_experts + e];
+        }
+    }
+
+    int incl = tot;
+#pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, offset, WARP_SIZE);
+        if (lane >= offset) {
+            incl += v;
+        }
+    }
+    if (lane == WARP_SIZE - 1) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int w = lane < (int) (blockDim.x/WARP_SIZE) ? warp_sums[lane] : 0;
+        int wincl = w;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFF, wincl, offset, WARP_SIZE);
+            if (lane >= offset) {
+                wincl += v;
+            }
+        }
+        warp_sums[lane] = wincl - w;
+    }
+    __syncthreads();
+
+    if (e >= n_experts) {
+        return;
+    }
+    const int base = warp_sums[warp] + incl - tot;
+    expert_bounds[e] = base;
+    if (e == n_experts - 1) {
+        expert_bounds[n_experts] = base + tot;
+    }
+    int run = base;
+    for (int s = 0; s < n_seg; ++s) {
+        const int c = counts[(size_t) s*n_experts + e];
+        counts[(size_t) s*n_experts + e] = run;
+        run += c;
+    }
+}
+
+static __global__ void mm_ids_sort_scatter(
+        const int32_t * __restrict__ ids, const int32_t * __restrict__ offsets, int32_t * __restrict__ ids_src1,
+        int32_t * __restrict__ ids_dst, const int n_experts, const int n_tokens, const int n_expert_used,
+        const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    extern __shared__ int mm_ids_sort_scatter_data[];
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;
+
+    const int seg = blockIdx.x*MMID_WARPS + warp;
+    const int it0 = seg*MMID_SEG;
+    if (it0 >= n_tokens) {
+        return;
+    }
+    int * run = mm_ids_sort_scatter_data + warp*n_experts;
+    for (int e = lane; e < n_experts; e += WARP_SIZE) {
+        run[e] = offsets[(size_t) seg*n_experts + e];
+    }
+    __syncwarp();
+
+    const int n_entries = min(MMID_SEG, n_tokens - it0)*n_expert_used;
+    for (int k0 = 0; k0 < n_entries; k0 += WARP_SIZE) {
+        const int k = k0 + lane;
+        int it  = 0;
+        int iex = 0;
+        int e   = -1;
+        if (k < n_entries) {
+            it  = it0 + k/n_expert_used;
+            iex = k % n_expert_used;
+            e   = ids[it*si1 + iex];
+            if (e < 0 || e >= n_experts) {
+                e = -1;
+            }
+        }
+        // the entries of one expert in this step take consecutive positions in lane order
+        const unsigned int peers = __match_any_sync(0xFFFFFFFF, e);
+        const int pos = e >= 0 ? run[e] + __popc(peers & ((1u << lane) - 1)) : 0;
+        __syncwarp();
+        if (e >= 0 && (peers >> lane) == 1u) {
+            run[e] += __popc(peers);
+        }
+        __syncwarp();
+        if (e >= 0) {
+            ids_dst[pos] = it*n_expert_used + iex;
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex] = pos;
+            } else {
+                ids_src1[pos] = it*sis1 + iex % nchannels_y;
+            }
+        }
+    }
+}
+
+size_t ggml_cuda_mm_ids_sort_tmp_size(const int n_experts, const int n_tokens) {
+    if (n_tokens < 512 || n_experts > 1024) {
+        return 0;
+    }
+    const int n_seg = (n_tokens + MMID_SEG - 1)/MMID_SEG;
+    return (size_t) n_seg*n_experts;
+}
+
+void ggml_cuda_launch_mm_ids_sort(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        int32_t * __restrict__ tmp, const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    GGML_ASSERT(ggml_cuda_mm_ids_sort_tmp_size(n_experts, n_tokens) > 0);
+    const int    n_seg    = (n_tokens + MMID_SEG - 1)/MMID_SEG;
+    const int    n_blocks = (n_seg + MMID_WARPS - 1)/MMID_WARPS;
+    const dim3   block_dims(WARP_SIZE, MMID_WARPS, 1);
+    const size_t nbytes_shared = (size_t) MMID_WARPS*n_experts*sizeof(int);
+
+    mm_ids_sort_count<<<n_blocks, block_dims, nbytes_shared, stream>>>(ids, tmp, n_experts, n_tokens, n_expert_used, si1);
+    mm_ids_sort_scan<<<1, GGML_PAD(n_experts, WARP_SIZE), 0, stream>>>(tmp, expert_bounds, n_experts, n_seg);
+    mm_ids_sort_scatter<<<n_blocks, block_dims, nbytes_shared, stream>>>
+        (ids, tmp, ids_src1, ids_dst, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+}

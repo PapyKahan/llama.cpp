@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "dequantize.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -103,14 +104,159 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// a long mask row is scanned in chunks by many blocks: the selected cells of each chunk are counted first, then
+// written at the chunk's offset, in the order of the single-block scan above
+static constexpr int FA_SPARSE_CHUNK = 8192;
+
+template <int ncols1, bool oob>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_sparse_count(
+        const half * mask_ptr, int32_t * chunk_counts, const int ne30, const int n_queries, const int64_t s31,
+        const int64_t s33) {
+    const int chunk    = blockIdx.x;
+    const int group    = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const int q0 = group*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+    const half * mask = mask_ptr + sequence*s33 + q0*s31;
+
+    const int i_end = min((chunk + 1)*FA_SPARSE_CHUNK, ne30);
+    int cnt = 0;
+    for (int i = chunk*FA_SPARSE_CHUNK + threadIdx.x; i < i_end; i += blockDim.x) {
+        bool selected = false;
+#pragma unroll
+        for (int q = 0; q < ncols1; ++q) {
+            selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
+        }
+        cnt += selected;
+    }
+    cnt = warp_reduce_sum(cnt);
+
+    __shared__ int warp_cnt[256/WARP_SIZE];
+    if (threadIdx.x % WARP_SIZE == 0) {
+        warp_cnt[threadIdx.x / WARP_SIZE] = cnt;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int tot = 0;
+        for (int w = 0; w < 256/WARP_SIZE; ++w) {
+            tot += warp_cnt[w];
+        }
+        chunk_counts[(int64_t(sequence)*gridDim.y + group)*gridDim.x + chunk] = tot;
+    }
+}
+
+template <int ncols1, bool oob>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_sparse_write(
+        const half * mask_ptr, const int32_t * chunk_counts, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30,
+        const int n_queries, const int n_kv_max, const int64_t s31, const int64_t s33) {
+    const int chunk    = blockIdx.x;
+    const int group    = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int lane     = threadIdx.x % WARP_SIZE;
+    const int warp     = threadIdx.x / WARP_SIZE;
+
+    const int64_t list = int64_t(sequence)*gridDim.y + group;
+    const int32_t * cc = chunk_counts + list*gridDim.x;
+    int32_t * indices  = indices_ptr + list*n_kv_max;
+
+    __shared__ int base_s;
+    __shared__ int total_s;
+    __shared__ int warp_offsets[256/WARP_SIZE];
+    if (threadIdx.x == 0) {
+        int base  = 0;
+        int total = 0;
+        for (int c = 0; c < (int) gridDim.x; ++c) {
+            base  += c < chunk ? cc[c] : 0;
+            total += cc[c];
+        }
+        base_s  = base;
+        total_s = total;
+    }
+    __syncthreads();
+
+    const int q0 = group*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+    const half * mask = mask_ptr + sequence*s33 + q0*s31;
+
+    const int i_end = min((chunk + 1)*FA_SPARSE_CHUNK, ne30);
+    int run = base_s;
+    for (int i0 = chunk*FA_SPARSE_CHUNK; i0 < i_end && run < n_kv_max; i0 += blockDim.x) {
+        const int i = i0 + threadIdx.x;
+        bool selected = false;
+        if (i < i_end) {
+#pragma unroll
+            for (int q = 0; q < ncols1; ++q) {
+                selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
+            }
+        }
+        const uint32_t ballot = __ballot_sync(0xFFFFFFFF, selected);
+        if (lane == 0) {
+            warp_offsets[warp] = __popc(ballot);
+        }
+        __syncthreads();
+        int woff = 0;
+        int btot = 0;
+        for (int w = 0; w < 256/WARP_SIZE; ++w) {
+            woff += w < warp ? warp_offsets[w] : 0;
+            btot += warp_offsets[w];
+        }
+        const int dst = run + woff + __popc(ballot & ((1u << lane) - 1));
+        if (selected && dst < n_kv_max) {
+            indices[dst] = i;
+        }
+        run += btot;
+        __syncthreads();
+    }
+
+    if (chunk == (int) gridDim.x - 1) {
+        const int count = min(total_s, n_kv_max);
+        for (int k = count + threadIdx.x; k < n_kv_max; k += blockDim.x) {
+            indices[k] = -1;
+        }
+        if (threadIdx.x == 0) {
+            counts_ptr[list] = count;
+        }
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+int64_t ggml_cuda_flash_attn_ext_compact_mask_scratch(const ggml_tensor * mask, int64_t n_lists) {
+    const int64_t n_chunks = (mask->ne[0] + FA_SPARSE_CHUNK - 1)/FA_SPARSE_CHUNK;
+    return n_chunks > 2 ? n_lists*n_chunks : 0;
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max,
+        int32_t * scratch, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, counts, n_queries, ncols1, n_kv_max, stream);
+    GGML_UNUSED_VARS(mask, indices, counts, n_queries, ncols1, n_kv_max, scratch, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
+    const int64_t n_groups = (n_queries + ncols1 - 1)/ncols1;
+    if (scratch != nullptr && ggml_cuda_flash_attn_ext_compact_mask_scratch(mask, n_groups*mask->ne[3]) > 0) {
+        GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
+        const dim3 grid((mask->ne[0] + FA_SPARSE_CHUNK - 1)/FA_SPARSE_CHUNK, n_groups, mask->ne[3]);
+        const int ne30 = int(mask->ne[0]);
+        const half * m = (const half *) mask->data;
+        if (ncols1 == 1) {
+            flash_attn_mask_to_sparse_count<1, false><<<grid, 256, 0, stream>>>(m, scratch, ne30, n_queries, s31, s33);
+            flash_attn_mask_to_sparse_write<1, false><<<grid, 256, 0, stream>>>(m, scratch, indices, counts, ne30, n_queries, n_kv_max, s31, s33);
+        } else if (n_queries % 8 != 0) {
+            flash_attn_mask_to_sparse_count<8, true><<<grid, 256, 0, stream>>>(m, scratch, ne30, n_queries, s31, s33);
+            flash_attn_mask_to_sparse_write<8, true><<<grid, 256, 0, stream>>>(m, scratch, indices, counts, ne30, n_queries, n_kv_max, s31, s33);
+        } else {
+            flash_attn_mask_to_sparse_count<8, false><<<grid, 256, 0, stream>>>(m, scratch, ne30, n_queries, s31, s33);
+            flash_attn_mask_to_sparse_write<8, false><<<grid, 256, 0, stream>>>(m, scratch, indices, counts, ne30, n_queries, n_kv_max, s31, s33);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const dim3 blocks_num((n_queries + ncols1 - 1)/ncols1, mask->ne[3], 1);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
@@ -123,6 +269,84 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static __global__ void fattn_compact_kv(
+        const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask, int32_t * __restrict__ lists,
+        half * __restrict__ K_c, half * __restrict__ V_c, half * __restrict__ mask_c, const int64_t n_rows,
+        const int D_K, const int D_V, const int n_head, const size_t nbK1, const size_t nbK2, const size_t nbV1,
+        const size_t nbV2, const int n_mask_rows, const int64_t s_mask) {
+    const int64_t r   = blockIdx.x;
+    const int32_t idx = lists[r];
+
+    for (int h = 0; h < n_head; ++h) {
+        for (int pass = 0; pass < 2; ++pass) {
+            const int    D   = pass == 0 ? D_K : D_V;
+            half       * dst = (pass == 0 ? K_c : V_c) + (h*n_rows + r)*D;
+            const char * src = pass == 0 ? K + int64_t(idx)*nbK1 + h*nbK2 : V + int64_t(idx)*nbV1 + h*nbV2;
+            for (int i00 = 2*threadIdx.x; i00 < D; i00 += 2*blockDim.x) {
+                const int ib       = i00/qk;
+                const int iqs      = (i00%qk)/qr;
+                const int iybs     = i00 - i00%qk;
+                const int y_offset = qr == 1 ? 1 : qk/2;
+                // the padding rows read as zeros: their -inf mask entries keep them out, NaN bytes would not
+                float2 v = make_float2(0.0f, 0.0f);
+                if (idx >= 0) {
+                    dequantize_kernel(src, ib, iqs, v);
+                }
+                dst[iybs + iqs + 0]        = __float2half(v.x);
+                dst[iybs + iqs + y_offset] = __float2half(v.y);
+            }
+        }
+    }
+    for (int q = threadIdx.x; q < n_mask_rows; q += blockDim.x) {
+        mask_c[q*n_rows + r] = idx >= 0 ? mask[q*s_mask + idx] : __float2half(-INFINITY);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        lists[r] = idx >= 0 ? (int32_t) r : -1;
+    }
+}
+
+bool ggml_cuda_fattn_compact_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_FA_COMPACT"); return v == nullptr || atoi(v) != 0; }();
+    return on;
+}
+
+bool ggml_cuda_fattn_compact_supported(const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask) {
+    switch (K->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+    return V->type == K->type && mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+        K->ne[3] == 1 && V->ne[3] == 1 && K->ne[2] == V->ne[2] && K->ne[0] % 32 == 0 && V->ne[0] % 32 == 0 &&
+        K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type);
+}
+
+void ggml_cuda_fattn_compact_kv(const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask, int32_t * lists,
+        int64_t n_rows, half * K_c, half * V_c, half * mask_c, cudaStream_t stream) {
+    const dim3 blocks(n_rows, 1, 1);
+    const dim3 threads(128, 1, 1);
+    const int64_t s_mask = mask->nb[1]/sizeof(half);
+#define FATTN_COMPACT_ARGS (const char *) K->data, (const char *) V->data, (const half *) mask->data, lists, K_c, V_c, mask_c, n_rows, \
+        (int) K->ne[0], (int) V->ne[0], (int) K->ne[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) mask->ne[1], s_mask
+    switch (K->type) {
+        case GGML_TYPE_Q4_0: fattn_compact_kv<QK4_0, QR4_0, dequantize_q4_0><<<blocks, threads, 0, stream>>>(FATTN_COMPACT_ARGS); break;
+        case GGML_TYPE_Q4_1: fattn_compact_kv<QK4_1, QR4_1, dequantize_q4_1><<<blocks, threads, 0, stream>>>(FATTN_COMPACT_ARGS); break;
+        case GGML_TYPE_Q5_0: fattn_compact_kv<QK5_0, QR5_0, dequantize_q5_0><<<blocks, threads, 0, stream>>>(FATTN_COMPACT_ARGS); break;
+        case GGML_TYPE_Q5_1: fattn_compact_kv<QK5_1, QR5_1, dequantize_q5_1><<<blocks, threads, 0, stream>>>(FATTN_COMPACT_ARGS); break;
+        case GGML_TYPE_Q8_0: fattn_compact_kv<QK8_0, QR8_0, dequantize_q8_0><<<blocks, threads, 0, stream>>>(FATTN_COMPACT_ARGS); break;
+        default: GGML_ABORT("fatal error");
+    }
+#undef FATTN_COMPACT_ARGS
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
@@ -144,10 +368,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
+    // GGML_CUDA_FA_SPARSE_MIN_KV: query tiles gather from this many K/V cells on, instead of the worst-case bound, as
+    // the queries of a tile mostly select the same cells
+    static const int64_t min_kv = [] { const char * v = getenv("GGML_CUDA_FA_SPARSE_MIN_KV"); return v ? atoll(v) : 0; }();
+
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        K->ne[1] >= (min_kv > 0 && ncols1 > 1 ? min_kv : std::max<int64_t>(4096, 2*n_gather));
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -646,13 +874,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                } else {
-                    if (Q->ne[1] == 1) {
-                        return BEST_FATTN_KERNEL_VEC;
+                // a sparse mask hint over a quantized cache: the sparse MMA kernel reads only the listed cells,
+                // converted into a compact buffer, where the vector kernel reads the whole cache
+                const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 && ggml_cuda_fattn_compact_enabled() &&
+                    ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8) &&
+                    ggml_cuda_fattn_compact_supported(K, V, mask);
+                if (!sparse_decode) {
+                    if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                        if (Q->ne[1] <= 2) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
+                    } else {
+                        if (Q->ne[1] == 1) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
                     }
                 }
             }

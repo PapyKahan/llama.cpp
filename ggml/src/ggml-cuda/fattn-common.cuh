@@ -723,8 +723,23 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// the scratch ints ggml_cuda_flash_attn_ext_compact_mask needs to scan a long mask row with many blocks, 0 for one
+int64_t ggml_cuda_flash_attn_ext_compact_mask_scratch(const ggml_tensor * mask, int64_t n_lists);
+
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max,
+        int32_t * scratch, cudaStream_t stream);
+
+// GGML_CUDA_FA_COMPACT=0 turns the compact sparse gather off
+bool ggml_cuda_fattn_compact_enabled();
+
+// whether ggml_cuda_fattn_compact_kv covers these K, V and mask
+bool ggml_cuda_fattn_compact_supported(const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask);
+
+// the K/V rows and mask entries that the sparse lists name, row r of the lists becoming row r of K_c and V_c
+// ([head][row][dim] F16) and entry r of each mask row of mask_c ([mask row][row]); the lists then name those rows
+void ggml_cuda_fattn_compact_kv(const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask, int32_t * lists,
+        int64_t n_rows, half * K_c, half * V_c, half * mask_c, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1015,6 +1030,10 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    // the pool frees in reverse order: the compact buffers come before the scratch allocated after them
+    ggml_cuda_pool_alloc<half>   K_c(pool);
+    ggml_cuda_pool_alloc<half>   V_c(pool);
+    ggml_cuda_pool_alloc<half>   mask_c(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1028,70 +1047,6 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
-        GGML_ASSERT(f16_extra.K != 0);
-        half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
-        } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
-
-            nb11 = K->ne[0] * sizeof(half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
-        }
-        K_data = (char *) K_f16;
-    }
-
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
-        if (V_is_K_view) {
-            V_data = K_data;
-            nb21   = nb11;
-            nb22   = nb12;
-            nb23   = nb13;
-        } else {
-            const size_t bs = ggml_blck_size(V->type);
-            const size_t ts = ggml_type_size(V->type);
-
-            GGML_ASSERT(f16_extra.V != 0);
-            half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16;
-
-                nb21 = nb21*bs*sizeof(half)/ts;
-                nb22 = nb22*bs*sizeof(half)/ts;
-                nb23 = nb23*bs*sizeof(half)/ts;
-            } else {
-                GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                const int64_t s01 = nb21 / ts;
-                const int64_t s02 = nb22 / ts;
-                const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
-
-                nb21 = V->ne[0] * sizeof(half);
-                nb22 = V->ne[1] * nb21;
-                nb23 = V->ne[2] * nb22;
-            }
-            V_data = (char *) V_f16;
-        }
-    }
-
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1099,16 +1054,117 @@ void launch_fattn(
 
     // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
     int32_t n_kv_max = 0;
+    size_t  n_lists  = 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
         n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
 
-        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+        n_lists = size_t(ntiles_x) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        const int64_t n_scratch = ggml_cuda_flash_attn_ext_compact_mask_scratch(mask, n_lists);
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists + n_scratch);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max,
+            n_scratch > 0 ? KV_max.ptr + size_t(n_kv_max)*n_lists + n_lists : nullptr, main_stream);
+    }
+
+    // a few query tiles (decoding) list fewer cells than the cache holds: only their K/V rows and mask entries are
+    // converted, into compact buffers the lists then index (GGML_CUDA_FA_COMPACT=0 converts the whole K/V)
+    const bool compact = use_sparse && ggml_cuda_fattn_compact_enabled() && (need_f16_K || need_f16_V) && !V_is_K_view &&
+        int64_t(n_kv_max)*int64_t(n_lists) < K->ne[1] && ggml_cuda_fattn_compact_supported(K, V, mask);
+
+    const char * mask_data = mask ? (const char *) mask->data : nullptr;
+    int64_t mask_nb1 = mask ? mask->nb[1] : 0;
+    int64_t mask_nb2 = mask ? mask->nb[2] : 0;
+    int64_t mask_nb3 = mask ? mask->nb[3] : 0;
+
+    if (compact) {
+        const int64_t n_rows = int64_t(n_kv_max)*int64_t(n_lists);
+        K_c.alloc(n_rows*K->ne[0]*K->ne[2]);
+        V_c.alloc(n_rows*V->ne[0]*V->ne[2]);
+        mask_c.alloc(n_rows*mask->ne[1]);
+        ggml_cuda_fattn_compact_kv(K, V, mask, KV_max.ptr, n_rows, K_c.ptr, V_c.ptr, mask_c.ptr, main_stream);
+
+        K_data = (const char *) K_c.ptr;
+        nb11 = K->ne[0]*sizeof(half);
+        nb12 = n_rows*nb11;
+        nb13 = K->ne[2]*nb12;
+
+        V_data = (const char *) V_c.ptr;
+        nb21 = V->ne[0]*sizeof(half);
+        nb22 = n_rows*nb21;
+        nb23 = V->ne[2]*nb22;
+
+        mask_data = (const char *) mask_c.ptr;
+        mask_nb1  = n_rows*sizeof(half);
+        mask_nb2  = mask->ne[1]*mask_nb1;
+        mask_nb3  = mask_nb2;
+    } else {
+        if (need_f16_K && K->type != GGML_TYPE_F16) {
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
+
+            GGML_ASSERT(f16_extra.K != 0);
+            half * K_f16 = (half *) f16_extra.K;
+            if (ggml_is_contiguously_allocated(K)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = nb13*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
+            K_data = (char *) K_f16;
+        }
+
+        if (need_f16_V && V->type != GGML_TYPE_F16) {
+            if (V_is_K_view) {
+                V_data = K_data;
+                nb21   = nb11;
+                nb22   = nb12;
+                nb23   = nb13;
+            } else {
+                const size_t bs = ggml_blck_size(V->type);
+                const size_t ts = ggml_type_size(V->type);
+
+                GGML_ASSERT(f16_extra.V != 0);
+                half * V_f16 = (half *) f16_extra.V;
+                if (ggml_is_contiguously_allocated(V)) {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                    to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                    V_data = (char *) V_f16;
+
+                    nb21 = nb21*bs*sizeof(half)/ts;
+                    nb22 = nb22*bs*sizeof(half)/ts;
+                    nb23 = nb23*bs*sizeof(half)/ts;
+                } else {
+                    GGML_ASSERT(V->nb[0] == ts);
+                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                    const int64_t s01 = nb21 / ts;
+                    const int64_t s02 = nb22 / ts;
+                    const int64_t s03 = nb23 / ts;
+                    to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+
+                    nb21 = V->ne[0] * sizeof(half);
+                    nb22 = V->ne[1] * nb21;
+                    nb23 = V->ne[2] * nb22;
+                }
+                V_data = (char *) V_f16;
+            }
+        }
+
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1252,7 +1308,7 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_data,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
@@ -1261,7 +1317,7 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask_nb1, mask_nb2, mask_nb3
     );
     CUDA_CHECK(cudaGetLastError());
 

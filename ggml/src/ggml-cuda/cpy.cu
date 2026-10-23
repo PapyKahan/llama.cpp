@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "convert.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -463,6 +464,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_is_contiguous(src1);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+
+    // a quantized tensor dequantized to F16 in one pass, as flash attention converts a quantized K/V cache
+    if (contiguous_srcs && src1->type == GGML_TYPE_F16 && ggml_is_quantized(src0->type)) {
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src0->data, (half *) src1->data, ne, main_stream);
+        return;
+    }
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
