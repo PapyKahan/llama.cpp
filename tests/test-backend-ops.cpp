@@ -12131,6 +12131,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+    // the four-head indexer on tensor cores: partial token and key tiles
+    for (int kv : {2000, 5003}) {
+        for (int bs : {64, 512, 777}) {
+            for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+            }
+        }
+    }
     // sparse decoding over a quantized cache: the compact gather of the listed cells, one query and a verify batch
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1, {0, 1, 2, 3}, true, false, 2048));

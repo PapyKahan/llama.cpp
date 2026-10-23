@@ -551,6 +551,175 @@ static __global__ void lightning_indexer_kernel_tile(
     }
 }
 
+// Four heads of 128 dims over a batch of tokens on tensor cores: a block scores 64 tokens against 128 keys, the keys
+// staged once as F16 and the queries of one head at a time, the products of a head accumulated in F32 by m16n8k16
+// MMAs, then rectified and weighted into the score. A warp holds 32 tokens x 32 keys. The queries are rounded to F16.
+static constexpr int LID_MMA4_D    = 128;
+static constexpr int LID_MMA4_TT   = 64;                 // tokens per block
+static constexpr int LID_MMA4_KT   = 128;                // keys per block
+static constexpr int LID_MMA4_LD   = LID_MMA4_D + 8;     // row stride in halves, conflict-free fragment loads
+static constexpr size_t LID_MMA4_SMEM = size_t(LID_MMA4_KT + LID_MMA4_TT)*LID_MMA4_LD*sizeof(half);
+
+template <ggml_type TYPE_K>
+__launch_bounds__(256, 2)
+static __global__ void lightning_indexer_kernel_mma4(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int D  = LID_MMA4_D;
+    constexpr int NH = 4;
+    constexpr int TT = LID_MMA4_TT;
+    constexpr int KT = LID_MMA4_KT;
+    constexpr int LD = LID_MMA4_LD;
+
+    extern __shared__ half lid_mma4_smem[];
+    half * k_s = lid_mma4_smem;
+    half * q_s = lid_mma4_smem + KT*LD;
+    __shared__ float w_s[NH][TT];
+
+    const int tid      = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int warp     = threadIdx.y;
+    const int lane     = threadIdx.x;
+    const int start_kv = blockIdx.x*KT;
+    const int start_t  = blockIdx.y*TT;
+    const int i_stream = blockIdx.z;
+
+    // the keys, rows past n_kv are zero
+    for (int i = tid; i < KT*(D/4); i += 256) {
+        const int r  = i / (D/4);
+        const int c4 = i % (D/4);
+        half2 lo = make_half2(0.0f, 0.0f);
+        half2 hi = lo;
+        if (start_kv + r < n_kv) {
+            const char * k_row = K + (start_kv + r)*nbk2 + i_stream*nbk3;
+            if constexpr (TYPE_K == GGML_TYPE_F16) {
+                lo = ((const half2 *) k_row)[2*c4 + 0];
+                hi = ((const half2 *) k_row)[2*c4 + 1];
+            } else {
+                float4 v;
+                if constexpr (TYPE_K == GGML_TYPE_F32) {
+                    v = ((const float4 *) k_row)[c4];
+                } else {
+                    constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
+                    dequantize_k(k_row, &v, c4 * 4);
+                }
+                lo = make_half2(v.x, v.y);
+                hi = make_half2(v.z, v.w);
+            }
+        }
+        *(half2 *) &k_s[r*LD + 4*c4 + 0] = lo;
+        *(half2 *) &k_s[r*LD + 4*c4 + 2] = hi;
+    }
+
+    // the head weights of each token, tokens past n_batch weigh nothing
+    for (int i = tid; i < NH*TT; i += 256) {
+        const int h = i / TT;
+        const int r = i % TT;
+        w_s[h][r] = start_t + r < n_batch ?
+            ((const float *) ((const char *) W + (start_t + r)*nbw1 + i_stream*nbw3))[h] : 0.0f;
+    }
+
+    const int wt  = warp / 4; // the warp's 32 tokens
+    const int wk  = warp % 4; // the warp's 32 keys
+    const int gid = lane / 4;
+    const int tig = lane % 4;
+
+    float score[2][4][4] = {};
+
+#pragma unroll 1
+    for (int h = 0; h < NH; ++h) {
+        // the previous head's queries are consumed, and for the first one the keys and weights are written
+        __syncthreads();
+        for (int i = tid; i < TT*(D/4); i += 256) {
+            const int r  = i / (D/4);
+            const int c4 = i % (D/4);
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (start_t + r < n_batch) {
+                v = *(const float4 *) ((const char *) Q + h*nbq1 + (start_t + r)*nbq2 + i_stream*nbq3 + c4*sizeof(float4));
+            }
+            *(half2 *) &q_s[r*LD + 4*c4 + 0] = __floats2half2_rn(v.x, v.y);
+            *(half2 *) &q_s[r*LD + 4*c4 + 2] = __floats2half2_rn(v.z, v.w);
+        }
+        __syncthreads();
+
+        float acc[2][4][4] = {};
+#pragma unroll
+        for (int k0 = 0; k0 < D; k0 += 16) {
+            uint32_t a[2][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const int row = wt*32 + mt*16 + gid;
+                a[mt][0] = *(const uint32_t *) &q_s[(row + 0)*LD + k0 + 2*tig + 0];
+                a[mt][1] = *(const uint32_t *) &q_s[(row + 8)*LD + k0 + 2*tig + 0];
+                a[mt][2] = *(const uint32_t *) &q_s[(row + 0)*LD + k0 + 2*tig + 8];
+                a[mt][3] = *(const uint32_t *) &q_s[(row + 8)*LD + k0 + 2*tig + 8];
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int key = wk*32 + nt*8 + gid;
+                const uint32_t b0 = *(const uint32_t *) &k_s[key*LD + k0 + 2*tig + 0];
+                const uint32_t b1 = *(const uint32_t *) &k_s[key*LD + k0 + 2*tig + 8];
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    float * c = acc[mt][nt];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                        : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]), "r"(b0), "r"(b1));
+                }
+            }
+        }
+
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int r0 = wt*32 + mt*16 + gid;
+            const float w0 = w_s[h][r0];
+            const float w1 = w_s[h][r0 + 8];
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                score[mt][nt][0] += fmaxf(acc[mt][nt][0], 0.0f)*w0;
+                score[mt][nt][1] += fmaxf(acc[mt][nt][1], 0.0f)*w0;
+                score[mt][nt][2] += fmaxf(acc[mt][nt][2], 0.0f)*w1;
+                score[mt][nt][3] += fmaxf(acc[mt][nt][3], 0.0f)*w1;
+            }
+        }
+    }
+
+    // the mask and the write: element e of a fragment is token r0 (+8 for e >= 2), key 2*tig (+1 for an odd e)
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2) {
+            const int t = start_t + wt*32 + mt*16 + gid + 8*e2;
+            if (t >= n_batch) {
+                continue;
+            }
+            const half * m_base = (const half *) ((const char *) M + t*nbm1 + (i_stream % nem3)*nbm3);
+            float * d_base = (float *) ((char *) dst + t*nb1 + i_stream*nb3);
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int j = start_kv + wk*32 + nt*8 + 2*tig;
+#pragma unroll
+                for (int e1 = 0; e1 < 2; ++e1) {
+                    if (j + e1 < n_kv) {
+                        d_base[j + e1] = score[mt][nt][2*e2 + e1] + __half2float(m_base[j + e1]);
+                    }
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, W, M, dst, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3,
+        nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3);
+    NO_DEVICE_CODE;
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+}
+
 #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
     if (K->type == (type_K)) {                                                              \
         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
@@ -613,6 +782,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     float       * dst_d = (      float *) dst->data;
 
     const int device = ggml_cuda_get_device();
+    // GGML_CUDA_LID_MMA=0 keeps the FMA tile kernel for four heads
+    static const bool lid_mma4_on = [] { const char * v = getenv("GGML_CUDA_LID_MMA"); return v == nullptr || atoi(v) != 0; }();
     const int cc     = ggml_cuda_info().devices[device].cc;
 
     if (n_embd == 128 && n_head == 64) {
@@ -697,6 +868,27 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
+    } else if (n_embd == 128 && n_head == 4 && n_batch >= LID_MMA4_TT && lid_mma4_on && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+               ampere_mma_available(cc) && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_IQ4_NL) {
+        dim3 block(32, 8);
+        dim3 grid((n_kv + LID_MMA4_KT - 1) / LID_MMA4_KT, (n_batch + LID_MMA4_TT - 1) / LID_MMA4_TT, n_stream);
+#define LID_MMA4_CASE(type_K)                                                                                  \
+        if (k->type == (type_K)) {                                                                             \
+            CUDA_SET_SHARED_MEMORY_LIMIT((lightning_indexer_kernel_mma4<type_K>), LID_MMA4_SMEM);             \
+            lightning_indexer_kernel_mma4<type_K><<<grid, block, LID_MMA4_SMEM, ctx.stream()>>>(               \
+                q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3,            \
+                nbk1, nbk2, nbk3, nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3);                                    \
+            return;                                                                                            \
+        }
+        LID_MMA4_CASE(GGML_TYPE_F16)
+        LID_MMA4_CASE(GGML_TYPE_F32)
+        LID_MMA4_CASE(GGML_TYPE_Q4_0)
+        LID_MMA4_CASE(GGML_TYPE_Q4_1)
+        LID_MMA4_CASE(GGML_TYPE_Q5_0)
+        LID_MMA4_CASE(GGML_TYPE_Q5_1)
+        LID_MMA4_CASE(GGML_TYPE_Q8_0)
+#undef LID_MMA4_CASE
+        GGML_ABORT("fatal error");
     } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;
