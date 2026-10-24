@@ -365,7 +365,7 @@ struct llama_memory_hybrid_idx::kpool_layout {
 };
 
 // Which pools of the layout the current ubatch must re-pool, in the layout's pool order.
-struct llama_memory_hybrid_idx_context::kpool_state {
+struct llama_kpool_state {
     std::vector<uint32_t> is_new;
     std::vector<uint32_t> rep_gen; // per global cell, the generation that last marked a pool with that rep
     std::vector<uint32_t> new_ip;  // the layout index of each pool marked new, in layout order once built
@@ -393,6 +393,13 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 }
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
+
+llama_kpool_state & llama_memory_hybrid_idx::kpool_scratch() {
+    if (!kpool_st) {
+        kpool_st = std::make_unique<llama_kpool_state>();
+    }
+    return *kpool_st;
+}
 
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
@@ -671,8 +678,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
-        kpool_st = std::make_unique<kpool_state>(std::move(st));
-        i_kpool  = 0;
+        kpool_own = std::make_unique<kpool_state>(std::move(st));
+        kpool_st  = kpool_own.get();
+        i_kpool   = 0;
     }
 }
 
@@ -730,7 +738,7 @@ bool llama_memory_hybrid_idx_context::apply() {
     if (res && kpool_track()) {
         mem->kpool_layout_update();
         if (!kpool_st) {
-            kpool_st = std::make_unique<kpool_state>();
+            kpool_st = &mem->kpool_scratch();
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;

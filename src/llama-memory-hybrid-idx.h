@@ -14,6 +14,9 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// what a ubatch must re-pool, see llama_memory_hybrid_idx_context::kpool_build_state
+struct llama_kpool_state;
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -110,6 +113,10 @@ public:
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
+    // the k-pool state the batch contexts build, kept here: a context lives for one decode, and its per-cell marks
+    // span the whole cache, so a state of its own would be allocated and cleared on every decode
+    llama_kpool_state & kpool_scratch();
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -123,6 +130,9 @@ private:
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
+
+    // unique_ptr because llama_kpool_state is incomplete here
+    std::unique_ptr<llama_kpool_state> kpool_st;
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
@@ -221,13 +231,15 @@ private:
     size_t i_cur = 0;
 
     // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
-    struct kpool_state;
+    using kpool_state = llama_kpool_state;
     kpool_state kpool_build_sizes() const;
     void kpool_build_state(const llama_ubatch & ubatch);
     const kpool_state & kpool_cur() const;
 
+    // the state of a reserve, which owns it, or the one of mem for the batches
     // unique_ptr because kpool_state is incomplete here.
-    std::unique_ptr<kpool_state> kpool_st;
+    std::unique_ptr<kpool_state> kpool_own;
+    kpool_state * kpool_st = nullptr;
 
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;
