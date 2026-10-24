@@ -1530,10 +1530,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool               p_cum = false;
     std::vector<float> draft_p; // [n_seq] that product for the draft being built
 
-    // LLAMA_SPEC_P_TRACE=<file>: one line per verified draft, its size, the accepted drafts, then the probability of
-    // each token
-    FILE *                          p_trace = nullptr;
-    std::vector<std::vector<float>> draft_ps; // [n_seq] the probability of each token of the draft being built
+    // LLAMA_SPEC_P_TRACE=<file>: one line per verified draft, its size, the accepted drafts, then the probability and
+    // the id of each token
+    FILE *                                p_trace = nullptr;
+    std::vector<std::vector<float>>       draft_ps;   // [n_seq] the probability of each token of the draft being built
+    std::vector<std::vector<llama_token>> draft_ids;  // [n_seq] its ids
 
     // LLAMA_SPEC_ASYNC_PROCESS: the catch-up decode of process() runs in the background, on the draft device, while the
     // target decodes its next batch; every other use of ctx_dft waits for it first (a single head only)
@@ -1584,6 +1585,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         draft_p.assign(n_seq, 1.0f);
         draft_ps.assign(n_seq, {});
+        draft_ids.assign(n_seq, {});
         if (const char * v = getenv("LLAMA_SPEC_P_TRACE"); v != nullptr && *v != 0) {
             p_trace = fopen(v, "a");
         }
@@ -1882,6 +1884,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             draft_p[seq_id]  = 1.0f;
             draft_ps[seq_id].clear();
+            draft_ids[seq_id].clear();
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
@@ -1968,6 +1971,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 draft_p[seq_id] = p;
                 draft_ps[seq_id].push_back(cur_p->data[0].p);
+                draft_ids[seq_id].push_back(id);
 
                 common_sampler_accept(smpl, id, true);
 
@@ -2043,6 +2047,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             fprintf(p_trace, "%zu %d", draft_ps[seq_id].size(), (int) n_accepted);
             for (const float p : draft_ps[seq_id]) {
                 fprintf(p_trace, " %.4f", p);
+            }
+            for (const llama_token t : draft_ids[seq_id]) {
+                fprintf(p_trace, " %d", t);
             }
             fprintf(p_trace, "\n");
             fflush(p_trace);
