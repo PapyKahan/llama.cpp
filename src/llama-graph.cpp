@@ -1453,16 +1453,28 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     // LLAMA_PROFILE_UBATCH: the inputs of a large ubatch that take more than a millisecond to set, =2 of any ubatch
     static const char * profile_env = getenv("LLAMA_PROFILE_UBATCH");
     static const bool   profile     = profile_env != nullptr;
-    static const bool   profile_all = profile && atoi(profile_env) == 2;
+    static const bool   profile_all = profile && atoi(profile_env) >= 2;
+    static const bool   profile_agg = profile && atoi(profile_env) == 3;
+    static std::map<std::string, std::pair<int64_t, int64_t>> agg;
+    static int64_t n_agg = 0;
     for (auto & input : inputs) {
         const int64_t t0 = profile ? ggml_time_us() : 0;
         input->set_input(ubatch);
         if (profile && (profile_all || ubatch->n_tokens > 256)) {
             const int64_t dt = ggml_time_us() - t0;
-            if (dt > 1000) {
+            if (profile_agg && ubatch->n_tokens <= 8) {
+                auto & a = agg[std::string(typeid(*input).name()) + (ubatch->n_tokens == 1 ? " (1)" : " (n)")];
+                a.first += dt; a.second++;
+            } else if (dt > 1000) {
                 LLAMA_LOG_INFO("%s: %s: %.1f ms\n", __func__, typeid(*input).name(), dt/1e3);
             }
         }
+    }
+    if (profile_agg && ubatch->n_tokens <= 8 && ++n_agg % 400 == 0) {
+        for (const auto & [name, a] : agg) {
+            LLAMA_LOG_INFO("%s: %s: %.3f ms x %lld\n", __func__, name.c_str(), a.first/1e3/a.second, (long long) a.second);
+        }
+        agg.clear();
     }
 }
 
