@@ -1736,8 +1736,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
-            // the background decode keeps the token ids and hidden rows of the batch, not vision embeddings
-            bool async = async_on && !chain_heads;
+            // the background decode keeps the token ids and hidden rows of the batch, not vision embeddings; only a
+            // prompt chunk goes there: the next draft waits for a verification's catch-up anyway, which a background
+            // thread only delays
+            bool async = async_on && !chain_heads && n_tokens > 64;
             for (int k = 0; k < n_tokens && async; ++k) {
                 async = batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
             }
