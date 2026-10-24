@@ -338,6 +338,14 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // a scheduler on the backends of src that allocates its graphs in the compute buffers of src: the graphs of the two
+    // must not be computed at the same time, and the allocation of a graph fails if the buffers of src are too small
+    // each scheduler keeps the split and the allocation of its own graph, so either computes its graph again after the
+    // other one computed another graph
+    GGML_API ggml_backend_sched_t ggml_backend_sched_new_shared(ggml_backend_sched_t src, size_t graph_size);
+    // false if the buffers of src were allocated again since the graph of the shared scheduler was allocated
+    GGML_API bool                 ggml_backend_sched_shared_valid(ggml_backend_sched_t sched);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

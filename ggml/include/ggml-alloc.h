@@ -49,6 +49,13 @@ GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
+// an allocator that allocates from the buffers of parent instead of buffers of its own: the graphs of the two must not
+// be computed at the same time, and a reserve fails if the buffers of parent are not large enough
+GGML_API ggml_gallocr_t ggml_gallocr_new_shared(ggml_gallocr_t parent);
+// false if the buffers of the parent of a shared allocator were allocated again since its last reserve: the tensors it
+// allocated then point to freed memory
+GGML_API bool           ggml_gallocr_shared_valid(ggml_gallocr_t galloc);
+
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
 // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed

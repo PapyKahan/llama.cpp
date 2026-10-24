@@ -2053,6 +2053,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+ggml_backend_sched_t ggml_backend_sched_new_shared(ggml_backend_sched_t src, size_t graph_size) {
+    GGML_ASSERT(src);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(src->backends, src->bufts, src->n_backends, graph_size, false, src->op_offload);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = ggml_gallocr_new_shared(src->galloc);
+    return sched;
+}
+
+bool ggml_backend_sched_shared_valid(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return ggml_gallocr_shared_valid(sched->galloc);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

@@ -254,7 +254,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // sched_gf: the scheduler that allocated gf, sched if nullptr
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_gf = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -265,13 +266,15 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // sched_gf: the scheduler that allocates the graph, sched if nullptr
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                    ggml_backend_sched_t   sched_gf = nullptr) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_gf) const;
 
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
@@ -387,6 +390,26 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // the scheduler of the graph of the last ubatch: sched, or the one of a graph slot
+    ggml_backend_sched_t sched_cur = nullptr;
+
+    // LLAMA_GRAPH_SLOTS=<n>: the graphs of decoding ubatches of up to LLAMA_GRAPH_SLOT_TOKENS tokens (default 16) stay
+    // allocated in n slots, each with a scheduler that allocates from the compute buffers of sched, so that a graph
+    // computes again after graphs of other shapes without being built and allocated again; the least recently used
+    // slot takes a new graph
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        uint64_t               used   = 0;     // the clock of the last ubatch of the slot
+        bool                   active = false; // the graph of res is allocated by sched
+    };
+    std::vector<graph_slot> graph_slots;
+    uint32_t                graph_slot_tokens = 16;
+    uint64_t                graph_slot_clock  = 0;
+
+    // the slot with the allocated graph of the ubatch, nullptr if it goes the regular way
+    graph_slot * graph_slot_get(const llama_ubatch & ubatch, llm_graph_type gtype, const llama_memory_context_i * mctx);
 
     bool sched_need_reserve = true;
 

@@ -493,6 +493,11 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // ggml_gallocr_new_shared: the allocator whose buffers this one allocates from, it allocates no buffer of its own
+    struct ggml_gallocr * parent;
+    // counts the allocations of the buffers; a shared allocator keeps the count of its parent at its last reserve
+    uint64_t epoch;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -535,13 +540,25 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
+ggml_gallocr_t ggml_gallocr_new_shared(ggml_gallocr_t parent) {
+    GGML_ASSERT(parent != NULL && parent->parent == NULL);
+    ggml_gallocr_t galloc = ggml_gallocr_new_n(parent->bufts, parent->n_buffers);
+    galloc->parent = parent;
+    return galloc;
+}
+
+bool ggml_gallocr_shared_valid(ggml_gallocr_t galloc) {
+    return galloc->parent == NULL || galloc->epoch == galloc->parent->epoch;
+}
+
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
     }
 
     for (int i = 0; i < galloc->n_buffers; i++) {
-        if (galloc->buffers != NULL) {
+        // a shared allocator does not own its buffers
+        if (galloc->buffers != NULL && galloc->parent == NULL) {
             // skip if already freed
             bool freed = false;
             for (int j = 0; j < i; j++) {
@@ -901,6 +918,25 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // a shared allocator takes the buffers of its parent as they are, they must be large enough
+    if (galloc->parent != NULL) {
+        GGML_ASSERT(!no_alloc);
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            struct vbuffer * buf = galloc->parent->buffers[i];
+            if (buf == NULL) {
+                return false;
+            }
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > ggml_vbuffer_chunk_size(buf, c)) {
+                    return false;
+                }
+            }
+            galloc->buffers[i] = buf;
+        }
+        galloc->epoch = galloc->parent->epoch;
+        return true;
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -933,6 +969,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->epoch++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1050,7 +1087,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    if (!ggml_gallocr_shared_valid(galloc) || ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
