@@ -901,6 +901,9 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // see llama_prefetch_token(); a model whose token rows are read from the file as they are needed implements it
+    virtual void prefetch_token(const llama_token * window, int32_t n_window) const;
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;

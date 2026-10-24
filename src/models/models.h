@@ -8,6 +8,9 @@
 #include <cmath>
 #include <map>
 
+#include <atomic>
+#include <mutex>
+
 class llama_memory_hybrid_idx_context;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
@@ -2644,8 +2647,17 @@ struct llama_model_clef : public llama_model_qwen35 {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     class llm_graph_input_kpool;
+
+    // LLAMA_PLE_PREFETCH: llama_prefetch_token() has a thread read the PLE rows of the coming tokens; the model owns it,
+    // so that it stops before the base class unmaps the table
+    struct ple_reader;
+    mutable std::atomic<ple_reader *> ple_rd { nullptr };
+    mutable std::mutex                ple_rd_mtx;
+
+    void prefetch_token(const llama_token * window, int32_t n_window) const override;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

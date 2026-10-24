@@ -1353,6 +1353,9 @@ llama_model::~llama_model() {
     }
 }
 
+void llama_model::prefetch_token(const llama_token * /*window*/, int32_t /*n_window*/) const {
+}
+
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;

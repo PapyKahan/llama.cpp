@@ -122,6 +122,11 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Asks for the stored rows that the last token of the window will read when a decode gets it, so that they are in memory
+// by then; the earlier tokens of the window are its predecessors, oldest first. The rows are read in the background and
+// the call returns at once. A model that does not read rows from the file as it needs them ignores the call
+LLAMA_API void llama_prefetch_token(struct llama_context * ctx, const llama_token * window, int32_t n_window);
+
 // Marks an entry whose results are not used, such as one that fills a speculative verification up to a constant size so
 // that its graph is reused; the MoE layers in host mode compute no expert for it
 LLAMA_API bool llama_batch_ext_set_pad(struct llama_batch_ext * batch, int32_t idx, bool pad);

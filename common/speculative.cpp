@@ -1525,6 +1525,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // the last tokens of each sequence's draft, with the prompt before it: the predecessors that llama_prefetch_token()
+    // hashes a token's rows with
+    static constexpr size_t               pf_ctx = 8;
+    std::vector<std::vector<llama_token>> pf_win;
+
     // LLAMA_SPEC_P_CUM=1: p_min bounds the product of the probabilities of the draft so far, the chance that all of it
     // is accepted, instead of the probability of each token
     bool               p_cum = false;
@@ -1640,6 +1645,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        pf_win.assign(n_seq, {});
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1905,6 +1911,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             i_last[seq_id] = idx;
 
+            // the target reads stored rows for each token it verifies: ask for them as the tokens become known
+            auto & win = pf_win[seq_id];
+            win.clear();
+            if (dp.prompt != nullptr) {
+                const size_t n_prompt = dp.prompt->size();
+                win.assign(dp.prompt->begin() + (n_prompt - std::min<size_t>(n_prompt, pf_ctx - 1)), dp.prompt->end());
+            }
+            win.push_back(dp.id_last);
+            llama_prefetch_token(params.ctx_tgt, win.data(), (int32_t) win.size());
+
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
@@ -1979,6 +1995,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+
+                auto & win = pf_win[seq_id];
+                if (win.size() >= pf_ctx) {
+                    win.erase(win.begin());
+                }
+                win.push_back(id);
+                llama_prefetch_token(params.ctx_tgt, win.data(), (int32_t) win.size());
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);

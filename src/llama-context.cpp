@@ -5281,6 +5281,13 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+void llama_prefetch_token(llama_context * ctx, const llama_token * window, int32_t n_window) {
+    if (window == nullptr || n_window <= 0) {
+        return;
+    }
+    ctx->get_model().prefetch_token(window, n_window);
+}
+
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }

@@ -4,7 +4,11 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -1320,6 +1324,153 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
 
+// the rows of a token: ctx[0] is the token, ctx[s] its predecessor s positions back, EOS from the first cut on
+static void ple_rows_of(const llama_hparams & hparams, const int64_t * ctx, int32_t * rows) {
+    const int64_t n_gram   = hparams.ple_ngram_size;
+    const int64_t per_gram = hparams.ple_heads_per_ngram;
+
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            rows[h_i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+        }
+    }
+}
+
+// The rows of the coming tokens, read by a thread while the drafts are made: a row is a few bytes at a hashed place in
+// a table far larger than the page cache, so nearly every one is a read from the file, and a decode that faults them in
+// itself waits for each. The rows the thread has read are remembered until newer ones push them out.
+struct llama_model_qwen4exp::ple_reader {
+    const ggml_tensor * table;
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::vector<int32_t>    todo;
+    bool                    quit = false;
+
+    std::unordered_set<int32_t> done;
+    std::vector<int32_t>        ring; // the rows of done, oldest first from pos
+    size_t                      pos = 0;
+
+    std::thread thr;
+
+    explicit ple_reader(const ggml_tensor * table) : table(table), ring(8192, -1) {
+        thr = std::thread([this] { run(); });
+    }
+
+    ~ple_reader() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            quit = true;
+        }
+        cv.notify_one();
+        thr.join();
+    }
+
+    void push(const int32_t * rows, size_t n) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            todo.insert(todo.end(), rows, rows + n);
+        }
+        cv.notify_one();
+    }
+
+    // the rows of the list that the thread has not read
+    void not_read(const int32_t * rows, size_t n, std::vector<int32_t> & out) {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mtx);
+        for (size_t i = 0; i < n; ++i) {
+            if (done.count(rows[i]) == 0) {
+                out.push_back(rows[i]);
+            }
+        }
+    }
+
+    void run() {
+        const size_t row_bytes = ggml_row_size(table->type, table->ne[0]);
+        const char * base = (const char *) table->data;
+
+        std::vector<int32_t> batch;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&] { return quit || !todo.empty(); });
+                if (quit) {
+                    return;
+                }
+                batch.swap(todo);
+            }
+
+            // ask for all the pages first, so that their reads are in flight together, then wait for each
+            llama_prefetch_rows(table, batch.data(), batch.size());
+            for (const int32_t r : batch) {
+                const volatile char * row = base + (size_t) r*table->nb[1];
+                (void) row[0];
+                (void) row[row_bytes - 1];
+            }
+
+            std::lock_guard<std::mutex> lock(mtx);
+            for (const int32_t r : batch) {
+                if (!done.insert(r).second) {
+                    continue;
+                }
+                if (ring[pos] >= 0) {
+                    done.erase(ring[pos]);
+                }
+                ring[pos] = r;
+                pos = (pos + 1) % ring.size();
+            }
+            batch.clear();
+        }
+    }
+};
+
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    delete ple_rd.load();
+}
+
+void llama_model_qwen4exp::prefetch_token(const llama_token * window, int32_t n_window) const {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_PLE_PREFETCH");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    const ggml_tensor * ple = per_layer_tok_embd;
+    if (!enabled || ple == nullptr || hparams.ple_n_heads == 0 || can_prefetch.count(ple) == 0 ||
+            hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+        return;
+    }
+
+    ple_reader * rd = ple_rd.load(std::memory_order_acquire);
+    if (rd == nullptr) {
+        std::lock_guard<std::mutex> lock(ple_rd_mtx);
+        rd = ple_rd.load(std::memory_order_relaxed);
+        if (rd == nullptr) {
+            rd = new ple_reader(ple);
+            ple_rd.store(rd, std::memory_order_release);
+        }
+    }
+
+    // as set_input() reads the window: a missing predecessor is EOS, and so is everything at or before an EOS
+    const int64_t eos = hparams.ple_eos_token_id;
+    std::array<int64_t, LLAMA_MAX_PLE_NGRAM> ctx;
+    ctx[0] = window[n_window - 1];
+    bool cut = false;
+    for (int64_t s = 1; s < (int64_t) hparams.ple_ngram_size; ++s) {
+        const llama_token t = cut || s >= n_window ? LLAMA_TOKEN_NULL : window[n_window - 1 - s];
+        cut = cut || t < 0 || t == eos;
+        ctx[s] = cut ? eos : t;
+    }
+
+    std::array<int32_t, LLAMA_MAX_PLE_HEADS> rows;
+    ple_rows_of(hparams, ctx.data(), rows.data());
+    rd->push(rows.data(), hparams.ple_n_heads);
+}
+
 class llm_graph_input_qwen4exp_ple : public llm_graph_input_i {
 public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
@@ -1347,6 +1498,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<int32_t>     unread;
 };
 
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
@@ -1366,7 +1518,6 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hparams.ple_ngram_size;
     const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
     const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
@@ -1382,11 +1533,11 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    std::vector<int64_t> ctx(n_gram);
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
@@ -1396,18 +1547,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
             ctx[s] = cut ? eos : t;
         }
 
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
-            }
-        }
+        ple_rows_of(hparams, ctx.data(), idx.data() + i*n_heads);
     }
 
     {
@@ -1422,7 +1562,13 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         const int    n_thr     = raw != nullptr ? (int) std::min<size_t>(n_gather, n_rows/2048) : 1;
 
         if (prefetch && n_thr <= 1) {
-            llama_prefetch_rows(ple, idx.data(), n_rows);
+            auto * rd = static_cast<const llama_model_qwen4exp &>(model).ple_rd.load(std::memory_order_acquire);
+            if (rd != nullptr) {
+                rd->not_read(idx.data(), n_rows, unread);
+                llama_prefetch_rows(ple, unread.data(), unread.size());
+            } else {
+                llama_prefetch_rows(ple, idx.data(), n_rows);
+            }
         }
 
         if (raw != nullptr) {
