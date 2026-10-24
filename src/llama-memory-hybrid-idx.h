@@ -92,6 +92,9 @@ public:
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
 
+    // kpool_layout_get() with its flat pool tables (a single stream only) built again from the first pool that changed
+    const kpool_layout & kpool_flat_update();
+
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
     using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
