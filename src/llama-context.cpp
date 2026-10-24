@@ -747,18 +747,25 @@ struct llama_context::expert_prefetch {
                 return (s.routed && !s.used[e]) ||
                     (cache != nullptr && (cache->cached(backend, src, e) || (any_host && cache->host_computes(src, e))));
             };
+            // the host copies, which the cache may move (LLAMA_MOE_CACHE_EXCLUSIVE): a run is uploaded in pieces whose
+            // copies are contiguous
+            auto host_of = [&](int64_t e) {
+                const void * p = cache != nullptr ? cache->host_data(src, e) : (const uint8_t *) src->data + e*expert_size;
+                GGML_ASSERT(p != nullptr);
+                return (const uint8_t *) p;
+            };
             for (int64_t first = 0; first < n_expert; ) {
                 if (in_cache(first)) {
                     n_skipped += cache != nullptr && cache->cached(backend, src, first);
                     first++;
                     continue;
                 }
+                const uint8_t * p0 = host_of(first);
                 int64_t last = first;
-                while (last + 1 < n_expert && !in_cache(last + 1)) {
+                while (last + 1 < n_expert && !in_cache(last + 1) && host_of(last + 1) == p0 + (last + 1 - first)*expert_size) {
                     last++;
                 }
-                ggml_backend_tensor_set_async(stream, s.t, (const uint8_t *) src->data + first*expert_size,
-                        first*expert_size, (last + 1 - first)*expert_size);
+                ggml_backend_tensor_set_async(stream, s.t, p0, first*expert_size, (last + 1 - first)*expert_size);
                 n_uploaded += last + 1 - first;
                 bytes_uploaded += (last + 1 - first)*expert_size;
                 first = last + 1;
@@ -3827,6 +3834,28 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // the host copy of an expert, which the MoE cache may move (LLAMA_MOE_CACHE_EXCLUSIVE)
+    auto host_of = [&](int64_t e) {
+        const void * p = lctx->moe_cache ? lctx->moe_cache->host_data(src, e) : (const uint8_t *) src->data + e*expert_size;
+        GGML_ASSERT(p != nullptr);
+        return (const uint8_t *) p;
+    };
+    // experts [from, to) from their host copies, in pieces whose copies are contiguous, then pad bytes of expert to
+    auto upload = [&](int64_t from, int64_t to, size_t pad) {
+        while (from < to) {
+            const uint8_t * p0 = host_of(from);
+            int64_t n = 1;
+            while (from + n < to && host_of(from + n) == p0 + n*expert_size) {
+                n++;
+            }
+            ggml_backend_tensor_set_async(backend, dst, p0, from*expert_size, n*expert_size);
+            from += n;
+        }
+        if (pad > 0) {
+            ggml_backend_tensor_set_async(backend, dst, host_of(to), to*expert_size, pad);
+        }
+    };
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3846,20 +3875,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 e++;
                 continue;
             }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
+            upload(next, e, 0);
             e   += n;
             next = e;
         }
 
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-        }
+        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend;
+        // an expert after it that the MoE cache holds is copied whole from device memory instead, it may have no host copy
+        const bool   next_cached = last < n_expert - 1 && lctx->moe_cache && lctx->moe_cache->copy_experts(backend, src, dst, last + 1, last + 1) > 0;
+        const size_t padding     = last < n_expert - 1 && !next_cached ? std::min<size_t>(expert_size, 512) : 0;
+        upload(next, last + 1, padding);
 
         first = last + 1;
     }

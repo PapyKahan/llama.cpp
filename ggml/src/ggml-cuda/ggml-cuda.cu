@@ -95,6 +95,14 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -168,6 +176,24 @@ static bool ggml_cuda_pinned_memory_disabled() {
 static bool ggml_cuda_register_host_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_REGISTER_HOST");
     return enabled;
+}
+
+// GGML_CUDA_HOST_MEMFD_GUARD: the pages given back are also made inaccessible, so that a stray access faults instead of
+// bringing memory back
+static bool ggml_cuda_host_memfd_guard() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_HOST_MEMFD_GUARD");
+    return enabled;
+}
+
+// GGML_CUDA_HOST_MEMFD: a page-locked buffer is a shared memory file of its own, registered with the devices, rather than
+// cudaMallocHost memory, so that ggml_backend_cuda_host_release() can give back the parts of it nothing reads any more
+static bool ggml_cuda_host_memfd_enabled() {
+#if defined(__linux__)
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_HOST_MEMFD");
+    return enabled;
+#else
+    return false;
+#endif
 }
 
 static bool ggml_cuda_fusion_disabled() {
@@ -864,11 +890,15 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// host memory in memfd buffers whose registrations were split (GGML_CUDA_HOST_MEMFD) is copied in pieces
+static void ggml_cuda_memcpy_host_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream);
+static bool ggml_cuda_host_memfd_is_split(const void * p, size_t size);
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_memcpy_host_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -876,7 +906,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_cuda_memcpy_host_async(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -885,8 +915,15 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_cuda_memcpy_host_async((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size,
+                cudaMemcpyHostToDevice, cudaStreamPerThread);
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -895,8 +932,15 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_cuda_memcpy_host_async((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size,
+                cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1367,7 +1411,338 @@ static bool ggml_cuda_host_cache_enabled() {
 
 static constexpr size_t GGML_CUDA_HOST_CACHE_MIN = 64ull << 20;
 
+#if defined(__linux__)
+// A memfd buffer (GGML_CUDA_HOST_MEMFD). Its pages are registered with the devices in ranges, each by one
+// cudaHostRegister call; or given back (holes: punched out of the file and made inaccessible); or present but not
+// registered. A single copy across two registrations fails, so ggml_cuda_memcpy_host_async() splits copies at their
+// bounds.
+struct ggml_cuda_host_memfd {
+    int    fd   = -1;
+    size_t size = 0;
+    std::map<size_t, size_t> regs;  // begin -> end, registered
+    std::map<size_t, size_t> holes; // begin -> end, given back, page aligned
+};
+
+static std::mutex                                ggml_cuda_host_memfd_mtx;
+static std::map<uintptr_t, ggml_cuda_host_memfd> ggml_cuda_host_memfds; // by base address
+// set once a buffer is no longer one registration: until then a copy needs no lookup
+static std::atomic<bool>                         ggml_cuda_host_memfd_split { false };
+
+static void * ggml_cuda_host_memfd_alloc(size_t size) {
+    const int fd = memfd_create("ggml-cuda-host", MFD_CLOEXEC);
+    if (fd < 0) {
+        GGML_LOG_DEBUG("%s: memfd_create failed: %s\n", __func__, strerror(errno));
+        return nullptr;
+    }
+    void * ptr = MAP_FAILED;
+    if (ftruncate(fd, (off_t) size) == 0) {
+        ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    }
+    if (ptr == MAP_FAILED) {
+        GGML_LOG_DEBUG("%s: failed to map %.2f MiB: %s\n", __func__, size/1024.0/1024.0, strerror(errno));
+        close(fd);
+        return nullptr;
+    }
+    if (cudaHostRegister(ptr, size, cudaHostRegisterPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to register %.2f MiB\n", __func__, size/1024.0/1024.0);
+        munmap(ptr, size);
+        close(fd);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+    ggml_cuda_host_memfd & m = ggml_cuda_host_memfds[(uintptr_t) ptr];
+    m.fd   = fd;
+    m.size = size;
+    m.regs = { { 0, size } };
+    return ptr;
+}
+
+// false if ptr is not a memfd buffer
+static bool ggml_cuda_host_memfd_free(void * ptr) {
+    ggml_cuda_host_memfd m;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+        const auto it = ggml_cuda_host_memfds.find((uintptr_t) ptr);
+        if (it == ggml_cuda_host_memfds.end()) {
+            return false;
+        }
+        m = std::move(it->second);
+        ggml_cuda_host_memfds.erase(it);
+    }
+    for (const auto & r : m.regs) {
+        if (cudaHostUnregister((char *) ptr + r.first) != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+    }
+    munmap(ptr, m.size);
+    close(m.fd);
+    return true;
+}
+
+// the buffer that holds [p, p + size), nullptr if none; the caller holds the mutex
+static ggml_cuda_host_memfd * ggml_cuda_host_memfd_find(uintptr_t p, size_t size, uintptr_t & base) {
+    auto it = ggml_cuda_host_memfds.upper_bound(p);
+    if (it == ggml_cuda_host_memfds.begin()) {
+        return nullptr;
+    }
+    --it;
+    if (p + size > it->first + it->second.size) {
+        return nullptr;
+    }
+    base = it->first;
+    return &it->second;
+}
+
+// the page aligned interiors of the given ranges, by buffer
+static std::map<uintptr_t, std::vector<std::pair<size_t, size_t>>> ggml_cuda_host_memfd_interiors(
+        const void * const * ptrs, const size_t * sizes, size_t n) {
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    std::map<uintptr_t, std::vector<std::pair<size_t, size_t>>> res;
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+    for (size_t i = 0; i < n; ++i) {
+        uintptr_t base = 0;
+        if (ggml_cuda_host_memfd_find((uintptr_t) ptrs[i], sizes[i], base) == nullptr) {
+            continue;
+        }
+        const size_t b = ((uintptr_t) ptrs[i] - base + page - 1)/page*page;
+        const size_t e = ((uintptr_t) ptrs[i] - base + sizes[i])/page*page;
+        if (e > b) {
+            res[base].push_back({ b, e });
+        }
+    }
+    for (auto & [base, v] : res) {
+        std::sort(v.begin(), v.end());
+        std::vector<std::pair<size_t, size_t>> merged;
+        for (const auto & r : v) {
+            if (!merged.empty() && r.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, r.second);
+            } else {
+                merged.push_back(r);
+            }
+        }
+        v = std::move(merged);
+    }
+    return res;
+}
+
+// [b, e) minus the sorted, disjoint ranges of cut
+static std::vector<std::pair<size_t, size_t>> ggml_cuda_ranges_minus(size_t b, size_t e, const std::vector<std::pair<size_t, size_t>> & cut) {
+    std::vector<std::pair<size_t, size_t>> res;
+    size_t at = b;
+    for (const auto & c : cut) {
+        if (c.second <= at || c.first >= e) {
+            continue;
+        }
+        if (c.first > at) {
+            res.push_back({ at, c.first });
+        }
+        at = std::max(at, c.second);
+    }
+    if (at < e) {
+        res.push_back({ at, e });
+    }
+    return res;
+}
+#endif
+
+// A copy between device memory and host memory, the host side possibly in a memfd buffer whose registrations were split:
+// it goes in pieces that each lie within one registration, or outside all of them. Host memory given back must never be
+// read or written: a copy of it aborts.
+static void ggml_cuda_memcpy_host_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+#if defined(__linux__)
+    if (size > 0 && ggml_cuda_host_memfd_split.load(std::memory_order_acquire)) {
+        const uintptr_t host = (uintptr_t) (kind == cudaMemcpyHostToDevice ? src : dst);
+        std::vector<std::pair<size_t, size_t>> pieces;
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+            uintptr_t base = 0;
+            const ggml_cuda_host_memfd * m = ggml_cuda_host_memfd_find(host, size, base);
+            if (m != nullptr) {
+                const size_t a = host - base;
+                const size_t b = a + size;
+                for (size_t pos = a; pos < b; ) {
+                    const auto h = m->holes.upper_bound(pos);
+                    if (h != m->holes.begin() && pos < std::prev(h)->second) {
+                        GGML_ABORT("%s: a copy of host memory that was given back", __func__);
+                    }
+                    const auto r = m->regs.upper_bound(pos);
+                    size_t end = b;
+                    if (r != m->regs.begin() && pos < std::prev(r)->second) {
+                        end = std::min(b, std::prev(r)->second);
+                    } else {
+                        if (r != m->regs.end()) {
+                            end = std::min(end, r->first);
+                        }
+                        if (h != m->holes.end()) {
+                            end = std::min(end, h->first);
+                        }
+                    }
+                    pieces.push_back({ pos - a, end - a });
+                    pos = end;
+                }
+            }
+        }
+        if (pieces.size() > 1) {
+            for (const auto & pc : pieces) {
+                CUDA_CHECK(cudaMemcpyAsync((char *) dst + pc.first, (const char *) src + pc.first, pc.second - pc.first, kind, stream));
+            }
+            return;
+        }
+    }
+#endif
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
+}
+
+// whether [p, p + size) lies in a memfd buffer whose registrations were split
+static bool ggml_cuda_host_memfd_is_split(const void * p, size_t size) {
+#if defined(__linux__)
+    if (!ggml_cuda_host_memfd_split.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+    uintptr_t base = 0;
+    return ggml_cuda_host_memfd_find((uintptr_t) p, size, base) != nullptr;
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+// whether [ptr, ptr + size) lies in a memfd buffer, whose pages ggml_backend_cuda_host_release() can give back
+static bool ggml_backend_cuda_host_releasable(const void * ptr, size_t size) {
+#if defined(__linux__)
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+    uintptr_t base = 0;
+    return ggml_cuda_host_memfd_find((uintptr_t) ptr, size, base) != nullptr;
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return false;
+#endif
+}
+
+// Gives back the whole pages of the given ranges that lie in memfd buffers: they are punched out of the file, so the
+// memory returns to the system. Only the registrations they cut are registered again, around them. Nothing may touch these
+// ranges any more: a copy of them aborts, a read or a write brings memory back (faults with GGML_CUDA_HOST_MEMFD_GUARD).
+// The registrations to cut leave the bookkeeping first, so that new copies of their other pages go as pageable memory;
+// sync, if set, then waits for the transfers already in flight, before they are unregistered. Returns the bytes given back.
+static size_t ggml_backend_cuda_host_release(const void * const * ptrs, const size_t * sizes, size_t n, void (*sync)(void *), void * sync_ud) {
+#if defined(__linux__)
+    size_t released = 0;
+    for (auto & [base, holes] : ggml_cuda_host_memfd_interiors(ptrs, sizes, n)) {
+        char * ptr = (char *) base;
+        int fd = -1;
+
+        // the registrations the holes cut are taken out first, so that copies of their other pages meanwhile go as
+        // pageable rather than as registered memory being unregistered
+        std::vector<std::pair<size_t, size_t>> cut;
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+            ggml_cuda_host_memfd & m = ggml_cuda_host_memfds[base];
+            fd = m.fd;
+            for (const auto & h : holes) {
+                auto r = m.regs.upper_bound(h.first);
+                if (r != m.regs.begin()) {
+                    --r;
+                }
+                while (r != m.regs.end() && r->first < h.second) {
+                    if (r->second > h.first) {
+                        cut.push_back(*r);
+                        r = m.regs.erase(r);
+                    } else {
+                        ++r;
+                    }
+                }
+            }
+            ggml_cuda_host_memfd_split.store(true, std::memory_order_release);
+        }
+        std::sort(cut.begin(), cut.end());
+        if (sync != nullptr && !cut.empty()) {
+            sync(sync_ud);
+        }
+        for (const auto & c : cut) {
+            if (cudaHostUnregister(ptr + c.first) != cudaSuccess) {
+                (void) cudaGetLastError();
+            }
+        }
+
+        for (const auto & h : holes) {
+            if (fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t) h.first, (off_t) (h.second - h.first)) != 0 ||
+                (ggml_cuda_host_memfd_guard() && mprotect(ptr + h.first, h.second - h.first, PROT_NONE) != 0)) {
+                GGML_LOG_WARN("%s: could not give back %.2f MiB: %s\n", __func__, (h.second - h.first)/1024.0/1024.0, strerror(errno));
+            }
+        }
+
+        std::vector<std::pair<size_t, size_t>> regs;
+        size_t n_failed = 0;
+        for (const auto & c : cut) {
+            for (const auto & r : ggml_cuda_ranges_minus(c.first, c.second, holes)) {
+                if (cudaHostRegister(ptr + r.first, r.second - r.first, cudaHostRegisterPortable) == cudaSuccess) {
+                    regs.push_back(r);
+                } else {
+                    (void) cudaGetLastError();
+                    n_failed++;
+                }
+            }
+        }
+        if (n_failed > 0) {
+            GGML_LOG_WARN("%s: %zu ranges could not be registered again, their transfers are pageable\n", __func__, n_failed);
+        }
+
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_memfd_mtx);
+        ggml_cuda_host_memfd & m = ggml_cuda_host_memfds[base];
+        for (const auto & r : regs) {
+            m.regs[r.first] = r.second;
+        }
+        for (const auto & h : holes) {
+            // the bytes of h that were not given back yet
+            std::vector<std::pair<size_t, size_t>> old;
+            auto it = m.holes.upper_bound(h.first);
+            if (it != m.holes.begin()) {
+                --it;
+            }
+            for (; it != m.holes.end() && it->first < h.second; ++it) {
+                if (it->second > h.first) {
+                    old.push_back(*it);
+                }
+            }
+            for (const auto & r : ggml_cuda_ranges_minus(h.first, h.second, old)) {
+                released += r.second - r.first;
+            }
+            // merge h with the holes it touches
+            size_t b = h.first;
+            size_t e = h.second;
+            it = m.holes.upper_bound(b);
+            if (it != m.holes.begin() && std::prev(it)->second >= b) {
+                --it;
+            }
+            while (it != m.holes.end() && it->first <= e) {
+                b = std::min(b, it->first);
+                e = std::max(e, it->second);
+                it = m.holes.erase(it);
+            }
+            m.holes[b] = e;
+        }
+    }
+    return released;
+#else
+    GGML_UNUSED(ptrs);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n);
+    GGML_UNUSED(sync);
+    GGML_UNUSED(sync_ud);
+    return 0;
+#endif
+}
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if defined(__linux__)
+    if (ggml_cuda_host_memfd_free(buffer->context)) {
+        return;
+    }
+#endif
     if (ggml_cuda_host_cache_enabled()) {
         std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
         const auto it = ggml_cuda_host_sizes.find(buffer->context);
@@ -1403,6 +1778,12 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
+#if defined(__linux__)
+    if (ggml_cuda_host_memfd_enabled()) {
+        return ggml_cuda_host_memfd_alloc(size);
+    }
+#endif
+
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
@@ -1417,7 +1798,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    const bool cache = ggml_cuda_host_cache_enabled() && size >= GGML_CUDA_HOST_CACHE_MIN;
+    const bool cache = ggml_cuda_host_cache_enabled() && !ggml_cuda_host_memfd_enabled() && size >= GGML_CUDA_HOST_CACHE_MIN;
     void * ptr = cache ? ggml_cuda_host_cache_take(size) : nullptr;
     if (ptr == nullptr) {
         ptr = ggml_cuda_host_malloc(size);
@@ -2725,7 +3106,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_memcpy_host_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2734,7 +3115,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_memcpy_host_async(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2744,6 +3125,13 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_cuda_memcpy_host_async((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size,
+                cudaMemcpyHostToDevice, cuda_ctx->stream());
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2755,6 +3143,13 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_cuda_memcpy_host_async((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size,
+                cudaMemcpyDeviceToHost, cuda_ctx->stream());
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2824,6 +3219,19 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
+}
+
+// Waits for the work queued on the stream of a CUDA backend without spinning: the calling thread sleeps until the device
+// signals, so a background thread takes no core from the threads that compute meanwhile
+static void ggml_backend_cuda_synchronize_sleep(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaEvent_t ev;
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventBlockingSync | cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev, cuda_ctx->stream()));
+    CUDA_CHECK(cudaEventSynchronize(ev));
+    CUDA_CHECK(cudaEventDestroy(ev));
 }
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
@@ -6441,6 +6849,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_host_release") == 0) {
+        return (void *)ggml_backend_cuda_host_release;
+    }
+    if (strcmp(name, "ggml_backend_host_releasable") == 0) {
+        return (void *)ggml_backend_cuda_host_releasable;
+    }
+    if (strcmp(name, "ggml_backend_synchronize_sleep") == 0) {
+        return (void *)ggml_backend_cuda_synchronize_sleep;
     }
     return nullptr;
 }

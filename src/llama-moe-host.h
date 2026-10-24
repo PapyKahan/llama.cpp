@@ -18,6 +18,9 @@ public:
         const ggml_tensor * up    = nullptr;
         const ggml_tensor * down  = nullptr;
         float               limit = 0.0f; // SwiGLU clamp of the experts, 0 if none
+        // if set, expert e of gate, up and down is read at ptrs[0], ptrs[1] and ptrs[2][e], which the MoE cache updates
+        // as it moves host copies; at its offset in the tensor otherwise
+        const char * const * ptrs[3] = { nullptr, nullptr, nullptr };
     };
 
     // byte offsets of the arrays of a mailbox, after its header

@@ -48,6 +48,7 @@ struct moe_host_barrier {
 // gate, up or down of a layer
 struct moe_host_mat {
     const char *      data     = nullptr;
+    const char * const * ptrs  = nullptr; // the host address of each expert, if set (llama_moe_host::layer::ptrs)
     size_t            nb1      = 0; // bytes per row
     size_t            nb2      = 0; // bytes per expert
     ggml_vec_dot_t    dot      = nullptr;
@@ -56,6 +57,10 @@ struct moe_host_mat {
     size_t            qrow     = 0;       // bytes of an input row quantized to vdt
     ggml_type         type     = GGML_TYPE_COUNT;
     int               row8_min = 0;       // an expert with this many entries or more unpacks each row once, 0 = never
+
+    const char * expert(int64_t e) const {
+        return ptrs != nullptr ? ptrs[e] : data + (size_t) e*nb2;
+    }
 };
 
 struct moe_host_layer {
@@ -293,6 +298,9 @@ struct llama_moe_host::impl {
             if (!l.on) {
                 continue;
             }
+            for (int mi = 0; mi < 3; ++mi) {
+                l.m[mi].ptrs = ls[il].ptrs[mi];
+            }
             l.limit     = ls[il].limit;
             l.x_slot[0] = 0;
             l.x_slot[1] = l.m[1].vdt == l.m[0].vdt ? 0 : 1;
@@ -454,7 +462,7 @@ struct llama_moe_host::impl {
             float * out = mi == 0 ? g.data() : u.data();
             const int32_t r0 = c*chunk_a;
             const int32_t r1 = std::min(r0 + chunk_a, n_ff);
-            const char * w = m.data + (size_t) ce.e*m.nb2;
+            const char * w = m.expert(ce.e);
             if (m.row8_min > 0 && ce.count >= m.row8_min) {
                 row8_buf & b = r8[ith];
                 for (int32_t j = 0; j < ce.count; ++j) {
@@ -506,7 +514,7 @@ struct llama_moe_host::impl {
             for (int32_t r = r0; r < r1; ++r) {
                 std::fill(a, a + cur_n_tokens, 0.0f);
                 for (const cpu_expert & ce : experts) {
-                    const char * wr = md.data + (size_t) ce.e*md.nb2 + (size_t) r*md.nb1;
+                    const char * wr = md.expert(ce.e) + (size_t) r*md.nb1;
                     if (md.row8_min > 0 && ce.count >= md.row8_min) {
                         row8_buf & b = r8[ith];
                         for (int32_t j = 0; j < ce.count; ++j) {
@@ -595,7 +603,7 @@ struct llama_moe_host::impl {
                     for (int32_t j = 0; j < k; ++j) {
                         ys[j] = qxs + (size_t) b_tok[q0 + j]*qx_row;
                     }
-                    batch_rows(m, m.data + (size_t) e*m.nb2, n_embd, 0, n_ff, ys, k, b, mi == 0 ? bf.g.data() : bf.u.data(), n_ff, q80);
+                    batch_rows(m, m.expert(e), n_embd, 0, n_ff, ys, k, b, mi == 0 ? bf.g.data() : bf.u.data(), n_ff, q80);
                 }
 
                 // the activation, quantized for down
@@ -617,7 +625,7 @@ struct llama_moe_host::impl {
                 }
 
                 // down, then into the rows of y
-                batch_rows(md, md.data + (size_t) e*md.nb2, n_ff, 0, n_embd, ys, k, b, bf.o.data(), n_embd);
+                batch_rows(md, md.expert(e), n_ff, 0, n_embd, ys, k, b, bf.o.data(), n_embd);
                 for (int32_t j = 0; j < k; ++j) {
                     const int32_t t = b_tok[q0 + j];
                     const float   w = b_w[q0 + j];

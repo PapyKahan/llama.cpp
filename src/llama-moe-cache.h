@@ -50,6 +50,10 @@ public:
     // whether expert e of the host weight w is in the cache of the device of backend
     bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const;
 
+    // the host copy of expert e of the host weight w, which the cache may move (LLAMA_MOE_CACHE_EXCLUSIVE); nullptr if
+    // the expert has none, it is then in the cache
+    const void * host_data(const ggml_tensor * w, int64_t e) const;
+
     // host mode (LLAMA_MOE_HOST): for small batches the device computes the cached experts of a layer and the host the
     // others (llama-moe-host), a layer posts its request and waits for the answer with these
     struct host_part {
