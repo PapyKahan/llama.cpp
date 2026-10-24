@@ -612,13 +612,21 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
+    // with a masked h output only the output rows go on: the keys of the others are written by now, and a catch-up
+    // that outputs nothing skips the FFN
+    const bool crop = cparams.embeddings_nextn_masked && inp_out_ids != nullptr;
+    if (crop) {
+        ggml_tensor * rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens), inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, rows, n_embd, hc, rows->ne[1]);
+    }
+
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
     cur    = build_layer_ffn(cur, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     // the next draft step reads this residual as its h
-    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
-    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+    ggml_tensor * flat_out = inp_out_ids && !crop ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
     res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
     cb(res->t_h_nextn, "h_nextn", il);
     ggml_build_forward_expand(gf, res->t_h_nextn);
