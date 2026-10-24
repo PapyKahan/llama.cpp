@@ -22,7 +22,7 @@ public:
 
     // byte offsets of the arrays of a mailbox, after its header
     struct mailbox_layout {
-        int32_t off_ids;   // i32 [max_tokens*n_used]
+        int32_t off_ids;   // i32 [max_tokens*n_used], -1 for the entries of a pad token
         int32_t off_slots; // i32 [max_tokens*n_used], the device slot of each selected expert, -1 if not cached
         int32_t off_w;     // f32 [max_tokens*n_used]
         int32_t off_x;     // f32 [max_tokens*n_embd]

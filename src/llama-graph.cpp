@@ -305,6 +305,20 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_pad::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(pad);
+    GGML_ASSERT(ggml_backend_buffer_is_host(pad->buffer));
+
+    int32_t * data = (int32_t *) pad->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        data[i] = ubatch->pad != nullptr && ubatch->pad[i] != 0;
+    }
+}
+
+bool llm_graph_input_pad::can_reuse(const llm_graph_params & params) {
+    return pad->ne[0] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -2488,6 +2502,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * w2d   = ggml_reshape_2d(ctx0, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), n_expert_used, n_tokens);
         slots = ggml_moe_host_post(ctx0, selected_experts, w2d, cur, host_part.state, host_part.mailbox, host_part.offs,
             host_part.n_expert, il, host_part.zero_base);
+        // a layer cropped to the output rows keeps all its rows' experts
+        if (n_tokens == (int64_t) ubatch.n_tokens) {
+            ggml_moe_host_post_set_pad(slots, build_inp_pad());
+        }
         ggml_backend_sched_set_tensor_backend(sched, slots, host_part.backend);
         cb(slots, "ffn_moe_host_post", il);
         ggml_build_forward_expand(gf, slots);
@@ -3055,6 +3073,26 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     ggml_set_name(cur, "out_ids");
 
     res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_pad() const {
+    if (inp_pad != nullptr) {
+        return inp_pad;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_pad>();
+
+    auto & cur = inp->pad;
+
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(cur);
+    ggml_set_name(cur, "inp_pad");
+
+    res->add_input(std::move(inp));
+
+    inp_pad = cur;
 
     return cur;
 }

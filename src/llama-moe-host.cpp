@@ -811,8 +811,12 @@ struct llama_moe_host::impl {
             fwrite(slots, sizeof(int32_t), n, trace);
         }
 
+        // the entries of a pad token have id -1: no count, no work
         std::atomic<uint32_t> * cnt = counts.data() + (size_t) il*n_expert;
         for (int32_t i = 0; i < n; ++i) {
+            if (ids[i] < 0) {
+                continue;
+            }
             std::atomic<uint32_t> & c = cnt[ids[i]];
             c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         }
@@ -833,7 +837,7 @@ struct llama_moe_host::impl {
         experts.clear();
         int32_t n_miss = 0;
         for (int32_t i = 0; i < n; ++i) {
-            if (slots[i] >= 0) {
+            if (slots[i] >= 0 || ids[i] < 0) {
                 continue;
             }
             n_miss++;
@@ -878,7 +882,7 @@ struct llama_moe_host::impl {
 
         std::fill(tok_has.begin(), tok_has.begin() + n_tokens, 0);
         for (int32_t i = 0; i < n; ++i) {
-            if (slots[i] >= 0 || index[ids[i]] < 0) {
+            if (slots[i] >= 0 || ids[i] < 0 || index[ids[i]] < 0) {
                 continue;
             }
             cpu_expert & ce = experts[index[ids[i]]];

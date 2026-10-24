@@ -122,6 +122,10 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Marks an entry whose results are not used, such as one that fills a speculative verification up to a constant size so
+// that its graph is reused; the MoE layers in host mode compute no expert for it
+LLAMA_API bool llama_batch_ext_set_pad(struct llama_batch_ext * batch, int32_t idx, bool pad);
+
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 

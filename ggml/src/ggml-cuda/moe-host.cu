@@ -30,12 +30,13 @@ static __device__ __forceinline__ void moe_host_store_release(int32_t * p, int32
 #endif
 }
 
-// one block: the slots of the selected experts, then the request in the mailbox, then its sequence number
+// one block: the slots of the selected experts, then the request in the mailbox, then its sequence number; a pad
+// token gets the zero slots and id -1, which the host skips
 static __global__ void k_moe_host_post(
         const char * __restrict__ ids, const int64_t ids_nb0, const int64_t ids_nb1,
         const char * __restrict__ w,   const int64_t w_nb0,   const int64_t w_nb1,
         const char * __restrict__ x,   const int64_t x_nb0,   const int64_t x_nb1,
-        int32_t * __restrict__ state, int32_t * __restrict__ slots,
+        const int32_t * __restrict__ pad, int32_t * __restrict__ state, int32_t * __restrict__ slots,
         char * __restrict__ mb, const int off_ids, const int off_slots, const int off_w, const int off_x, const int off_table,
         const int n_expert, const int n_used, const int n_tokens, const int n_embd, const int layer, const int zero_base) {
     const int tid = threadIdx.x;
@@ -52,13 +53,14 @@ static __global__ void k_moe_host_post(
     for (int i = tid; i < n; i += blockDim.x) {
         const int k = i % n_used;
         const int t = i / n_used;
-        const int32_t e = *(const int32_t *) (ids + k*ids_nb0 + t*ids_nb1);
-        const int32_t s = __ldcv(table + e);
+        const bool    p = pad != nullptr && pad[t] != 0;
+        const int32_t e = p ? -1 : *(const int32_t *) (ids + k*ids_nb0 + t*ids_nb1);
+        const int32_t s = p ? -1 : __ldcv(table + e);
         const int32_t slot = s >= 0 ? s : zero_base + k;
         slots[i]    = slot;
         mb_ids[i]   = e;
         mb_slots[i] = s;
-        mb_w[i]     = *(const float *) (w + k*w_nb0 + t*w_nb1);
+        mb_w[i]     = p ? 0.0f : *(const float *) (w + k*w_nb0 + t*w_nb1);
     }
 
     if (x_nb0 == (int64_t) sizeof(float) && n_embd % 4 == 0 && x_nb1 % 16 == 0 && (uintptr_t) x % 16 == 0 && off_x % 16 == 0) {
@@ -330,6 +332,7 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * weights = dst->src[1];
     const ggml_tensor * x       = dst->src[2];
     const ggml_tensor * state   = dst->src[3];
+    const ggml_tensor * pad     = dst->src[4];
 
     GGML_ASSERT(ggml_is_contiguous(dst));
 
@@ -348,7 +351,7 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
         (const char *) ids->data,     ids->nb[0],     ids->nb[1],
         (const char *) weights->data, weights->nb[0], weights->nb[1],
         (const char *) x->data,       x->nb[0],       x->nb[1],
-        (int32_t *) state->data, (int32_t *) dst->data,
+        pad != nullptr ? (const int32_t *) pad->data : nullptr, (int32_t *) state->data, (int32_t *) dst->data,
         (char *) mb, off_ids, off_slots, off_w, off_x, off_table,
         n_expert, (int) ids->ne[0], (int) ids->ne[1], (int) x->ne[0], layer, zero_base);
     CUDA_CHECK(cudaGetLastError());

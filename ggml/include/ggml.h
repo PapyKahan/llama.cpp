@@ -2806,6 +2806,12 @@ extern "C" {
             int32_t               layer,
             int32_t               zero_base);
 
+    // the tokens of a post whose experts nobody computes: pad [n_tokens] i32, a token with pad != 0 reads the zero
+    // slots and gives the host no work
+    GGML_API void ggml_moe_host_post_set_pad(
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * pad);
+
     // post for a whole large batch: the slot table marks the experts the host computes with -1, the device computes the
     // others; returns the selected experts with -1 for those the host computes (see ggml_mul_mat_id_set_negative_ids),
     // writes the ids, weights and table entries from many blocks and copies x to the mailbox asynchronously

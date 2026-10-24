@@ -233,6 +233,19 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+// 1 for the entries of the ubatch whose results are not used, see llama_batch_ext_set_pad()
+class llm_graph_input_pad : public llm_graph_input_i {
+public:
+    llm_graph_input_pad() = default;
+    virtual ~llm_graph_input_pad() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * pad = nullptr; // I32 [n_batch]
+};
+
 class llm_graph_input_out_ids : public llm_graph_input_i {
 public:
     llm_graph_input_out_ids(
@@ -1099,6 +1112,9 @@ struct llm_graph_context {
     // the mul_mat_id that read them leave those rows zero
     mutable ggml_tensor * moe_negative_ids = nullptr;
 
+    // the pad mask of the ubatch, built by the first layer that reads it, see build_inp_pad()
+    mutable ggml_tensor * inp_pad = nullptr;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
@@ -1283,6 +1299,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+    ggml_tensor * build_inp_pad() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

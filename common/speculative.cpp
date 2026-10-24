@@ -1678,11 +1678,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.size();
 
-        // remember the first and last batch index for each sequence
+        // remember the first and last batch index for each sequence, pads excluded: they follow the entries of their
+        // sequence and the draft never continues from them
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
         for (int k = 0; k < n_tokens; ++k) {
+            if (batch_in.tokens[k].pad) {
+                continue;
+            }
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (batch_in.tokens[k].seq_id == seq_id) {
                     i_batch_end[seq_id] = k;
@@ -1721,6 +1725,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
+                if (t.pad) {
+                    continue;
+                }
 
                 const llama_seq_id seq_id = t.seq_id;
 
@@ -1747,10 +1754,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the decode goes in pieces of the draft's ubatch size: a batch copies the rows it is given, so a long
             // prompt chunk at once would hold several copies of all its hidden rows
             const int32_t n_step = std::max<int32_t>(1, (int32_t) llama_n_ubatch(ctx_dft));
-            auto decode_pieces = [this, ctx_dft, n_tokens, n_step]() -> int32_t {
-                for (int32_t k0 = 0; k0 < n_tokens; k0 += n_step) {
+            const int32_t n_dft  = batch.size();
+            if (n_dft == 0) {
+                return true;
+            }
+            auto decode_pieces = [this, ctx_dft, n_dft, n_step]() -> int32_t {
+                for (int32_t k0 = 0; k0 < n_dft; k0 += n_step) {
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
-                            batch.get_sub_batch(k0, std::min(n_step, n_tokens - k0)));
+                            batch.get_sub_batch(k0, std::min(n_step, n_dft - k0)));
                     if (rc != 0) {
                         return rc;
                     }

@@ -6701,6 +6701,14 @@ struct ggml_tensor * ggml_moe_host_post(
     return result;
 }
 
+void ggml_moe_host_post_set_pad(
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * pad) {
+    GGML_ASSERT(post->op == GGML_OP_MOE_HOST_POST && ggml_get_op_params_i32(post, 10) == 0);
+    GGML_ASSERT(pad->type == GGML_TYPE_I32 && ggml_is_contiguous(pad) && ggml_nelements(pad) == post->ne[1]);
+    post->src[4] = pad;
+}
+
 struct ggml_tensor * ggml_moe_host_post_batch(
         struct ggml_context * ctx,
         struct ggml_tensor  * ids,

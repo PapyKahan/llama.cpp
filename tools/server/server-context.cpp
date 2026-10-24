@@ -158,6 +158,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
         int32_t i_embd = -1; // row in embd, -1 if this is a token
+        bool pad = false; // see llama_batch_ext_set_pad()
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -237,6 +238,11 @@ struct server_batch {
         tokens[idx].decision_order = order;
     }
 
+    void set_pad(int32_t idx) {
+        GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size());
+        tokens[idx].pad = true;
+    }
+
     // render the sub-batch [off, off + n_tokens) into view, index i in view is index off + i here
     void render(int32_t off, int32_t n_tokens) {
         GGML_ASSERT(off >= 0 && off < size());
@@ -251,6 +257,7 @@ struct server_batch {
                 view.add(t.token, t.pos[0], t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
+            view.tokens.back().pad            = t.pad;
         }
     }
 };
@@ -297,6 +304,7 @@ struct server_slot {
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    int32_t spec_n_pad = 0; // pads after the entries of the slot in the batch, see handle_last_sampled_token()
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -587,11 +595,26 @@ struct server_slot {
         return n_draft_max;
     }
 
-    // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any; pads fill the
+    // entries of the slot up to pad_to, so that a verification keeps its size (see LLAMA_SPEC_PAD)
+    void handle_last_sampled_token(server_batch & batch, int32_t pad_to) {
         bool add_ok = true;
         // the audio stream has no token before the first step, track the position with a dummy token
         const llama_token tok_track = sampled == LLAMA_TOKEN_NULL ? 0 : sampled;
+
+        // pads follow the n_real entries of the slot from position pos; the verification removes them with the
+        // rejected drafts
+        spec_n_pad = 0;
+        auto add_pads = [&](llama_pos pos, int32_t n_real) {
+            if (pad_to <= n_real || pos + (pad_to - n_real) > n_ctx) {
+                return;
+            }
+            for (int32_t i = n_real; i < pad_to; i++) {
+                add_ok &= batch.add(id, tok_track, pos++, true, false);
+                batch.set_pad(batch.size() - 1);
+                spec_n_pad++;
+            }
+        };
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
@@ -614,6 +637,7 @@ struct server_slot {
                 }
             } else {
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_pads(prompt.tokens.pos_next() + 1, 1);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -635,6 +659,7 @@ struct server_slot {
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
             }
+            add_pads(pos0, 1 + (int32_t) spec_draft.size());
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
@@ -1078,6 +1103,9 @@ private:
 
     common_speculative_ptr spec;
 
+    // the size a verification is padded to, 0 if it is not (see LLAMA_SPEC_PAD)
+    int32_t spec_pad_to = 0;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1485,6 +1513,28 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+        }
+
+        // LLAMA_SPEC_PAD=1: every verification is filled with pads up to the size of the largest draft, so that its
+        // graph is reused whatever the length of the draft; the MoE layers in host mode compute no expert for a pad,
+        // the MTP drafter skips them, a rollback of the recurrent state covers them
+        if (spec && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            const char * v = getenv("LLAMA_SPEC_PAD");
+            // the option appends to the default type, none
+            const auto & types = params_base.speculative.types;
+            const bool mtp_only =
+                std::any_of(types.begin(), types.end(),
+                    [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) &&
+                std::all_of(types.begin(), types.end(),
+                    [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_NONE; });
+            if (v != nullptr && atoi(v) != 0 && mtp_only) {
+                int32_t n_max = common_speculative_n_max(spec.get());
+                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    n_max = std::min<int32_t>(n_max, llama_n_rs_seq(ctx_tgt));
+                }
+                spec_pad_to = n_max > 0 ? n_max + 1 : 0;
+                SRV_INF("speculative verifications are padded to %d entries\n", spec_pad_to);
+            }
         }
 
         if (spec) {
@@ -3860,7 +3910,7 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, slot.can_speculate() ? spec_pad_to : 0);
         });
 
         // process in chunks of params.n_batch
@@ -4796,6 +4846,14 @@ private:
 
             slot.i_batch = -1;
 
+            // the pads are only in the target: the drafter skips them and may still be catching up in the background
+            if (slot.spec_n_pad > 0) {
+                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1)) {
+                    GGML_ABORT("failed to remove the pads of sequence %d\n", slot.id);
+                }
+                slot.spec_n_pad = 0;
+            }
+
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -4876,9 +4934,11 @@ private:
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                // the pads go back with the rejected drafts
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback + slot.spec_n_pad > llama_n_rs_seq(ctx_tgt));
+                slot.spec_n_pad = 0;
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
