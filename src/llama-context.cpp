@@ -1877,6 +1877,19 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// the backend part of a sampler chain and the nodes it adds: a chain with the same one builds the same graph
+static std::string llama_sampler_backend_sig(const llama_sampler * smpl) {
+    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+
+    std::string res = std::to_string(chain->n_nodes);
+    for (const auto & s : chain->samplers) {
+        res += s.is_backend ? '+' : '-';
+        res += llama_sampler_name(s.ptr);
+    }
+
+    return res;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1894,6 +1907,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             sched_need_reserve = true;
         }
         sampling.samplers.erase(seq_id);
+        sampling.samplers_sig.erase(seq_id);
         return false;
     }
 
@@ -1908,9 +1922,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        // a chain like the one it replaces (each request brings its own) leaves the reservation as it was, the
+        // scheduler reserves again by itself in the rare case a graph outgrows it
+        std::string sig = llama_sampler_backend_sig(sampler);
+        const auto it = sampling.samplers_sig.find(seq_id);
+        if (sampling.samplers.count(seq_id) == 0 || it == sampling.samplers_sig.end() || it->second != sig) {
+            sched_need_reserve = true;
+        }
 
-        sched_need_reserve = true;
+        sampling.samplers[seq_id]     = sampler;
+        sampling.samplers_sig[seq_id] = std::move(sig);
 
         return true;
     }
@@ -1923,11 +1944,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         }
 
         sampling.samplers.erase(seq_id);
+        sampling.samplers_sig.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
+    sampling.samplers_sig.erase(seq_id);
 
     sched_need_reserve = true;
 
