@@ -1525,6 +1525,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_SPEC_P_CUM=1: p_min bounds the product of the probabilities of the draft so far, the chance that all of it
+    // is accepted, instead of the probability of each token
+    bool               p_cum = false;
+    std::vector<float> draft_p; // [n_seq] that product for the draft being built
+
+    // LLAMA_SPEC_P_TRACE=<file>: one line per verified draft, its size, the accepted drafts, then the probability of
+    // each token
+    FILE *                          p_trace = nullptr;
+    std::vector<std::vector<float>> draft_ps; // [n_seq] the probability of each token of the draft being built
+
     // LLAMA_SPEC_ASYNC_PROCESS: the catch-up decode of process() runs in the background, on the draft device, while the
     // target decodes its next batch; every other use of ctx_dft waits for it first (a single head only)
     bool               async_on = false;
@@ -1568,6 +1578,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
         batch = common_batch(ctx_dft);
+
+        if (const char * v = getenv("LLAMA_SPEC_P_CUM"); v != nullptr && atoi(v) != 0) {
+            p_cum = true;
+        }
+        draft_p.assign(n_seq, 1.0f);
+        draft_ps.assign(n_seq, {});
+        if (const char * v = getenv("LLAMA_SPEC_P_TRACE"); v != nullptr && *v != 0) {
+            p_trace = fopen(v, "a");
+        }
 
         if (const char * v = getenv("LLAMA_SPEC_ASYNC_PROCESS"); v != nullptr && atoi(v) != 0) {
             async_on = true;
@@ -1628,6 +1647,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         join();
+        if (p_trace != nullptr) {
+            fclose(p_trace);
+        }
         if (async_on) {
             common_context_set_wait(this->params.ctx_dft, nullptr, nullptr);
         }
@@ -1856,6 +1878,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+            draft_p[seq_id]  = 1.0f;
+            draft_ps[seq_id].clear();
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
@@ -1933,12 +1957,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float p = p_cum ? draft_p[seq_id]*cur_p->data[0].p : cur_p->data[0].p;
+                if (p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
+                draft_p[seq_id] = p;
+                draft_ps[seq_id].push_back(cur_p->data[0].p);
 
                 common_sampler_accept(smpl, id, true);
 
@@ -2008,6 +2035,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         join();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (p_trace != nullptr && !draft_ps[seq_id].empty()) {
+            fprintf(p_trace, "%zu %d", draft_ps[seq_id].size(), (int) n_accepted);
+            for (const float p : draft_ps[seq_id]) {
+                fprintf(p_trace, " %.4f", p);
+            }
+            fprintf(p_trace, "\n");
+            fflush(p_trace);
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
