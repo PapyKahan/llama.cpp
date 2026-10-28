@@ -201,6 +201,46 @@ replacements then only remove upload traffic from host memory: `LLAMA_MOE_HOST_S
 45.2 tok/s against 42.9 (96), 51 to 54 ms per step against 57 to 58. Flash-Next keeps 96: at 48 it misses 21 % instead
 of 17 %.
 
+### Measured host share and lent memory
+
+2026-10-28. Ornith-1.5-122B at fixed host shares first, the large batches of the follow-up and short-prompt suites,
+before the batch wait was fixed (see [moe-offload.md](moe-offload.md#large-batches-shared-with-the-host)):
+
+| share of the lacking experts | 1018-token batch (ms) | 3008-token batch | 5806-token batch | host busy, 1018 tokens |
+|---|---|---|---|---|
+| 0 | 3227 | 3267 | 3440 | 0 % |
+| 0.05 | 3132 | 3402 | 4097 | 27 % |
+| 0.15 | 2908 | 4909 | 8366 | 47 % |
+| 0.3 | 3365 | 9584 | 17747 | 87 % |
+
+Without a share every large batch uploads the same 42.6 GB at 12.4 to 13.2 GB/s, about 3.3 s from 1K to 5.8K tokens. A
+fixed share pays only at about 1000 tokens, and only while the host keeps up. With the wait polling from one thread, each
+staging slot's uploads ran at 13.1 to 13.3 GB/s whatever the host's load, against 5 to 6 GB/s while the device waited
+for a late host before. The host's cost fitted per kind of layer predicted its time within a few percent from the
+actual entries (1687 / 2871 / 3729 ms predicted for 1687 / 3053 / 3767 measured); what the profile expected of the
+entries did not (the experts least selected while decoding got nearly the average number of tokens of a prompt).
+
+Then the installed `fd5cd5fd5` (before: Flash-Next with the fixed model of the share, Ornith without a share) against the
+measured share and the lent memory (after), each model with its profile's settings, the same evening:
+
+| | Flash-Next before | after | Ornith-1.5-122B before | after |
+|---|---|---|---|---|
+| decode cold / warm / code (tok/s) | 111.5–113.4 / 108.5–108.7 / 99.2–104.6 | 114.3 / 108.2 / 102.6 | 43.6–47.0 / 42.8–43.5 / 42.2–42.4 | 45.0 / 45.3 / 45.0 |
+| prefill 2.3K / 11.6K (tok/s) | 555–568 / 1375–1379 | 577 / 1531 | 577–578 / 1463–1467 | 646 / 1654 |
+| prefill 34.8K / 92.8K (tok/s) | 1723–1733 / 1835–1846 | 1809 / 1838 | 1656–1668 / 1354–1358 | 1744 / 1357 |
+| follow-ups +100 / +300 (s) | 1.16–1.22 / 1.75–1.89 | 1.17 / 1.78 | 2.01–2.02 / 3.98–4.00 | 2.08 / 3.90 |
+| follow-ups +1000 / +3000 (s) | 2.79–2.83 / 4.24–4.28 | 2.38 / 2.58 | 3.92 / 4.38–4.39 | 2.28 / 3.11 |
+| peak VRAM GPU0 (MiB) | | | 23971–23977 | 23973 |
+
+A change of phase takes 15 to 35 ms each way, against about 200 ms (up to 570 ms with admissions in flight). A first
+version of the policy, which let the host take experts while the predicted cycle merely did not grow, gave follow-ups of
+2.23 / 2.51 s on Flash-Next but lost 3.5 % on its 34.8K prompt: there the device's own work binds, and the host piled up
+work for nothing until the next batch measured the damage. Each expert must now shorten the cycle.
+
+Numerics against the base logits of [the merge](#after-the-merge-with-upstream): Ornith 512-token batches in the large
+phase, the lent memory alone 0.1264 ± 0.0037 (the same as before), with the measured share (the host took 53 % of the
+experts the core lacks over 30 batches) 0.1271 ± 0.0037; Flash-Next 2 × 2048, measured share 0.0149 ± 0.0013.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the

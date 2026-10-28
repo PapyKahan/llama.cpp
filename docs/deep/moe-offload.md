@@ -107,11 +107,25 @@ ggml-cuda) whose physical memory can be released from their end:
   mode with the whole cache.
 
 When small batches return, the experts the lent slots held are admitted again into them by the upload worker
-(commit `8060a31c7`), instead of the policy refilling a third of the cache over tens of graphs. A switch costs about
-150 ms each way with `LLAMA_HOST_COMPUTE_PAGEABLE=1`, which puts the CPU compute buffers in pageable memory: page-locked
-CPU compute buffers cost about 450 ms of `cudaHostAlloc`/`cudaFreeHost` per switch (`GGML_CUDA_HOST_BUFFER_CACHE=1`
-recycles freed page-locked buffers instead, but keeps them locked). `GGML_CUDA_VMM_CHUNK_MIB` (default 32) sets the
-granularity at which a VMM buffer grows and shrinks (commit `991413bff`).
+(commit `8060a31c7`), instead of the policy refilling a third of the cache over tens of graphs; a large batch that comes
+before they are all back drops the admissions not started yet, whose experts are admitted after it.
+`LLAMA_HOST_COMPUTE_PAGEABLE=1` puts the CPU compute buffers in pageable memory: page-locked CPU compute buffers cost
+about 450 ms of `cudaHostAlloc`/`cudaFreeHost` per switch (`GGML_CUDA_HOST_BUFFER_CACHE=1` recycles freed page-locked
+buffers instead, but keeps them locked). `GGML_CUDA_VMM_CHUNK_MIB` (default 32) sets the granularity at which a VMM
+buffer grows and shrinks (commit `991413bff`).
+
+### The lent memory mapped twice
+
+Releasing the lent slots and mapping them again cost about 175 ms each way inside the driver, whatever the number of
+calls, and up to 570 ms when admissions were still in flight. The banks now stay mapped whole: the chunks of the lent
+slots are mapped a second time, one after the other in one range per device (`ggml_backend_vmm_alias`), and a lent
+buffer type over that range (`ggml_backend_lent_buffer_type_new`, `_set`, `_free`) places the compute buffers and the
+staging slots of large batches in it while the cache lends, from the end of the switch to large batches to the start of
+the switch back. What those buffers need beyond the range is mapped after it, in address space reserved for that, and
+released when they are freed, so the large phase holds no more memory than when the slots were released. A switch then
+maps and unmaps nothing: 15 to 35 ms each way on the test machine, most of it the compute buffers' reservation. The
+CUDA backend's asynchronous copies accept any CUDA buffer type of the device for this. `LLAMA_MOE_CACHE_ALIAS=0`
+releases and maps the lent slots again at each switch.
 
 With a 13000 MiB cache and an 8200 MiB core, an 8192-token ubatch fits at 262K context on the 24 GB card with a few
 hundred MB of headroom; a larger core ran out of memory around 112K tokens of context, where the allocator packs a
@@ -149,9 +163,32 @@ the host's experts, and `ggml_moe_host_wait_batch` adds the host's answer, retur
 only. The input goes to the host by an asynchronous copy on a stream of its own. On the host each expert's entries are
 computed in chunks of 64 tokens over the worker pool, gate and up unpacked once per chunk against Q8_0 inputs.
 
-The share balances the host's time against the uploads it saves and stops where the device's compute becomes the longer
-part; it is about zero above 5K tokens per ubatch on the test machine and pays for mid-size prompts.
-`LLAMA_MOE_BATCH_CPU=<share>` forces a share, 0 turns it off; `LLAMA_MOE_BATCH_CPU_MAX` caps it (default 1).
+The share is measured, per layer and per batch. Each layer gives the host the least selected of the experts its core
+lacks for as long as each one shortens the device's predicted cycle for the layer: the longer of the uploads left and
+the device's own work, which is what it does before it posts (the combine of the layer before, the attention, the
+routing: the host cannot overlap it) followed by the longer of its own experts and the host's answer. Where the
+device's own work is the longer already, the uploads are hidden and the host takes nothing. What goes into it:
+
+- the host's cost of an item (an expert's pass over its weights for up to 64 of its tokens) and of an entry (a token of
+  an expert), in thread seconds, fitted to every item the workers time, per kind of layer (the types of its gate, up
+  and down): the layers of a GSQ-RCO model differ several fold, an IQ2_XS layer, which the row8 kernels do not unpack,
+  costing more than twice an IQ3_S one per entry;
+- the upload rate, from timed events around each staging slot's uploads (a CUDA proc address,
+  `ggml_backend_event_new_timed` with `ggml_backend_event_elapsed_ms`);
+- the device's time before each post, read from its clock in the batch mailbox: the post and the wait write it, and the
+  host reads the times of the previous layer at each request;
+- each lacking expert's expected entries, from its selections in the last shared batches (the host counts all the
+  entries of each request), or from the profile until they exist. The experts least selected in past batches get more
+  in the next one; a ratio learned per source from the entries the host finds corrects that.
+
+A batch the host would save less than 2% of is not shared. A kind of layer the host has not measured yet gives it a few
+of its cheapest experts, so that it is: in any batch until the host has measured one kind, in a shared one after that. The share is part of the graph's parameters: a graph built without the posts is
+not reused for a shared batch, nor the other way round. `LLAMA_PROFILE_UBATCH=1` logs each decision and its outcome.
+`LLAMA_MOE_BATCH_CPU=<share>` fixes the share instead, 0 turns it off; `LLAMA_MOE_BATCH_CPU_MAX` caps it (default 1).
+
+Every block of the batch wait used to poll the mailbox across the bus while the device waited: when the host was late,
+those reads cut the uploads beside them from 13 to 5 or 6 GB/s, which made a late host later. One thread polls now, and
+the blocks that add the answer read its outcome from device memory.
 
 Fixes this needed elsewhere: `mm_ids_helper` counted negative ids as a lower expert, and the MMQ forward and inverse
 maps had to handle skipped slots. The first version lost the host experts of the last layer, which is cropped to the

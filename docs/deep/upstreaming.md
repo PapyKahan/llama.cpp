@@ -67,14 +67,13 @@ what was tried and dropped so that nobody repeats it.
 
 ### Known issues
 
-- Follow-up turns are slower than Strata's except around 1000 new tokens: 0.95 / 1.5 / 3.1 / 4.3 s for +100 / +300 /
-  +1000 / +3000 tokens, against 0.72 / 0.96 / 3.14 / 3.34 s (see [measurements.md](measurements.md#follow-up-turns)).
-  Two pieces of work remain. A batch of 512 to about 3000 tokens uploads every expert the core lacks, about 3 s
-  whatever its size: a host share measured at run time, per layer, as Strata's `STRATA_PREFILL_CPU_SHARE=auto` does,
-  would give the host the experts few tokens route to (the fixed model of `LLAMA_MOE_BATCH_CPU` suits Flash-Next and
-  hurts Ornith-1.5-122B). And each change of phase maps or unmaps about 7.7 GB of device memory, about 175 ms each way
-  inside the driver whatever the number of calls: compute buffers of the large phase mapped onto the physical memory
-  the cache lends, instead of freed and allocated again, would remove both.
+- Short follow-up turns are slower than Strata's: a turn of up to 512 tokens runs in the small phase, 128-token batches
+  whose misses the host computes (Flash-Next 1.16 / 1.75 s for +100 / +300 tokens, against 0.72 / 0.96 s; Ornith-1.5-122B
+  about 2 / 4 s). From 1000 tokens on, the measured host share and the lent memory make the branch faster than Strata
+  (see [measurements.md](measurements.md#measured-host-share-and-lent-memory)). A lower phase threshold is the next
+  thing to try now that a change of phase costs little.
+- The host's row8 kernels have no unpacker for IQ2_XS, Q4_K or Q5_K: a host expert of such a layer takes a quantized dot
+  product per token, more than twice the cost per entry, which limits the host's share of those layers.
 - The start loads all 47.7 GiB of experts before the exclusive core releases its share: loading the exclusive experts
   straight into the cache would remove that peak.
 - The exclusive core needs the cache profile, so the very first session has none.
@@ -118,10 +117,10 @@ mailboxes, a service thread that must make no CUDA call):
 
 16. Expert prefetch for large batches (`0e80359ad` to `ddd0cfe81`, part of `65dc51115`).
 17. Host mode, its ops and the row8 host kernels (`e1cd4e00f`, `2b37cca0f`).
-18. Service-thread policy, cache phases on VMM buffers, re-admission of lent slots (`a29262c1e`, `991413bff`, part of
-    `8060a31c7`).
+18. Service-thread policy, cache phases on VMM buffers, re-admission of lent slots, the large phase's buffers in the
+    lent memory (`a29262c1e`, `991413bff`, part of `8060a31c7`, `b83aeb575`).
 19. Cache profile (part of `8060a31c7`).
-20. Large batches shared with the host (`d8b10a771`, `70d3d4ba7`).
+20. Large batches shared with the host, the share measured (`d8b10a771`, `70d3d4ba7`, `3cce2f756`).
 21. Tail skip, opt-in (`012d9f7ef`).
 22. Exclusive core and memfd host buffers (`170656bca`).
 

@@ -32,8 +32,11 @@ become parameters.
 | `LLAMA_MOE_PREFETCH` | 0 | 3 | expert prefetch for large batches: staging slots |
 | `LLAMA_MOE_PREFETCH_ROUTED` | 1 | 0 | stage only the experts the routing selects; 0 stages whole tensors |
 | `LLAMA_MOE_PREFETCH_MIN` | 1024 | | smallest batch that uses the prefetch |
-| `LLAMA_MOE_BATCH_CPU` | balanced | | share of the experts the core lacks that the host computes in large batches; 0 = off |
+| `LLAMA_MOE_BATCH_CPU` | measured | | share of the experts the core lacks that the host computes in large batches: unset, measured per layer and batch; a number fixes it, 0 = off |
 | `LLAMA_MOE_BATCH_CPU_MAX` | 1 | | cap of that share |
+| `LLAMA_MOE_CACHE_ALIAS` | 1 | | phases: the buffers of large batches in the memory the cache lends, mapped twice; 0 releases and maps the lent slots at each switch |
+| `LLAMA_MOE_HOST_BATCH_LOG` | off | | log each batch request and the measured cost of its kind of layer |
+| `LLAMA_MOE_PREFETCH_LOG` | off | | log each staging slot's uploads and their time |
 | `LLAMA_MOE_CACHE_PROFILE` | off | file | selection counts of past sessions: start filled, add this session's at exit |
 | `LLAMA_MOE_CACHE_EXCLUSIVE` | off | 8200 | exclusive core: up to this many MiB of the core keep no host copy |
 | `LLAMA_MOE_CACHE_EXCLUSIVE_SPARES` | 16 | | spare host slots per group for the exclusive core's downloads |
@@ -94,7 +97,7 @@ and [prefill.md](prefill.md).
 
 | Variable | Meaning |
 |---|---|
-| `LLAMA_PROFILE_UBATCH` | 1: slow inputs of large ubatches; 2: every ubatch and decode call, k-pool rebuilds; 3: input times averaged over small ubatches |
+| `LLAMA_PROFILE_UBATCH` | 1: slow inputs of large ubatches, the measured share's decision and outcome for each; 2: every ubatch and decode call, k-pool rebuilds; 3: input times averaged over small ubatches |
 | `GGML_SCHED_PROFILE` | host time per backend in the scheduler's input copies and compute calls |
 
 ## Command-line options
@@ -122,6 +125,10 @@ and [prefill.md](prefill.md).
 | `ggml_backend_vmm_buffer_alloc` / `_commit` | CUDA proc address | device buffers whose physical memory grows and shrinks from the end |
 | `ggml_backend_host_release`, `ggml_backend_host_releasable` | CUDA proc address | give back pages of memfd host buffers |
 | `ggml_backend_synchronize_sleep` | CUDA proc address | wait for a stream without spinning |
+| `ggml_backend_vmm_alias` / `_alias_free` | CUDA proc address | map the end chunks of VMM buffers a second time, in one range with room after it |
+| `ggml_backend_lent_buffer_type_new` / `_set` / `_free` | CUDA proc address | a buffer type placing its buffers in a lent range while it lends |
+| `ggml_backend_event_new_timed`, `ggml_backend_event_elapsed_ms` | CUDA proc address | events that time the work between them |
+| `GGML_MOE_HOST_REQ_T_POST`, `_RESP_T_WAIT`, `_RESP_T_DONE` | ggml | the device's clock in a batch mailbox: when it posted, began to wait and saw the answer |
 | `llama_prefetch_token` | `src/llama-ext.h` | read ahead the file-backed rows a token will need |
 | `common_context_set_wait`, `common_context_wait`, `common_context_defer` | common | serialize access to a context a background decode uses |
 | `llama_batch_ext_set_pad`, `common_batch::token::pad`, `llama_ubatch::pad` | llama, common | pad entries of a batch |
@@ -171,3 +178,6 @@ first:
 | `b1a241661` | one expert per re-admission job; the admission worker stops before the banks are freed |
 | `1e888e4e7` | server: tail checkpoint only after small batches (`LLAMA_SERVER_CKPT_TAIL_MAX`), a restored checkpoint not copied again |
 | `eb1dd9ce1` | qwen35moe MTP layer cropped to its output rows after the attention |
+| `3cce2f756` | large batches shared with the host by measure; the batch wait polls from one thread |
+| `b83aeb575` | the large phase's buffers in the memory the cache lends; queued re-admissions dropped at a switch |
+| `98714f4d5` | the measured share takes an expert only if it shortens the layer's cycle |

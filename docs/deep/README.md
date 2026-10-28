@@ -21,21 +21,23 @@ and the drafter also run Ornith-1.5-122B, a `qwen35moe` model (see [measurements
 ## Where it stands
 
 All runs on the same machine (see [measurements.md](measurements.md) for the hardware, the harness and the spread),
-2026-10-23 to 2026-10-24.
+2026-10-23 to 2026-10-24; `deep`'s prompts and follow-ups 2026-10-28, with the measured host share and the lent memory.
 
 | | upstream + #30965 + #30966 | Strata 0.2.2 | `deep` |
 |---|---|---|---|
 | decode, short prompts: cold / warm / code (tok/s) | 61.0 / 61.3 / 55.2 | 88.9 / 87.1 / 72.7 | 108.7–114.0 / 105.7–110.4 / 99.5–104.4 |
-| prefill 11.6K / 34.8K / 92.8K tokens (tok/s) | 320 / 313 / 298 | 1389 / 1616 / 1709 | 1304–1361 / 1710–1756 / 1825–1848 |
+| prefill 11.6K / 34.8K / 92.8K tokens (tok/s) | 320 / 313 / 298 | 1389 / 1616 / 1709 | 1531 / 1809 / 1838 |
 | code task decode at 2.3K / 84K / 210K context (tok/s) | | 68.4 / 76.1 / 76.1 | 77.3–85.3 / 69.7–78.7 / 72.6–85.6 |
 | code task prefill 84K / 210K (tok/s) | | 1708 / 1686 | 1870–1894 / 1743–1843 |
-| follow-up turn of +100 / +300 / +1000 / +3000 tokens on an 11.6K conversation (s to first token) | | 0.72 / 0.96 / 3.14 / 3.34 | 0.92–0.98 / 1.48–1.60 / 3.03–3.11 / 4.31–4.38 |
+| follow-up turn of +100 / +300 / +1000 / +3000 tokens on an 11.6K conversation (s to first token) | | 0.72 / 0.96 / 3.14 / 3.34 | 1.17 / 1.78 / 2.38 / 2.58 |
 | lowest MemAvailable while serving (GiB of 62.7) | | ≥ 13.8 | 13.0–13.3 |
 
 Decode throughput follows the drafter's acceptance, which varies with the sampled text from run to run; the cost of a
 step at a given number of drafts is the stable figure, and it is on par with Strata's at long context (28.5–29.4 ms per
-step at 84K and 32.3 ms at 210K, against 27.6 and 32.9 ms in Strata's own log, at similar draft counts). Follow-up turns
-remain slower than Strata's, except around 1000 new tokens.
+step at 84K and 32.3 ms at 210K, against 27.6 and 32.9 ms in Strata's own log, at similar draft counts). Since the
+measured host share and the lent memory, follow-up turns of 1000 tokens and more are faster than Strata's (2.38 / 2.58 s
+for +1000 / +3000, see [measurements.md](measurements.md#measured-host-share-and-lent-memory)); shorter ones remain
+slower.
 
 The upstream column is the stock MoE cache path (`--cpu-moe --moe-cache-mib 14600 --moe-cache-cpu-share 0.7`, ubatch
 1024) with the two pull requests it needed at the time. After the merge with upstream, the same benches give the same
@@ -53,8 +55,9 @@ starts each session from a profile of past sessions.
 **Long prompts** (chunks of more than 512 tokens) run in 8192-token ubatches in the *large phase*
 ([moe-offload.md](moe-offload.md#cache-phases)): the expert cache shrinks to its core and lends the rest of its memory to
 the compute buffers and to staging slots, into which a worker uploads the next layers' experts while the current layer
-computes; the host computes the least selected of the experts the core lacks for the whole batch meanwhile. Prompts of
-up to 512 tokens stay in host mode in 128-token batches.
+computes; the memory it lends stays mapped, so a change of phase costs little. The host computes the least selected of
+the experts the core lacks for the whole batch meanwhile, as many as it is measured to save time with. Prompts of up to
+512 tokens stay in host mode in 128-token batches.
 
 **The drafter** ([speculative.md](speculative.md)) is the model's MTP layer on the second GPU, with a trimmed output
 vocabulary; it drafts up to three tokens and stops when the chance that the whole draft is accepted falls below 0.3. The
