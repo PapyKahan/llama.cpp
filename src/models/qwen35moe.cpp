@@ -665,6 +665,13 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
 
+    // with a masked h output only the output rows go on: the keys of the others are written by now, and a catch-up
+    // that outputs nothing skips the FFN
+    const bool crop = cparams.embeddings_nextn_masked && inp_out_ids != nullptr;
+    if (crop) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     ggml_tensor * ffn_residual = cur;
     cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_post_norm", il);
@@ -722,7 +729,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "h_nextn", -1);
     res->t_h_nextn= cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (!crop) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
