@@ -1111,8 +1111,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         if (svc_policy) {
             lk_svc.lock();
         }
-        // a few experts per job, so that they become hits as they land
-        constexpr size_t per_job = 16;
+        // one expert per job, so that it becomes a hit as it lands, and the copies of the device queued behind the
+        // job's uploads (a checkpoint restored, the inputs of a graph) wait for one expert, not for many
+        constexpr size_t per_job = 1;
         admit_job job;
         job.gate = false; // nothing queued before reads these slots
         auto flush = [&]() {
@@ -2336,6 +2337,22 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     }
 
     ~impl() {
+        // the admissions still queued are dropped, and the one in flight lands before the banks go
+        if (worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                quit = true;
+                jobs.clear();
+            }
+            cv.notify_all();
+            worker.join();
+            for (size_t i = 0; i < side.size(); ++i) {
+                ggml_backend_synchronize(side[i]);
+                ggml_backend_event_free(gate_ev[i]);
+                ggml_backend_event_free(done_ev[i]);
+                ggml_backend_free(side[i]);
+            }
+        }
         if (excl_worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(mtx);
@@ -2382,20 +2399,6 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         }
         for (ggml_backend_buffer_t buf : bank_bufs) {
             ggml_backend_buffer_free(buf);
-        }
-        if (worker.joinable()) {
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                quit = true;
-            }
-            cv.notify_all();
-            worker.join();
-            for (size_t i = 0; i < side.size(); ++i) {
-                ggml_backend_synchronize(side[i]);
-                ggml_backend_event_free(gate_ev[i]);
-                ggml_backend_event_free(done_ev[i]);
-                ggml_backend_free(side[i]);
-            }
         }
         log_stats();
         if (trace != nullptr) {
