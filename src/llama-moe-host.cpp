@@ -69,6 +69,7 @@ struct moe_host_layer {
     int          x_slot[2] = { 0, 0 }; // the quantized input read by gate and by up
     int          n_x   = 1;            // distinct quantized inputs
     float        limit = 0.0f;
+    int          kind  = -1;           // the layers whose weights have the same types share their measured cost
 };
 
 bool moe_host_mat_init(moe_host_mat & m, const ggml_tensor * t, int64_t n_in, int64_t n_out) {
@@ -204,6 +205,8 @@ struct llama_moe_host::impl {
         std::vector<float>   u;  // [batch_chunk][n_ff]
         std::vector<uint8_t> qa; // [batch_chunk][qh_row]
         std::vector<float>   o;  // [batch_chunk][n_embd]
+        // the items of the current request on this thread: count, sums of k, k^2, seconds and k*seconds, the longest
+        double n = 0.0, k = 0.0, kk = 0.0, t = 0.0, kt = 0.0, t_max = 0.0;
     };
     std::vector<batch_buf>   bb;        // per thread
     std::atomic<int32_t>     b_next[3];
@@ -211,6 +214,31 @@ struct llama_moe_host::impl {
     ggml_fp16_t *            cur_yh = nullptr;
     bool                     cur_batch = false;
     uint64_t st_breq = 0, st_bexperts = 0, st_bentries = 0, st_bns = 0;
+
+    // the measured cost of batch requests: per kind of layer, a thread's seconds per item t = per_item + per_entry*k
+    // (k its entries), fitted to the items of the last requests of that kind, whose sums fade with each request; and
+    // the wall seconds a request takes beyond its items spread over the threads (the inputs, the answer, the waits)
+    struct batch_kind {
+        double n = 0.0, k = 0.0, kk = 0.0, t = 0.0, kt = 0.0;
+        double per_item = 0.0, per_entry = 0.0;
+        bool   known = false;
+    };
+    mutable std::mutex      mtx_cost;
+    std::vector<batch_kind> kinds;
+    // the device's clock in the requests of a batch: from its answer to the next layer's post, its own work before the
+    // experts (the combine, the attention, the routing), which the host cannot overlap, in seconds per token per
+    // layer, fading with each request; and the seconds it waited for answers
+    std::vector<double>     b_pre;     // [n_layer], 0 until measured
+    double                  b_wait_total = 0.0;
+    int32_t                 b_last_seq    = 0;
+    int32_t                 b_last_tokens = 0;
+    uint64_t                b_last_post   = 0;
+    std::vector<float>      b_pop;     // [n_layer*n_expert] selections of every entry of the batch requests (take_batch_counts)
+    std::vector<float>      b_pop_req; // [n_expert] those of the current request
+    bool                    b_pop_new = false;
+    double                  b_overhead = 0.0;
+    bool                    b_overhead_known = false;
+    uint64_t                b_total_ns = 0, b_total_entries = 0;
 
     // the request being computed
     const moe_host_layer * cur   = nullptr;
@@ -307,6 +335,16 @@ struct llama_moe_host::impl {
             l.n_x       = l.x_slot[1] + 1;
             qx_row = std::max({ qx_row, l.m[0].qrow, l.m[1].qrow });
             qh_row = std::max(qh_row, l.m[2].qrow);
+            for (size_t j = 0; j < il && l.kind < 0; ++j) {
+                const moe_host_layer & o = layers[j];
+                if (o.on && o.m[0].type == l.m[0].type && o.m[1].type == l.m[1].type && o.m[2].type == l.m[2].type) {
+                    l.kind = o.kind;
+                }
+            }
+            if (l.kind < 0) {
+                l.kind = (int) kinds.size();
+                kinds.emplace_back();
+            }
         }
 
         const size_t max_entries = (size_t) max_tokens*n_used;
@@ -592,6 +630,7 @@ struct llama_moe_host::impl {
             const int32_t e     = b_items[i] / n_chunks_max;
             const int32_t c0    = (b_items[i] % n_chunks_max)*batch_chunk;
             const int32_t count = b_cnt[e];
+            const int64_t t_item = moe_host_now_ns();
             {
                 const int32_t k  = std::min(batch_chunk, count - c0);
                 const int32_t q0 = b_first[e] + c0;
@@ -647,6 +686,13 @@ struct llama_moe_host::impl {
                     }
                     lk.store(0, std::memory_order_release);
                 }
+                const double dt = (moe_host_now_ns() - t_item)*1e-9;
+                bf.n++;
+                bf.k  += k;
+                bf.kk += (double) k*k;
+                bf.t  += dt;
+                bf.kt += k*dt;
+                bf.t_max = std::max(bf.t_max, dt);
             }
         }
         bar.wait();
@@ -656,6 +702,88 @@ struct llama_moe_host::impl {
             const int32_t t = b_toks[i];
             ggml_cpu_fp32_to_fp16(cur_y + (size_t) t*n_embd, cur_yh + (size_t) t*n_embd, n_embd);
         }
+    }
+
+    // the request that follows another of the same batch: the device's clock since that one's answer
+    void learn_batch_device(const int32_t * hdr, int32_t il, int32_t seq, int32_t n_tokens) {
+        const uint64_t t_post = *(const uint64_t *) (hdr + GGML_MOE_HOST_REQ_T_POST);
+        if (b_last_seq + 1 == seq && b_last_tokens == n_tokens) {
+            const uint64_t t_wait = *(const uint64_t *) (hdr + GGML_MOE_HOST_RESP_T_WAIT);
+            const uint64_t t_done = *(const uint64_t *) (hdr + GGML_MOE_HOST_RESP_T_DONE);
+            if (b_last_post < t_wait && t_wait <= t_done && t_done < t_post) {
+                const double pre = (t_post - t_done)*1e-9/n_tokens;
+                std::lock_guard<std::mutex> lk(mtx_cost);
+                if (b_pre.empty()) {
+                    b_pre.assign(n_layer, 0.0);
+                }
+                b_pre[il] = b_pre[il] > 0.0 ? b_pre[il] + 0.3*(pre - b_pre[il]) : pre;
+                b_wait_total += (t_done - t_wait)*1e-9;
+            }
+        }
+        b_last_seq    = seq;
+        b_last_tokens = n_tokens;
+        b_last_post   = t_post;
+    }
+
+    void add_batch_pop(int32_t il) {
+        std::lock_guard<std::mutex> lk(mtx_cost);
+        if (b_pop.empty()) {
+            b_pop.assign((size_t) n_layer*n_expert, 0.0f);
+        }
+        float * pc = b_pop.data() + (size_t) il*n_expert;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            pc[e] += b_pop_req[e];
+        }
+        b_pop_new = true;
+    }
+
+    // the items of the request just served into the cost of its kind of layer
+    void learn_batch_cost(int kind, double wall, int32_t n_ent) {
+        batch_kind add;
+        double t_max = 0.0;
+        for (const batch_buf & bf : bb) {
+            add.n  += bf.n;
+            add.k  += bf.k;
+            add.kk += bf.kk;
+            add.t  += bf.t;
+            add.kt += bf.kt;
+            t_max = std::max(t_max, bf.t_max);
+        }
+        std::lock_guard<std::mutex> lk(mtx_cost);
+        b_total_ns      += (uint64_t) (wall*1e9);
+        b_total_entries += n_ent;
+        if (kind < 0 || add.n == 0.0) {
+            return;
+        }
+        constexpr double fade = 0.9;
+        batch_kind & bk = kinds[kind];
+        bk.n  = bk.n *fade + add.n;
+        bk.k  = bk.k *fade + add.k;
+        bk.kk = bk.kk*fade + add.kk;
+        bk.t  = bk.t *fade + add.t;
+        bk.kt = bk.kt*fade + add.kt;
+        const double mk = bk.k/bk.n, mt = bk.t/bk.n;
+        const double var = bk.kk/bk.n - mk*mk;
+        if (var >= 1.0) {
+            bk.per_entry = (bk.kt/bk.n - mk*mt)/var;
+            bk.per_item  = mt - bk.per_entry*mk;
+            if (bk.per_item < 0.0) {
+                bk.per_item  = 0.0;
+                bk.per_entry = bk.kt/bk.kk;
+            } else if (bk.per_entry < 0.0) {
+                bk.per_entry = 0.0;
+                bk.per_item  = mt;
+            }
+        } else {
+            // the items have about the same number of entries: an item's pass taken as worth a few entries
+            constexpr double pass = 4.0;
+            bk.per_entry = mt/(mk + pass);
+            bk.per_item  = pass*bk.per_entry;
+        }
+        bk.known = true;
+        const double o = wall - std::max(add.t/(n_workers + 1), t_max);
+        b_overhead = b_overhead_known ? b_overhead + 0.2*(o - b_overhead) : o;
+        b_overhead_known = true;
     }
 
     // a whole large batch: the entries the device marks -1, grouped by expert; no tail skip, a prompt is computed whole
@@ -675,6 +803,8 @@ struct llama_moe_host::impl {
             answer(0);
             return -1;
         }
+        learn_batch_device(hdr, il, seq, n_tokens);
+
         const mailbox_layout bl = layout(max_batch, n_used, n_embd, n_layer, n_expert);
         const int32_t * ids   = (const int32_t *) (mb + bl.off_ids);
         const int32_t * slots = (const int32_t *) (mb + bl.off_slots);
@@ -706,10 +836,14 @@ struct llama_moe_host::impl {
             }
         }
 
-        // a counting sort of the entries by expert
+        // a counting sort of the entries by expert, and the selections of all of them
         std::fill(b_cnt.begin(), b_cnt.end(), 0);
+        b_pop_req.assign(n_expert, 0.0f);
         int32_t n_ent = 0;
         for (int32_t i = 0; i < n; ++i) {
+            if (ids[i] >= 0 && ids[i] < n_expert) {
+                b_pop_req[ids[i]] += 1.0f;
+            }
             if (slots[i] < 0) {
                 b_cnt[ids[i]]++;
                 n_ent++;
@@ -717,6 +851,7 @@ struct llama_moe_host::impl {
         }
         if (n_ent == 0) {
             answer(0);
+            add_batch_pop(il);
             return il;
         }
         b_experts.clear();
@@ -767,17 +902,39 @@ struct llama_moe_host::impl {
         for (auto & nx : b_next) {
             nx.store(0, std::memory_order_relaxed);
         }
+        for (batch_buf & bf : bb) {
+            bf.n = bf.k = bf.kk = bf.t = bf.kt = bf.t_max = 0.0;
+        }
 
         const int64_t t0 = moe_host_now_ns();
         run_all();
         cur_batch = false;
 
+        const uint64_t dt = moe_host_now_ns() - t0;
         st_breq++;
         st_bexperts += b_experts.size();
         st_bentries += n_ent;
-        st_bns      += moe_host_now_ns() - t0;
+        st_bns      += dt;
 
         answer(1);
+        learn_batch_cost(layers[il].kind, dt*1e-9, n_ent);
+        add_batch_pop(il);
+        // LLAMA_MOE_HOST_BATCH_LOG: each batch request, and the cost its kind of layer is measured at since
+        static const bool blog = getenv("LLAMA_MOE_HOST_BATCH_LOG") != nullptr;
+        if (blog) {
+            const moe_host_layer & l = layers[il];
+            batch_kind bk;
+            double ovh;
+            {
+                std::lock_guard<std::mutex> lkc(mtx_cost);
+                bk  = kinds[l.kind];
+                ovh = b_overhead;
+            }
+            LLAMA_LOG_INFO("llama_moe_host: batch request: layer %d (kind %d), %d tokens, %zu experts, %zu items, %d entries, %.2f ms; "
+                "%.3f ms per item, %.4f ms per entry, %.2f ms per request\n",
+                il, l.kind, n_tokens, b_experts.size(), b_items.size(), n_ent, dt/1e6, 1e3*bk.per_item, 1e3*bk.per_entry, 1e3*ovh);
+        }
+
         return il;
     }
 
@@ -1048,6 +1205,51 @@ void llama_moe_host::take_counts(std::vector<float> & counts, float decay, std::
             (*total)[i] += c;
         }
     }
+}
+
+bool llama_moe_host::get_batch_cost(int32_t il, batch_cost & bc) const {
+    const impl & p = *pimpl;
+    if (il < 0 || il >= p.n_layer || !p.layers[il].on) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(p.mtx_cost);
+    const impl::batch_kind & bk = p.kinds[p.layers[il].kind];
+    if (!bk.known) {
+        return false;
+    }
+    bc.per_item  = bk.per_item;
+    bc.per_entry = bk.per_entry;
+    bc.overhead  = p.b_overhead_known ? std::max(0.0, p.b_overhead) : 0.0;
+    bc.n_threads = p.n_workers + 1;
+    return true;
+}
+
+void llama_moe_host::take_batch_counts(std::vector<float> & counts, float decay) {
+    impl & p = *pimpl;
+    GGML_ASSERT(counts.size() == (size_t) p.n_layer*p.n_expert);
+    std::lock_guard<std::mutex> lk(p.mtx_cost);
+    if (!p.b_pop_new) {
+        return;
+    }
+    for (size_t i = 0; i < counts.size(); ++i) {
+        counts[i] = counts[i]*decay + p.b_pop[i];
+    }
+    std::fill(p.b_pop.begin(), p.b_pop.end(), 0.0f);
+    p.b_pop_new = false;
+}
+
+void llama_moe_host::get_batch_totals(double & seconds, uint64_t & entries, double & device_wait) const {
+    const impl & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.mtx_cost);
+    seconds     = p.b_total_ns*1e-9;
+    entries     = p.b_total_entries;
+    device_wait = p.b_wait_total;
+}
+
+double llama_moe_host::get_batch_pre(int32_t il) const {
+    const impl & p = *pimpl;
+    std::lock_guard<std::mutex> lk(p.mtx_cost);
+    return il >= 0 && il < (int32_t) p.b_pre.size() ? p.b_pre[il] : 0.0;
 }
 
 void llama_moe_host::log_stats() const {

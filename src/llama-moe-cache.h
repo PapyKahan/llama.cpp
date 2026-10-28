@@ -74,8 +74,18 @@ public:
     // host mode with phases: large batches of up to max_batch tokens may share the experts the core lacks with the host
     void init_batch(int32_t max_batch);
 
-    // before the graph of a large batch of n_tokens (0 before any other graph): which experts the host computes for it
-    void begin_batch(int64_t n_tokens);
+    // before the graph of a large batch of n_tokens (0 before any other graph): which experts the host computes for it;
+    // upload_rate: the bytes per second the expert uploads get, 0 if not measured
+    void begin_batch(int64_t n_tokens, double upload_rate);
+
+    // whether the batch begun wants end_batch, once its graph is done: seconds from the start of its graph to the end of
+    // the device's work, the bytes uploaded for it
+    bool end_batch_wanted() const;
+    void end_batch(double seconds, int64_t bytes_uploaded, double upload_rate);
+
+    // whether the batch begun is shared with the host: its graph posts to the host, so no graph without the posts is
+    // reused for it, nor one with them for a batch that is not
+    bool batch_shared() const;
 
     // false if layer il does not share its n_tokens with the host; the part posts with ggml_moe_host_post_batch
     bool get_batch_part(int32_t il, int64_t n_tokens, host_part & hp) const;

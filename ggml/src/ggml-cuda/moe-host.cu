@@ -144,6 +144,9 @@ static __global__ void k_moe_host_post_batch(
         char * __restrict__ mb, const int off_ids, const int off_slots, const int off_w, const int off_table,
         const int n_expert, const int n_used, const int n_tokens, const int layer) {
     extern __shared__ int32_t table_s[];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *(uint64_t *) ((int32_t *) mb + GGML_MOE_HOST_REQ_T_POST) = moe_host_globaltimer();
+    }
     const int32_t * table = (const int32_t *) (mb + off_table) + (int64_t) layer*n_expert;
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
         table_s[e] = __ldcv(table + e);
@@ -243,34 +246,38 @@ static void ggml_cuda_op_moe_host_post_batch(ggml_backend_cuda_context & ctx, gg
     CUDA_CHECK(cudaGetLastError());
 }
 
-// batch mode: every block waits for the answer, then the blocks add y from the mailbox
+// batch mode: one thread waits for the answer and leaves in state[2] whether it brings y, so that the blocks adding y
+// read that from device memory: blocks polling the mailbox each would keep many reads across the bus while the device
+// waits, and slow the expert uploads that share it
+static __global__ void k_moe_host_wait_batch_poll(int32_t * __restrict__ state, char * __restrict__ mb) {
+    int32_t * hdr = (int32_t *) mb;
+    const int32_t seq = state[0];
+    const uint64_t t0 = moe_host_globaltimer();
+    *(uint64_t *) (hdr + GGML_MOE_HOST_RESP_T_WAIT) = t0;
+    int32_t got;
+    while ((got = moe_host_load_acquire(hdr + GGML_MOE_HOST_RESP_SEQ)) != seq) {
+        if (moe_host_globaltimer() - t0 > MOE_HOST_TIMEOUT_NS) {
+            break;
+        }
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        __nanosleep(256);
+#endif
+    }
+    if (got == seq) {
+        state[2] = moe_host_load_acquire(hdr + GGML_MOE_HOST_RESP_HAS_Y);
+    } else {
+        state[2] = 0;
+        hdr[GGML_MOE_HOST_RESP_TIMEOUT] = seq;
+    }
+    *(uint64_t *) (hdr + GGML_MOE_HOST_RESP_T_DONE) = moe_host_globaltimer();
+    __threadfence_system();
+}
+
+// batch mode, once the answer is in: the blocks add y from the mailbox
 static __global__ void k_moe_host_wait_batch(
         const char * __restrict__ a, const int64_t a_nb1, float * __restrict__ dst, const int32_t * __restrict__ state,
         char * __restrict__ mb, const int off_yh, const int off_yflag, const int n_embd, const int n_tokens) {
-    __shared__ int32_t has_y;
-
-    if (threadIdx.x == 0) {
-        int32_t * hdr = (int32_t *) mb;
-        const int32_t seq = state[0];
-        const uint64_t t0 = moe_host_globaltimer();
-        int32_t got;
-        while ((got = moe_host_load_acquire(hdr + GGML_MOE_HOST_RESP_SEQ)) != seq) {
-            if (moe_host_globaltimer() - t0 > MOE_HOST_TIMEOUT_NS) {
-                break;
-            }
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-            __nanosleep(256);
-#endif
-        }
-        if (got == seq) {
-            has_y = moe_host_load_acquire(hdr + GGML_MOE_HOST_RESP_HAS_Y);
-        } else {
-            has_y = 0;
-            hdr[GGML_MOE_HOST_RESP_TIMEOUT] = seq;
-            __threadfence_system();
-        }
-    }
-    __syncthreads();
+    const int32_t has_y = state[2];
 
     // a block per token at a time: its flag read once, then the row the host flags, in half precision, 8 values a load
     __shared__ int32_t flag;
@@ -314,6 +321,9 @@ static void ggml_cuda_op_moe_host_wait_batch(ggml_backend_cuda_context & ctx, gg
     const int32_t off_yh    = ggml_get_op_params_i32(dst, 4);
     const int32_t off_yflag = ggml_get_op_params_i32(dst, 5);
     GGML_ASSERT(off_yh % 16 == 0 && a->ne[0] % 8 == 0);
+
+    k_moe_host_wait_batch_poll<<<1, 1, 0, ctx.stream()>>>((int32_t *) state->data, (char *) mb);
+    CUDA_CHECK(cudaGetLastError());
 
     const int n_blocks = (int) std::min<int64_t>(4*ggml_cuda_info().devices[ctx.device].nsm, a->ne[1]);
     k_moe_host_wait_batch<<<n_blocks, 256, 0, ctx.stream()>>>(

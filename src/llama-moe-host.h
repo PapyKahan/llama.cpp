@@ -73,6 +73,30 @@ public:
     // total, if not null: also adds them there, undecayed
     void take_counts(std::vector<float> & counts, float decay, std::vector<float> * total = nullptr);
 
+    // the measured cost of a batch request of layer il, from the requests served so far: a thread's seconds per item
+    // (an expert's pass over its weights for up to 64 of its tokens) and per entry (a token of an expert), the layers
+    // with the same types of weights measured together, and the wall seconds a request takes beyond its items spread
+    // over the threads; false while no request of the layer's kind was measured
+    struct batch_cost {
+        double per_item  = 0.0;
+        double per_entry = 0.0;
+        double overhead  = 0.0;
+        int    n_threads = 1;
+    };
+    bool get_batch_cost(int32_t il, batch_cost & bc) const;
+
+    // the wall seconds and the entries of all the batch requests served so far, and the seconds the device waited for
+    // their answers
+    void get_batch_totals(double & seconds, uint64_t & entries, double & device_wait) const;
+
+    // the device's own seconds per token in layer il of a batch before it posts (the combine of the layer before, the
+    // attention, the routing), which the host cannot overlap; 0 until measured
+    double get_batch_pre(int32_t il) const;
+
+    // if batch requests came since the last call: counts [n_layer*n_expert] times decay, plus the selections of each
+    // expert in them, all their entries, whether the host computed them or not
+    void take_batch_counts(std::vector<float> & counts, float decay);
+
     void log_stats() const;
 
 private:

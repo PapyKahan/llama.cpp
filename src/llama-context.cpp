@@ -643,7 +643,9 @@ struct llama_context::expert_prefetch {
         ggml_backend_buffer_t buf   = nullptr;
         ggml_context        * ctx   = nullptr; // the descriptor of the staged tensor
         ggml_tensor         * t     = nullptr;
+        ggml_backend_event_t  start = nullptr; // recorded on the upload stream before the uploads, if timed
         ggml_backend_event_t  ready = nullptr; // recorded on the upload stream after the uploads
+        int64_t               timed_bytes = 0; // the bytes between start and ready, not yet counted in the upload rate
         ggml_backend_event_t  done  = nullptr; // recorded on the compute stream after the copy into place
         bool                  done_recorded = false;
         const ggml_tensor   * src   = nullptr; // the host tensor staged in the slot
@@ -677,6 +679,14 @@ struct llama_context::expert_prefetch {
     // per graph, for LLAMA_PROFILE_UBATCH
     std::atomic<int64_t> n_uploaded{0}, n_skipped{0}, bytes_uploaded{0};
 
+    // the rate of the upload stream, from timed events around the uploads of each slot: bytes and seconds that fade
+    // with each upload measured, so the rate follows what the uploads get while the host computes beside them
+    ggml_backend_event_t (*event_new_timed)(ggml_backend_dev_t) = nullptr;
+    float (*event_elapsed_ms)(ggml_backend_event_t, ggml_backend_event_t) = nullptr;
+    double              up_bytes = 0.0;
+    double              up_s     = 0.0;
+    std::atomic<double> up_rate{0.0};
+
     std::thread             worker;
     std::mutex              mtx;
     std::condition_variable cv;
@@ -689,7 +699,38 @@ struct llama_context::expert_prefetch {
         if (stream == nullptr) {
             throw std::runtime_error("failed to create the upload stream of the expert prefetch");
         }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        event_new_timed  = (decltype(event_new_timed))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_new_timed");
+        event_elapsed_ms = (decltype(event_elapsed_ms)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_elapsed_ms");
+        if (event_new_timed == nullptr || event_elapsed_ms == nullptr) {
+            event_new_timed  = nullptr;
+            event_elapsed_ms = nullptr;
+        }
         worker = std::thread([this] { run(); });
+    }
+
+    // the bytes per second the upload stream moves, 0 until measured
+    double upload_rate() const {
+        return up_rate.load(std::memory_order_relaxed);
+    }
+
+    // the last uploads of a slot into the rate, once they are done
+    void take_timing(slot & s) {
+        if (s.start == nullptr || s.timed_bytes == 0) {
+            return;
+        }
+        const float ms = event_elapsed_ms(s.start, s.ready);
+        // LLAMA_MOE_PREFETCH_LOG: each tensor's uploads
+        static const bool job_log = getenv("LLAMA_MOE_PREFETCH_LOG") != nullptr;
+        if (job_log) {
+            LLAMA_LOG_INFO("%s: expert prefetch: %.2f MiB uploaded in %.3f ms\n", __func__, s.timed_bytes/1024.0/1024.0, ms);
+        }
+        if (ms > 0.0f) {
+            up_bytes = up_bytes*0.98 + (double) s.timed_bytes;
+            up_s     = up_s*0.98 + ms*1e-3;
+            up_rate.store(up_bytes/up_s, std::memory_order_relaxed);
+        }
+        s.timed_bytes = 0;
     }
 
     ~expert_prefetch() {
@@ -701,6 +742,9 @@ struct llama_context::expert_prefetch {
         cv.notify_all();
         worker.join();
         for (auto & s : slots) {
+            if (s.start != nullptr) {
+                ggml_backend_event_free(s.start);
+            }
             ggml_backend_event_free(s.ready);
             ggml_backend_event_free(s.done);
             ggml_free(s.ctx);
@@ -725,6 +769,7 @@ struct llama_context::expert_prefetch {
             // a slot is refilled only once its previous tensor was copied into place
             if (s.done_recorded) {
                 ggml_backend_event_synchronize(s.done);
+                take_timing(s);
             }
             const ggml_tensor * src = s.src;
             ggml_reset(s.ctx);
@@ -755,6 +800,10 @@ struct llama_context::expert_prefetch {
                 GGML_ASSERT(p != nullptr);
                 return (const uint8_t *) p;
             };
+            if (s.start != nullptr) {
+                ggml_backend_event_record(s.start, stream);
+            }
+            const int64_t bytes0 = bytes_uploaded;
             for (int64_t first = 0; first < n_expert; ) {
                 if (in_cache(first)) {
                     n_skipped += cache != nullptr && cache->cached(backend, src, first);
@@ -772,6 +821,7 @@ struct llama_context::expert_prefetch {
                 first = last + 1;
             }
             ggml_backend_event_record(s.ready, stream);
+            s.timed_bytes = bytes_uploaded - bytes0;
             {
                 std::lock_guard<std::mutex> lk(mtx);
                 s.issued = true;
@@ -800,7 +850,8 @@ struct llama_context::expert_prefetch {
             ggml_backend_buffer_clear(s.buf, 0);
             ggml_init_params params = { ggml_tensor_overhead()*2, nullptr, true };
             s.ctx   = ggml_init(params);
-            s.ready = ggml_backend_event_new(dev);
+            s.start = event_new_timed != nullptr ? event_new_timed(dev) : nullptr;
+            s.ready = s.start != nullptr ? event_new_timed(dev) : ggml_backend_event_new(dev);
             s.done  = ggml_backend_event_new(dev);
             free_slots.push_back(k);
         }
@@ -815,6 +866,10 @@ struct llama_context::expert_prefetch {
         for (auto & s : slots) {
             if (s.done != nullptr && s.done_recorded) {
                 ggml_backend_event_synchronize(s.done);
+            }
+            take_timing(s);
+            if (s.start != nullptr) {
+                ggml_backend_event_free(s.start);
             }
             if (s.ready != nullptr) {
                 ggml_backend_event_free(s.ready);
@@ -858,6 +913,9 @@ struct llama_context::expert_prefetch {
             free_slots.push_back(k);
         }
         staged.clear();
+        for (auto & s : slots) {
+            take_timing(s);
+        }
     }
 
     // the order from the graph about to run, before any copy: the host expert tensors of its MUL_MAT_ID nodes in
@@ -2095,7 +2153,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // which experts of a large batch the host computes, before the graph is built or reused
     if (moe_cache) {
-        moe_cache->begin_batch(moe_phase_large ? (int64_t) ubatch.n_tokens : 0);
+        moe_cache->begin_batch(moe_phase_large ? (int64_t) ubatch.n_tokens : 0, prefetch ? prefetch->upload_rate() : 0.0);
     }
 
     // a small decoding ubatch may go to a graph slot
@@ -2169,6 +2227,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int64_t t_compute = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, sched_cur);
+    // a large batch the MoE cache shares by measure learns from its time
+    if (status == GGML_STATUS_SUCCESS && moe_cache && moe_cache->end_batch_wanted()) {
+        synchronize();
+        moe_cache->end_batch((ggml_time_us() - t_compute)*1e-6, prefetch ? prefetch->bytes_uploaded.load() : 0,
+            prefetch ? prefetch->upload_rate() : 0.0);
+    }
     if (profile && (profile_all || ubatch.n_tokens > 256)) {
         const int64_t t_end = ggml_time_us();
         synchronize();
@@ -3348,6 +3412,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(sched_gf),
         /*.res         =*/ res,
         /*.vsub        =*/ vsub.get(),
+        /*.moe_batch   =*/ moe_cache != nullptr && moe_cache->batch_shared(),
     };
 }
 

@@ -864,6 +864,9 @@ struct llm_graph_params {
 
     const llama_vocab_subset * vsub = nullptr;
 
+    // the batch is shared with the host (llama_moe_cache::batch_shared): its MoE layers post to the host
+    bool moe_batch = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -901,6 +904,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (moe_batch != other.moe_batch) {
             return false;
         }
 

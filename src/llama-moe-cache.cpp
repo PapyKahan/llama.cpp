@@ -542,9 +542,12 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     std::vector<publication> lent; // the experts of the lent slots, admitted again into them when small batches return
     size_t  n_readmitted = 0;
 
-    // large batches shared with the host (LLAMA_MOE_BATCH_CPU, host mode with phases): for the graph of a large batch
-    // the host computes the least selected of the experts the core lacks, for all the tokens of the batch, while the
-    // device uploads and computes the others; the share balances the host's rate against the upload rate
+    // large batches shared with the host (host mode with phases): for the graph of a large batch the host computes the
+    // least selected of the experts the core lacks, for all the tokens of the batch, while the device uploads and
+    // computes the others. Each layer gives the host its least selected lacking experts for as long as the host's time
+    // for them, measured per kind of layer (llama_moe_host::get_batch_cost), stays within the time of the uploads left,
+    // at the upload rate the prefetch measures, or within the device's own time for the layer, measured on the batches
+    // neither bounds; LLAMA_MOE_BATCH_CPU=<share> fixes the share of the lacking experts instead, 0 turns sharing off
     llama_moe_host::mailbox_layout batch_lay;
     int32_t              batch_max     = 0;
     int64_t              batch_tokens  = 0;     // the batch the host takes part in, 0 if none
@@ -555,6 +558,23 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     size_t               batch_n_cpu   = 0;
     uint64_t             batch_graphs  = 0;
     double               batch_share   = 0.0;   // sum of the shares, for the log
+    double               batch_c_tok   = 0.5e-3; // the device's seconds per token of a large batch
+    // the selections of each expert in the last shared batches (llama_moe_host::take_batch_counts), fading with each
+    // batch: they predict the entries of a large batch better than the profile, counted in decoding. A layer uses them
+    // once they hold a few selections per expert, the profile until then; for each source, the entries the host
+    // finds against the ones it expects (the experts least selected in the last batches are selected more in the
+    // next one)
+    std::vector<float>   batch_pop;
+    double               batch_ratio[2] = { 1.0, 1.5 }; // from the profile, from batch_pop
+    int                  batch_src     = 0;     // the source of the batch begun, when it uses only one
+    // the measured batch begun, for end_batch: its tokens (0 if none), the entries expected for the host's experts,
+    // the host's totals before it, and its predicted seconds without and with the host
+    int64_t              batch_begun   = 0;
+    double               batch_expected = 0.0;
+    double               batch_host_s0 = 0.0;
+    uint64_t             batch_host_e0 = 0;
+    double               batch_host_w0 = 0.0;
+    double               batch_pred[2] = {};
 
     // exclusive core (LLAMA_MOE_CACHE_EXCLUSIVE=<MiB>, host mode with phases and the service policy, GGML_CUDA_HOST_MEMFD
     // expert buffers): the experts held by the first n_excl slots of each group, up to that size, have no host copy, as
@@ -1920,38 +1940,87 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             __func__, max_batch, batch_lay.size/1024.0/1024.0);
     }
 
-    // the share of the n_lacking experts the core lacks in a layer that the host computes for a batch of n_tokens: an
-    // expert the host takes saves its upload, so the share balances the uploads against the host's time for the experts
-    // (each unpacked once per chunk of tokens, then multiplied per token), and stops where the device's own compute
-    // becomes the longer part: beyond that the host only adds memory traffic
-    float batch_share_for(int64_t n_tokens, size_t n_lacking, size_t expert_bytes) const {
-        if (batch_force >= 0.0f) {
-            return batch_force;
+    // the lacking experts of layer il the host takes for a batch of n_tokens, the least selected first, as they cost the
+    // host the least and an upload costs the same for all. The device's cycle for the layer is the longer of the uploads
+    // left and its own work: what it does before it posts (pre, which the host cannot overlap) then the longer of its
+    // experts (dev) and the host's answer. The host takes experts while that cycle does not grow. t[0], t[1]: the
+    // layer's predicted seconds without and with the host. A layer whose kind the host has not measured yet takes a
+    // few of its cheapest experts, so that it is measured.
+    size_t batch_take(int32_t il, const std::vector<int32_t> & lacking, const std::vector<double> & k_exp,
+            double up_e, double pre, double dev, double io, double & expected, double t[2]) const {
+        llama_moe_host::batch_cost bc;
+        const bool known = host->get_batch_cost(il, bc);
+        size_t cap = std::min(lacking.size(), (size_t) std::lround(batch_cap*lacking.size()));
+        if (!known) {
+            bc.per_item  = 1e-3;
+            bc.per_entry = 0.3e-3;
+            bc.overhead  = 1e-3;
+            bc.n_threads = batch_threads;
+            cap = std::min<size_t>(cap, 4);
         }
-        if (n_lacking == 0) {
-            return 0.0f;
+        t[0] = std::max(lacking.size()*up_e, pre + dev);
+        t[1] = t[0];
+        double sum = 0.0, t_max = 0.0;
+        size_t n = 0;
+        for (; n < cap; ++n) {
+            const double k = k_exp[n];
+            if (!known && k > 16.0) {
+                break;
+            }
+            // an expert with fewer than 64 entries is one item if it has any, a larger one an item per 64
+            const double items = k < 64.0 ? 1.0 - std::exp(-k) : std::ceil(k/64.0);
+            const double t_e = bc.per_item*items + bc.per_entry*k;
+            const double t_i = std::min(t_e, bc.per_item + bc.per_entry*64.0);
+            const double h   = io + bc.overhead + std::max((sum + t_e)/bc.n_threads, std::max(t_max, t_i));
+            const double u   = (lacking.size() - n - 1)*up_e;
+            const double c   = std::max(u, pre + std::max(dev, h));
+            if (known && c > t[1]) {
+                break;
+            }
+            sum  += t_e;
+            t_max = std::max(t_max, t_i);
+            t[1]  = c;
+            expected += k;
         }
-        const double t_e     = (double) n_tokens*n_expert_used/host_n_expert;               // tokens per expert, on average
-        const double host_e  = (0.36e-3*std::ceil(t_e/64.0) + 0.09e-3*t_e)/batch_threads; // s per expert on the host
-        const double upload  = (double) n_lacking*expert_bytes/15e9;                      // s per layer
-        const double compute = (double) n_tokens*0.5e-3/layers.size();                    // s per layer on the device
-        if (compute >= upload) {
-            return 0.0f;
-        }
-        const double balance = upload/(upload + n_lacking*host_e);
-        return (float) std::min({ balance, 1.0 - compute/upload, (double) batch_cap });
+        return n;
     }
 
-    void begin_batch(int64_t n_tokens) {
+    // rate: the bytes per second of the uploads, 0 if not measured yet
+    void begin_batch(int64_t n_tokens, double rate) {
         batch_tokens = 0;
+        batch_begun  = 0;
         if (batch_max == 0 || !(phases && prefill) || n_tokens <= host_max_tokens || n_tokens > batch_max) {
             return;
         }
+        const bool measured = batch_force < 0.0f;
+        if (rate <= 0.0) {
+            rate = 12e9;
+        }
+        int32_t n_moe = 0;
+        for (const layer & l : layers) {
+            n_moe += l.ig >= 0;
+        }
+        // the device's own seconds per layer, and the inputs to the host and its answer, which the host waits for
+        const double dev_layer = batch_c_tok*n_tokens/std::max(1, n_moe);
+        const double io        = (double) n_tokens*host_n_embd*6/rate;
+
         const int32_t ne = host_n_expert;
         std::fill(batch_cpu.begin(), batch_cpu.end(), 0);
         batch_n_cpu = 0;
+        if (measured) {
+            if (batch_pop.empty()) {
+                batch_pop.assign((size_t) layers.size()*ne, 0.0f);
+            }
+            host->take_batch_counts(batch_pop, 0.7f);
+        }
+        int    n_src[2]  = {};
         std::vector<int32_t> lacking;
-        float share = 0.0f;
+        std::vector<double>  k_exp;
+        size_t n_lacking = 0;
+        double expected  = 0.0;
+        double t_layer[2];
+        double t_sum[2]  = {};
+        bool   probing   = false;
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
             if (g.n_slots == 0) {
@@ -1974,16 +2043,52 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                         lacking.push_back(e);
                     }
                 }
-                // the least selected first: they cost the host the least per expert, an upload costs the same for all
+                n_lacking += lacking.size();
                 const auto pop = [&](int32_t e) {
                     const size_t key = (size_t) il*ne + e;
                     return !profile.empty() ? profile[key] : host_score[key];
                 };
-                const float share_il = batch_share_for(n_tokens, lacking.size(), expert_bytes);
-                share = std::max(share, share_il);
-                const size_t n_cpu = std::min(lacking.size(), (size_t) std::lround(share_il*lacking.size()));
-                std::partial_sort(lacking.begin(), lacking.begin() + n_cpu, lacking.end(),
-                    [&](int32_t a, int32_t b) { return pop(a) < pop(b); });
+                size_t n_cpu = 0;
+                if (!measured) {
+                    n_cpu = std::min(lacking.size(), (size_t) std::lround(batch_force*lacking.size()));
+                    std::partial_sort(lacking.begin(), lacking.begin() + n_cpu, lacking.end(),
+                        [&](int32_t a, int32_t b) { return pop(a) < pop(b); });
+                } else {
+                    // the entries of each expert expected from its share of the layer's selections, in the last shared
+                    // batches if they counted enough of them, in the profile otherwise
+                    const float * bp = batch_pop.data() + (size_t) il*ne;
+                    double bp_sum = 0.0;
+                    for (int32_t e = 0; e < ne; ++e) {
+                        bp_sum += bp[e];
+                    }
+                    const int src = bp_sum >= 4.0*ne ? 1 : 0;
+                    n_src[src]++;
+                    const auto share = [&](int32_t e) {
+                        return src == 1 ? (bp[e] + 0.5)/(bp_sum + 0.5*ne) : (double) pop(e);
+                    };
+                    std::sort(lacking.begin(), lacking.end(), [&](int32_t a, int32_t b) { return share(a) < share(b); });
+                    double pop_sum = 1.0;
+                    if (src == 0) {
+                        pop_sum = 0.0;
+                        for (int32_t e = 0; e < ne; ++e) {
+                            pop_sum += pop(e);
+                        }
+                    }
+                    const double n_ent = (double) n_tokens*n_expert_used*batch_ratio[src];
+                    k_exp.resize(lacking.size());
+                    for (size_t i = 0; i < lacking.size(); ++i) {
+                        k_exp[i] = n_ent*(pop_sum > 0.0 ? share(lacking[i])/pop_sum : 1.0/ne);
+                    }
+                    llama_moe_host::batch_cost bc;
+                    probing |= !host->get_batch_cost(il, bc);
+                    // before its post the device works for a part of its time the host cannot overlap, measured, or
+                    // taken as a fifth until then
+                    const double pre_tok = host->get_batch_pre(il);
+                    const double pre     = pre_tok > 0.0 ? std::min(dev_layer, pre_tok*n_tokens) : 0.2*dev_layer;
+                    n_cpu = batch_take(il, lacking, k_exp, expert_bytes/rate, pre, dev_layer - pre, io, expected, t_layer);
+                    t_sum[0] += t_layer[0];
+                    t_sum[1] += t_layer[1];
+                }
                 for (size_t i = 0; i < n_cpu; ++i) {
                     const size_t key = (size_t) il*ne + lacking[i];
                     batch_cpu[key] = 1;
@@ -1992,14 +2097,79 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 batch_n_cpu += n_cpu;
             }
         }
-        // the graph of a batch shares it with the host whenever the share is positive, so a graph reused for a batch of
-        // the same size has the same posts even if no expert goes to the host this time
-        if (share <= 0.0f) {
+        // a measured batch is shared only if the host saves more than a little of it, or measures a kind of layer
+        if (measured && batch_n_cpu > 0 && !probing && t_sum[1] > 0.98*t_sum[0]) {
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                const group & g = groups[ig];
+                for (int32_t il : g.layers) {
+                    if (int32_t * table = hdev[g.id].batch_table; table != nullptr && g.n_slots > 0) {
+                        std::fill(table + (size_t) il*ne, table + (size_t) (il + 1)*ne, 0);
+                    }
+                }
+            }
+            std::fill(batch_cpu.begin(), batch_cpu.end(), 0);
+            batch_n_cpu = 0;
+        }
+        if (measured) {
+            batch_begun    = n_tokens;
+            batch_expected = batch_n_cpu > 0 && (n_src[0] == 0 || n_src[1] == 0) ? expected : 0.0;
+            batch_src      = n_src[1] > 0 ? 1 : 0;
+            batch_pred[0]  = t_sum[0];
+            batch_pred[1]  = batch_n_cpu > 0 ? t_sum[1] : t_sum[0];
+            host->get_batch_totals(batch_host_s0, batch_host_e0, batch_host_w0);
+            static const bool profile_log = getenv("LLAMA_PROFILE_UBATCH") != nullptr;
+            if (profile_log) {
+                LLAMA_LOG_INFO("%s: %lld tokens: %zu of %zu lacking experts to the host, predicted %.0f ms instead of %.0f (uploads at %.1f GB/s, device %.0f ms, %d layers from the batches, entries x%.2f/x%.2f)\n",
+                    __func__, (long long) n_tokens, batch_n_cpu, n_lacking, 1e3*batch_pred[1], 1e3*batch_pred[0], rate/1e9,
+                    1e3*batch_c_tok*n_tokens, n_src[1], batch_ratio[0], batch_ratio[1]);
+            }
+        }
+        // the graph of a batch shares it with the host whenever experts go to the host, so a graph reused for a batch
+        // of the same size has the same posts
+        if (batch_n_cpu == 0 && (measured || batch_force <= 0.0f)) {
             return;
         }
         batch_tokens = n_tokens;
         batch_graphs++;
-        batch_share += share;
+        batch_share += n_lacking > 0 ? (double) batch_n_cpu/n_lacking : 0.0;
+    }
+
+    // after the graph of a batch begun in the measured mode: seconds from its start to the device's end, the bytes the
+    // prefetch uploaded for it at the rate it measures. The host's entries correct the expectation of its source, and a
+    // batch the host took no part in and the uploads did not bound gives the device's time per token
+    void end_batch(double seconds, int64_t bytes_uploaded, double rate) {
+        if (batch_begun == 0) {
+            return;
+        }
+        const int64_t n_tokens = batch_begun;
+        batch_begun = 0;
+        double   host_s = 0.0;
+        uint64_t host_e = 0;
+        double   host_w = 0.0;
+        host->get_batch_totals(host_s, host_e, host_w);
+        host_s -= batch_host_s0;
+        host_e -= batch_host_e0;
+        host_w -= batch_host_w0;
+        if (batch_expected >= 16.0) {
+            const double r = (double) host_e/batch_expected;
+            double & ratio = batch_ratio[batch_src];
+            ratio = std::clamp(ratio*(1.0 + 0.5*(r - 1.0)), 0.25, 8.0);
+        }
+        // the device's own time from a batch the host took no part in, if the uploads did not bound it
+        const double up_s = rate > 0.0 ? bytes_uploaded/rate : 0.0;
+        if (batch_tokens == 0 && seconds > 1.25*up_s) {
+            batch_c_tok += 0.5*(seconds/n_tokens - batch_c_tok);
+        }
+        static const bool profile_log = getenv("LLAMA_PROFILE_UBATCH") != nullptr;
+        if (profile_log) {
+            LLAMA_LOG_INFO("%s: %lld tokens: %.0f ms (predicted %.0f), uploads %.0f ms at %.1f GB/s, host %.0f ms for %llu entries, the device waited %.0f ms\n",
+                __func__, (long long) n_tokens, 1e3*seconds, 1e3*batch_pred[1], 1e3*up_s, rate/1e9, 1e3*host_s,
+                (unsigned long long) host_e, 1e3*host_w);
+        }
+    }
+
+    bool end_batch_wanted() const {
+        return batch_begun > 0;
     }
 
     // every cached layer of a shared batch posts to the host, whatever its own tokens: the prefetch does not upload the
@@ -2781,8 +2951,20 @@ void llama_moe_cache::init_batch(int32_t max_batch) {
     pimpl->init_batch(max_batch);
 }
 
-void llama_moe_cache::begin_batch(int64_t n_tokens) {
-    pimpl->begin_batch(n_tokens);
+void llama_moe_cache::begin_batch(int64_t n_tokens, double upload_rate) {
+    pimpl->begin_batch(n_tokens, upload_rate);
+}
+
+bool llama_moe_cache::batch_shared() const {
+    return pimpl->batch_tokens > 0;
+}
+
+bool llama_moe_cache::end_batch_wanted() const {
+    return pimpl->end_batch_wanted();
+}
+
+void llama_moe_cache::end_batch(double seconds, int64_t bytes_uploaded, double upload_rate) {
+    pimpl->end_batch(seconds, bytes_uploaded, upload_rate);
 }
 
 bool llama_moe_cache::get_batch_part(int32_t il, int64_t n_tokens, host_part & hp) const {

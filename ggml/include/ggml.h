@@ -2790,9 +2790,12 @@ extern "C" {
         GGML_MOE_HOST_REQ_LAYER    = 1,
         GGML_MOE_HOST_REQ_N_TOKENS = 2,
         GGML_MOE_HOST_REQ_N_USED   = 3,
+        GGML_MOE_HOST_REQ_T_POST   = 4,  // batch requests: the device's clock (ns, two words) when it posted
         GGML_MOE_HOST_RESP_SEQ     = 16, // written last by the host
         GGML_MOE_HOST_RESP_HAS_Y   = 17, // 0 if the host computed nothing, y is then not read
         GGML_MOE_HOST_RESP_TIMEOUT = 18, // set by the device when it gave up waiting for an answer
+        GGML_MOE_HOST_RESP_T_WAIT  = 20, // batch requests: the device's clock when it began to wait for the answer,
+        GGML_MOE_HOST_RESP_T_DONE  = 22, // and when it saw it (two words each), before its next post
         GGML_MOE_HOST_HDR_WORDS    = 32,
     };
     //

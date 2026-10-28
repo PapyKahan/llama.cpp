@@ -6741,6 +6741,41 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// An event that also takes the device's time when it is reached (ggml_backend_event_elapsed_ms), freed with
+// ggml_backend_event_free
+static ggml_backend_event_t ggml_backend_cuda_event_new_timed(ggml_backend_dev_t dev) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED(dev);
+    return nullptr;
+#else
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreate(&event));
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+#endif
+}
+
+// The milliseconds from ev0 to ev1, two timed events of one device; negative while either is not reached
+static float ggml_backend_cuda_event_elapsed_ms(ggml_backend_event_t ev0, ggml_backend_event_t ev1) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)ev0->device->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, (cudaEvent_t)ev0->context, (cudaEvent_t)ev1->context) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1.0f;
+    }
+    return ms;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -6991,6 +7026,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_synchronize_sleep") == 0) {
         return (void *)ggml_backend_cuda_synchronize_sleep;
+    }
+    if (strcmp(name, "ggml_backend_event_new_timed") == 0) {
+        return (void *)ggml_backend_cuda_event_new_timed;
+    }
+    if (strcmp(name, "ggml_backend_event_elapsed_ms") == 0) {
+        return (void *)ggml_backend_cuda_event_elapsed_ms;
     }
     return nullptr;
 }
