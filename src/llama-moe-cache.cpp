@@ -2070,13 +2070,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     // the lacking experts of layer il the host takes for a batch of n_tokens, the least selected first, as they cost the
     // host the least and an upload costs the same for all. The device's cycle for the layer is the longer of the uploads
     // left and its own work: what it does before it posts (pre, which the host cannot overlap) then the longer of its
-    // experts (dev) and the host's answer. The host takes experts while that cycle does not grow. t[0], t[1]: the
-    // layer's predicted seconds without and with the host. A layer whose kind the host has not measured yet takes a
-    // few of its cheapest experts, so that it is measured.
+    // experts (dev) and the host's answer. The host takes experts while each shortens that cycle. t[0], t[1]: the
+    // layer's predicted seconds without and with the host. A layer whose kind the host has not measured yet (known
+    // false) takes a few of its cheapest experts, so that it is measured.
     size_t batch_take(int32_t il, const std::vector<int32_t> & lacking, const std::vector<double> & k_exp,
-            double up_e, double pre, double dev, double io, double & expected, double t[2]) const {
+            double up_e, double pre, double dev, double io, double & expected, double t[2], bool & known) const {
         llama_moe_host::batch_cost bc;
-        const bool known = host->get_batch_cost(il, bc);
+        known = host->get_batch_cost(il, bc);
         size_t cap = std::min(lacking.size(), (size_t) std::lround(batch_cap*lacking.size()));
         if (!known) {
             bc.per_item  = 1e-3;
@@ -2101,7 +2101,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             const double h   = io + bc.overhead + std::max((sum + t_e)/bc.n_threads, std::max(t_max, t_i));
             const double u   = (lacking.size() - n - 1)*up_e;
             const double c   = std::max(u, pre + std::max(dev, h));
-            if (known && c > t[1]) {
+            if (known && c >= t[1]) {
                 break;
             }
             sum  += t_e;
@@ -2144,10 +2144,19 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         std::vector<int32_t> lacking;
         std::vector<double>  k_exp;
         size_t n_lacking = 0;
-        double expected  = 0.0;
         double t_layer[2];
         double t_sum[2]  = {};
-        bool   probing   = false;
+        // the experts each layer gives the host, applied once the batch is known to be worth sharing
+        struct pick {
+            int32_t * table;
+            int32_t   il;
+            size_t    first;    // in picked
+            size_t    n;
+            double    expected; // their entries
+            bool      known;    // the layer's kind is measured
+        };
+        std::vector<pick>    picks;
+        std::vector<int32_t> picked;
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
             if (g.n_slots == 0) {
@@ -2175,7 +2184,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                     const size_t key = (size_t) il*ne + e;
                     return !profile.empty() ? profile[key] : host_score[key];
                 };
-                size_t n_cpu = 0;
+                size_t n_cpu    = 0;
+                double expected = 0.0;
+                bool   known    = true;
                 if (!measured) {
                     n_cpu = std::min(lacking.size(), (size_t) std::lround(batch_force*lacking.size()));
                     std::partial_sort(lacking.begin(), lacking.begin() + n_cpu, lacking.end(),
@@ -2206,43 +2217,41 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                     for (size_t i = 0; i < lacking.size(); ++i) {
                         k_exp[i] = n_ent*(pop_sum > 0.0 ? share(lacking[i])/pop_sum : 1.0/ne);
                     }
-                    llama_moe_host::batch_cost bc;
-                    probing |= !host->get_batch_cost(il, bc);
                     // before its post the device works for a part of its time the host cannot overlap, measured, or
                     // taken as a fifth until then
                     const double pre_tok = host->get_batch_pre(il);
                     const double pre     = pre_tok > 0.0 ? std::min(dev_layer, pre_tok*n_tokens) : 0.2*dev_layer;
-                    n_cpu = batch_take(il, lacking, k_exp, expert_bytes/rate, pre, dev_layer - pre, io, expected, t_layer);
+                    n_cpu = batch_take(il, lacking, k_exp, expert_bytes/rate, pre, dev_layer - pre, io, expected, t_layer, known);
                     t_sum[0] += t_layer[0];
                     t_sum[1] += t_layer[1];
                 }
-                for (size_t i = 0; i < n_cpu; ++i) {
-                    const size_t key = (size_t) il*ne + lacking[i];
-                    batch_cpu[key] = 1;
-                    table[key] = -1;
-                }
-                batch_n_cpu += n_cpu;
+                picks.push_back({ table, il, picked.size(), n_cpu, expected, known });
+                picked.insert(picked.end(), lacking.begin(), lacking.begin() + n_cpu);
             }
         }
-        // a measured batch is shared only if the host saves more than a little of it, or measures a kind of layer
-        if (measured && batch_n_cpu > 0 && !probing && t_sum[1] > 0.98*t_sum[0]) {
-            for (size_t ig = 0; ig < groups.size(); ++ig) {
-                const group & g = groups[ig];
-                for (int32_t il : g.layers) {
-                    if (int32_t * table = hdev[g.id].batch_table; table != nullptr && g.n_slots > 0) {
-                        std::fill(table + (size_t) il*ne, table + (size_t) (il + 1)*ne, 0);
-                    }
-                }
+        // a measured batch is shared only if the host saves more than a little of it; until the host has measured a kind
+        // of layer, the layers keep their few experts even so
+        const bool worth = !measured || t_sum[1] <= 0.98*t_sum[0];
+        const bool any_known = std::any_of(picks.begin(), picks.end(), [](const pick & pk) { return pk.known; });
+        double expected = 0.0;
+        for (const pick & pk : picks) {
+            if (!worth && (pk.known || any_known)) {
+                continue;
             }
-            std::fill(batch_cpu.begin(), batch_cpu.end(), 0);
-            batch_n_cpu = 0;
+            for (size_t i = 0; i < pk.n; ++i) {
+                const size_t key = (size_t) pk.il*ne + picked[pk.first + i];
+                batch_cpu[key]  = 1;
+                pk.table[key]   = -1;
+            }
+            batch_n_cpu += pk.n;
+            expected    += pk.expected;
         }
         if (measured) {
             batch_begun    = n_tokens;
             batch_expected = batch_n_cpu > 0 && (n_src[0] == 0 || n_src[1] == 0) ? expected : 0.0;
             batch_src      = n_src[1] > 0 ? 1 : 0;
             batch_pred[0]  = t_sum[0];
-            batch_pred[1]  = batch_n_cpu > 0 ? t_sum[1] : t_sum[0];
+            batch_pred[1]  = worth ? t_sum[1] : t_sum[0];
             host->get_batch_totals(batch_host_s0, batch_host_e0, batch_host_w0);
             static const bool profile_log = getenv("LLAMA_PROFILE_UBATCH") != nullptr;
             if (profile_log) {
