@@ -794,10 +794,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_backend_cuda_lent_buft_context;
+static void ggml_backend_cuda_lent_release(ggml_backend_cuda_lent_buft_context * lent, void * ptr);
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+
+    // a buffer placed in the range of a lent buffer type (ggml_backend_lent_buffer_type_new): freeing it gives its
+    // place back to the range
+    ggml_backend_cuda_lent_buft_context * lent = nullptr;
 
 #if defined(GGML_USE_VMM)
     // a buffer of ggml_backend_cuda_vmm_buffer_alloc: its virtual range is reserved whole, and physical memory is
@@ -813,6 +820,10 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (lent != nullptr) {
+            ggml_backend_cuda_lent_release(lent, dev_ptr);
+            return;
+        }
 #if defined(GGML_USE_VMM)
         if (vmm_reserved > 0) {
             ggml_cuda_set_device(device);
@@ -991,6 +1002,11 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
+// the memory of the device: its own buffer type, or one lent a range of it (ggml_backend_cuda_lent_buffer_type_new)
+static bool ggml_backend_buft_is_cuda_device(ggml_backend_buffer_type_t buft, int device) {
+    return ggml_backend_buft_is_cuda(buft) && ((ggml_backend_cuda_buffer_type_context *) buft->context)->device == device;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
@@ -1045,6 +1061,160 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
 };
+
+// A buffer type of a device that places its buffers in a device range it is lent, first fit, while it lends (the
+// memory of a cache that another phase of the computation uses for its buffers); from the device's own memory when it
+// does not lend. A buffer that does not fit is placed past the lent range, where the type maps memory of its own (the
+// range's address space reaches capacity), given back once the buffers past the range are freed. Its buffers are CUDA
+// buffers of the device like any other.
+struct ggml_backend_cuda_lent_buft_context : ggml_backend_cuda_buffer_type_context {
+    char *                   ptr      = nullptr;
+    size_t                   size     = 0;
+    size_t                   capacity = 0;
+    bool                     lend     = false;
+    std::mutex               mtx;
+    std::map<size_t, size_t> live;  // the offset and size of each buffer in the range
+    std::vector<size_t>      extra; // the sizes of the chunks mapped past the lent range, in order
+};
+
+#if defined(GGML_USE_VMM)
+// maps chunks past the lent range until it reaches `end`; false if memory runs short, the chunks mapped kept
+static bool ggml_backend_cuda_lent_grow(ggml_backend_cuda_lent_buft_context * c, size_t end) {
+    const int    physical_device = ggml_cuda_get_physical_device(c->device);
+    const size_t granularity     = ggml_cuda_info().devices[c->device].vmm_granularity;
+    const size_t chunk           = granularity * std::max<size_t>(1, ((size_t) 32 << 20) / granularity);
+    size_t mapped = c->size;
+    for (size_t s : c->extra) {
+        mapped += s;
+    }
+    while (mapped < end) {
+        const size_t s = std::min(chunk, c->capacity - mapped);
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical_device;
+        CUmemGenericAllocationHandle handle;
+        if (s == 0 || cuMemCreate(&handle, s, &prop, 0) != CUDA_SUCCESS) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        CU_CHECK(cuMemMap((CUdeviceptr) c->ptr + mapped, s, 0, handle, 0));
+        CU_CHECK(cuMemRelease(handle));
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id   = physical_device;
+        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_CHECK(cuMemSetAccess((CUdeviceptr) c->ptr + mapped, s, &access, 1));
+        c->extra.push_back(s);
+        mapped += s;
+    }
+    return true;
+}
+
+// unmaps the chunks past the lent range that no buffer reaches
+static void ggml_backend_cuda_lent_shrink(ggml_backend_cuda_lent_buft_context * c) {
+    size_t end = 0;
+    for (const auto & it : c->live) {
+        end = std::max(end, it.first + it.second);
+    }
+    size_t mapped = c->size;
+    for (size_t s : c->extra) {
+        mapped += s;
+    }
+    while (!c->extra.empty() && mapped - c->extra.back() >= std::max(end, c->size)) {
+        mapped -= c->extra.back();
+        CU_CHECK(cuMemUnmap((CUdeviceptr) c->ptr + mapped, c->extra.back()));
+        c->extra.pop_back();
+    }
+}
+#endif
+
+static void ggml_backend_cuda_lent_release(ggml_backend_cuda_lent_buft_context * lent, void * ptr) {
+    // as cudaFree would, the place is given back once the work queued before is done with it
+    ggml_cuda_set_device(lent->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::lock_guard<std::mutex> lk(lent->mtx);
+    lent->live.erase((size_t) ((char *) ptr - lent->ptr));
+#if defined(GGML_USE_VMM)
+    ggml_backend_cuda_lent_shrink(lent);
+#endif
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_lent_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * c = (ggml_backend_cuda_lent_buft_context *) buft->context;
+    {
+        std::lock_guard<std::mutex> lk(c->mtx);
+        if (c->lend) {
+            const size_t align = 256;
+            const size_t need  = GGML_PAD(std::max<size_t>(size, 1), align);
+            size_t off = 0;
+            for (const auto & it : c->live) {
+                if (it.first >= off + need) {
+                    break;
+                }
+                off = GGML_PAD(it.first + it.second, align);
+            }
+            bool fits = off + need <= c->size;
+#if defined(GGML_USE_VMM)
+            if (!fits && off + need <= c->capacity) {
+                ggml_cuda_set_device(c->device);
+                fits = ggml_backend_cuda_lent_grow(c, off + need);
+                if (!fits) {
+                    ggml_backend_cuda_lent_shrink(c);
+                }
+            }
+#endif
+            if (fits) {
+                c->live[off] = need;
+                auto * ctx = new ggml_backend_cuda_buffer_context(c->device, c->ptr + off);
+                ctx->lent = c;
+                return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+            }
+        }
+    }
+    return ggml_backend_cuda_buffer_type_alloc_buffer(buft, size);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_lent_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
+    /* .alloc_buffer        = */ ggml_backend_cuda_lent_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
+};
+
+// ptr: a device range of `size` bytes lent, within `capacity` bytes of address space reserved
+static ggml_backend_buffer_type_t ggml_backend_cuda_lent_buffer_type_new(int device, void * ptr, size_t size, size_t capacity) {
+    auto * c = new ggml_backend_cuda_lent_buft_context();
+    c->device   = device;
+    c->name     = GGML_CUDA_NAME + std::to_string(device);
+    c->ptr      = (char *) ptr;
+    c->size     = size;
+    c->capacity = std::max(size, capacity);
+    return new ggml_backend_buffer_type {
+        /* .iface    = */ ggml_backend_cuda_lent_buffer_type_interface,
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .context  = */ c,
+    };
+}
+
+// whether the buffers allocated from now on go to the range
+static void ggml_backend_cuda_lent_buffer_type_set(ggml_backend_buffer_type_t buft, bool lend) {
+    auto * c = (ggml_backend_cuda_lent_buft_context *) buft->context;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    c->lend = lend;
+}
+
+// once its buffers are freed
+static void ggml_backend_cuda_lent_buffer_type_free(ggml_backend_buffer_type_t buft) {
+    auto * c = (ggml_backend_cuda_lent_buft_context *) buft->context;
+    GGML_ASSERT(c->live.empty() && c->extra.empty());
+    delete c;
+    delete buft;
+}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
@@ -3155,7 +3325,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_memcpy_host_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream());
 }
@@ -3164,7 +3334,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_memcpy_host_async(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream());
 }
@@ -3174,7 +3344,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
         for (size_t i = 0; i < n_copies; ++i) {
@@ -3192,7 +3362,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     if (n_copies > 0 && ggml_cuda_host_memfd_is_split(data, stride_data*(n_copies - 1) + size)) {
         for (size_t i = 0; i < n_copies; ++i) {
@@ -5380,12 +5550,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                assert(ggml_backend_buft_is_cuda_device(node->buffer->buft, cuda_ctx->device) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                        assert(ggml_backend_buft_is_cuda_device(node->src[j]->buffer->buft, cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -6924,6 +7094,63 @@ static size_t ggml_backend_cuda_vmm_buffer_commit(ggml_backend_buffer_t buffer, 
     return mapped;
 }
 
+// The physical memory of VMM buffers mapped a second time: the whole chunks of each buffer from offset from[i] to its
+// end, one after the other in a new virtual range of the device, whose size goes to *size; the address space reserved
+// after it, as large as the device's memory, goes to *capacity. What is written through either range is read through
+// the other. The buffers must not commit again while the range exists: the chunks it maps would no longer be theirs.
+static void * ggml_backend_cuda_vmm_alias(ggml_backend_buffer_t * bufs, const size_t * from, int n, size_t * size, size_t * capacity) {
+    *size     = 0;
+    *capacity = 0;
+    if (n <= 0) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_buffer_context *) bufs[0]->context)->device;
+    ggml_cuda_set_device(device);
+    std::vector<std::pair<CUdeviceptr, size_t>> chunks;
+    size_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        auto * ctx = (ggml_backend_cuda_buffer_context *) bufs[i]->context;
+        GGML_ASSERT(ctx->vmm_reserved > 0 && ctx->device == device);
+        size_t off = 0;
+        for (size_t s : ctx->vmm_mapped) {
+            if (off >= from[i]) {
+                chunks.push_back({ (CUdeviceptr) ctx->dev_ptr + off, s });
+                total += s;
+            }
+            off += s;
+        }
+    }
+    const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
+    const size_t reserved    = total + GGML_PAD(ggml_cuda_info().devices[device].total_vram, granularity);
+    CUdeviceptr addr = 0;
+    if (total == 0 || cuMemAddressReserve(&addr, reserved, 0, 0, 0) != CUDA_SUCCESS) {
+        return nullptr;
+    }
+    size_t off = 0;
+    for (const auto & ch : chunks) {
+        CUmemGenericAllocationHandle handle;
+        CU_CHECK(cuMemRetainAllocationHandle(&handle, (void *) ch.first));
+        CU_CHECK(cuMemMap(addr + off, ch.second, 0, handle, 0));
+        CU_CHECK(cuMemRelease(handle));
+        off += ch.second;
+    }
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = ggml_cuda_get_physical_device(device);
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CU_CHECK(cuMemSetAccess(addr, total, &access, 1));
+    *size     = total;
+    *capacity = reserved;
+    return (void *) addr;
+}
+
+static void ggml_backend_cuda_vmm_alias_free(int device, void * ptr, size_t size, size_t capacity) {
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cuMemUnmap((CUdeviceptr) ptr, size));
+    CU_CHECK(cuMemAddressFree((CUdeviceptr) ptr, capacity));
+}
+
 // a device buffer of `size` bytes whose physical memory can be released from its end and mapped again, initially
 // mapped up to `committed` bytes
 static ggml_backend_buffer_t ggml_backend_cuda_vmm_buffer_alloc(int device, size_t size, size_t committed) {
@@ -6996,7 +7223,22 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_vmm_buffer_commit") == 0) {
         return (void *)ggml_backend_cuda_vmm_buffer_commit;
     }
+    if (strcmp(name, "ggml_backend_vmm_alias") == 0) {
+        return (void *)ggml_backend_cuda_vmm_alias;
+    }
+    if (strcmp(name, "ggml_backend_vmm_alias_free") == 0) {
+        return (void *)ggml_backend_cuda_vmm_alias_free;
+    }
 #endif
+    if (strcmp(name, "ggml_backend_lent_buffer_type_new") == 0) {
+        return (void *)ggml_backend_cuda_lent_buffer_type_new;
+    }
+    if (strcmp(name, "ggml_backend_lent_buffer_type_set") == 0) {
+        return (void *)ggml_backend_cuda_lent_buffer_type_set;
+    }
+    if (strcmp(name, "ggml_backend_lent_buffer_type_free") == 0) {
+        return (void *)ggml_backend_cuda_lent_buffer_type_free;
+    }
     if (strcmp(name, "ggml_backend_host_mapped_free") == 0) {
         return (void *)ggml_backend_cuda_host_mapped_free;
     }

@@ -460,7 +460,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         int32_t                  dev;
         std::vector<upload>      uploads;
         std::vector<publication> pubs;
-        bool                     gate = true; // wait for the work queued on the compute stream before the job
+        bool                     gate    = true;  // wait for the work queued on the compute stream before the job
+        bool                     readmit = false; // fills lent slots again (readmit_lent)
     };
     bool    async_admit = false;
     size_t  async_max   = 96;   // experts in flight
@@ -622,6 +623,23 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     std::vector<ggml_tensor *>         bank_tensors;
     std::vector<int32_t>               bank_group;
     size_t (*vmm_commit)(ggml_backend_buffer_t, size_t) = nullptr;
+
+    // phases: the banks stay mapped whole, and the memory of the slots they lend is mapped a second time, one range per
+    // device, which a lent buffer type gives to the compute buffers and the staging slots of large batches while the
+    // cache lends (lend): a change of phase maps and unmaps nothing but the memory those buffers need beyond the
+    // range, mapped after it. LLAMA_MOE_CACHE_ALIAS=0 releases and maps the lent slots again at each change instead.
+    struct alias_range {
+        ggml_backend_t             backend  = nullptr;
+        int                        device   = -1; // the index of the device in its backend registry
+        void *                     ptr      = nullptr;
+        size_t                     size     = 0;
+        size_t                     capacity = 0;  // the address space reserved, past which nothing is mapped
+        ggml_backend_buffer_type_t buft     = nullptr;
+    };
+    std::vector<alias_range> aliases;
+    void (*alias_free)(int, void *, size_t, size_t) = nullptr;
+    void (*lent_set)(ggml_backend_buffer_type_t, bool) = nullptr;
+    void (*lent_free)(ggml_backend_buffer_type_t) = nullptr;
     std::vector<float>   host_score; // [n_layer*n_expert] decayed selection counts
     std::vector<int32_t> host_cand;
     std::vector<int32_t> host_vict;
@@ -962,6 +980,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     // one buffer per bank, its physical memory mapped up to the core slots: the phase of large batches
     void phases_alloc() {
         ggml_backend_buffer_t (*vmm_alloc)(int, size_t, size_t) = nullptr;
+        const char * alias_env = getenv("LLAMA_MOE_CACHE_ALIAS");
+        const bool   alias_on  = alias_env == nullptr || *alias_env == '\0' || atoi(alias_env) != 0;
+        std::vector<int> bank_index; // the registry index of each bank's device
         for (size_t ig = 0; ig < groups.size() && phases; ++ig) {
             group & g = groups[ig];
             if (g.n_slots == 0) {
@@ -986,7 +1007,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             for (ggml_tensor * bank : g.banks) {
                 const size_t size = ggml_backend_buft_get_alloc_size(d.buft, bank);
                 const size_t core = (size_t) g.n_core*bank->nb[2];
-                ggml_backend_buffer_t buf = vmm_alloc(index, size, core);
+                ggml_backend_buffer_t buf = vmm_alloc(index, size, alias_on ? size : core);
                 if (buf == nullptr) {
                     LLAMA_LOG_WARN("%s: failed to allocate a bank of the MoE cache with phases, the MoE cache has no phases\n", __func__);
                     phases = false;
@@ -1003,6 +1024,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 bank_bufs.push_back(buf);
                 bank_tensors.push_back(bank);
                 bank_group.push_back((int32_t) ig);
+                bank_index.push_back(index);
+            }
+        }
+        if (phases && alias_on && !alias_banks(bank_index)) {
+            // the lent slots go back to the system while large batches run, as without the ranges
+            for (size_t i = 0; i < bank_bufs.size(); ++i) {
+                vmm_commit(bank_bufs[i], (size_t) groups[bank_group[i]].n_core*bank_tensors[i]->nb[2]);
             }
         }
         if (!phases) {
@@ -1030,6 +1058,85 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         }
         LLAMA_LOG_INFO("%s: MoE cache phases: %.2f MiB between large batches, %.2f MiB while they run\n", __func__,
             size_all/1024.0/1024.0, size_core/1024.0/1024.0);
+    }
+
+    // the second mapping of the lent slots of each device's banks, and the lent buffer type over it; false if the
+    // backend cannot, nothing kept then
+    bool alias_banks(const std::vector<int> & bank_index) {
+        void * (*vmm_alias)(ggml_backend_buffer_t *, const size_t *, int, size_t *, size_t *) = nullptr;
+        ggml_backend_buffer_type_t (*lent_new)(int, void *, size_t, size_t) = nullptr;
+        for (size_t i = 0; i < bank_bufs.size(); ++i) {
+            const int32_t id = groups[bank_group[i]].id;
+            alias_range * ar = nullptr;
+            for (alias_range & a : aliases) {
+                if (a.backend == devices[id].backend) {
+                    ar = &a;
+                }
+            }
+            if (ar != nullptr) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[id].backend));
+            vmm_alias  = (decltype(vmm_alias))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_alias");
+            alias_free = (decltype(alias_free)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_alias_free");
+            lent_new   = (decltype(lent_new))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_lent_buffer_type_new");
+            lent_set   = (decltype(lent_set))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_lent_buffer_type_set");
+            lent_free  = (decltype(lent_free))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_lent_buffer_type_free");
+            if (vmm_alias == nullptr || alias_free == nullptr || lent_new == nullptr || lent_set == nullptr || lent_free == nullptr) {
+                LLAMA_LOG_WARN("%s: %s cannot map the lent slots again, they are released at each change of phase\n", __func__, ggml_backend_name(devices[id].backend));
+                aliases_free();
+                return false;
+            }
+            std::vector<ggml_backend_buffer_t> bufs;
+            std::vector<size_t> from;
+            for (size_t j = 0; j < bank_bufs.size(); ++j) {
+                if (groups[bank_group[j]].id == id) {
+                    bufs.push_back(bank_bufs[j]);
+                    from.push_back((size_t) groups[bank_group[j]].n_core*bank_tensors[j]->nb[2]);
+                }
+            }
+            alias_range a;
+            a.backend = devices[id].backend;
+            a.device  = bank_index[i];
+            a.ptr     = vmm_alias(bufs.data(), from.data(), (int) bufs.size(), &a.size, &a.capacity);
+            if (a.ptr == nullptr) {
+                LLAMA_LOG_WARN("%s: failed to map the lent slots again, they are released at each change of phase\n", __func__);
+                aliases_free();
+                return false;
+            }
+            a.buft = lent_new(a.device, a.ptr, a.size, a.capacity);
+            // the context starts with large batches
+            lent_set(a.buft, true);
+            aliases.push_back(a);
+            LLAMA_LOG_INFO("%s: %s: the compute buffers of large batches take %.2f MiB the cache lends\n", __func__,
+                ggml_backend_name(a.backend), a.size/1024.0/1024.0);
+        }
+        return true;
+    }
+
+    void aliases_free() {
+        for (alias_range & a : aliases) {
+            if (a.buft != nullptr) {
+                lent_free(a.buft);
+            }
+            alias_free(a.device, a.ptr, a.size, a.capacity);
+        }
+        aliases.clear();
+    }
+
+    ggml_backend_buffer_type_t lent_buft(ggml_backend_t backend) const {
+        for (const alias_range & a : aliases) {
+            if (a.backend == backend) {
+                return a.buft;
+            }
+        }
+        return nullptr;
+    }
+
+    void lend(bool on) {
+        for (alias_range & a : aliases) {
+            lent_set(a.buft, on);
+        }
     }
 
     // the slots [from, to) of group ig no longer hold an expert
@@ -1064,6 +1171,23 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             return;
         }
         if (large) {
+            // the re-admissions not started yet are dropped rather than waited for: their slots are lent again, and
+            // their experts admitted again after these large batches
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                for (auto it = jobs.begin(); it != jobs.end(); ) {
+                    if (!it->readmit) {
+                        ++it;
+                        continue;
+                    }
+                    hdev[it->dev].in_flight -= it->pubs.size();
+                    n_readmitted -= it->pubs.size();
+                    for (const upload & up : it->uploads) {
+                        async_bytes -= up.size;
+                    }
+                    it = jobs.erase(it);
+                }
+            }
             if (svc_policy) {
                 svc_settle();
             }
@@ -1079,12 +1203,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 host_collect();
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
+            // a slot still pending holds a dropped re-admission: its expert is lent again
             lent.clear();
             for (size_t ig = 0; ig < groups.size(); ++ig) {
                 const moe_cache_slru & sl = groups[ig].slru;
                 for (int32_t s = groups[ig].n_core; s < groups[ig].n_slots; ++s) {
                     const int32_t key = sl.key_of[s];
-                    if (key >= 0 && !sl.pending[s]) {
+                    if (key >= 0) {
                         lent.push_back({ (int32_t) ig, key / sl.n_expert, key % sl.n_expert, s });
                     }
                 }
@@ -1098,7 +1223,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             for (const device & d : devices) {
                 ggml_backend_synchronize(d.backend);
             }
-            for (size_t i = 0; i < bank_bufs.size(); ++i) {
+            for (size_t i = 0; i < bank_bufs.size() && aliases.empty(); ++i) {
                 vmm_commit(bank_bufs[i], (size_t) groups[bank_group[i]].n_core*bank_tensors[i]->nb[2]);
             }
         } else {
@@ -1106,7 +1231,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 ggml_tensor * bank = bank_tensors[i];
                 const size_t full = ggml_backend_buffer_get_size(bank_bufs[i]);
                 const size_t core = (size_t) groups[bank_group[i]].n_core*bank->nb[2];
-                if (vmm_commit(bank_bufs[i], full) < full) {
+                if (aliases.empty() && vmm_commit(bank_bufs[i], full) < full) {
                     GGML_ABORT("the MoE cache could not map its banks again");
                 }
                 // the zero slots after the cached ones must read as zero
@@ -1135,7 +1260,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         // job's uploads (a checkpoint restored, the inputs of a graph) wait for one expert, not for many
         constexpr size_t per_job = 1;
         admit_job job;
-        job.gate = false; // nothing queued before reads these slots
+        job.gate    = false; // nothing queued before reads these slots
+        job.readmit = true;
         auto flush = [&]() {
             if (job.pubs.empty()) {
                 return;
@@ -1147,7 +1273,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             }
             cv.notify_one();
             job = admit_job();
-            job.gate = false;
+            job.gate    = false;
+            job.readmit = true;
         };
         for (const publication & pb : lent) {
             group & g = groups[pb.ig];
@@ -2567,6 +2694,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 hd.mailbox_free(hd.batch_mailbox);
             }
         }
+        aliases_free();
         for (ggml_backend_buffer_t buf : bank_bufs) {
             ggml_backend_buffer_free(buf);
         }
@@ -2953,6 +3081,14 @@ void llama_moe_cache::init_batch(int32_t max_batch) {
 
 void llama_moe_cache::begin_batch(int64_t n_tokens, double upload_rate) {
     pimpl->begin_batch(n_tokens, upload_rate);
+}
+
+ggml_backend_buffer_type_t llama_moe_cache::lent_buft(ggml_backend_t backend) const {
+    return pimpl->lent_buft(backend);
+}
+
+void llama_moe_cache::lend(bool on) {
+    pimpl->lend(on);
 }
 
 bool llama_moe_cache::batch_shared() const {

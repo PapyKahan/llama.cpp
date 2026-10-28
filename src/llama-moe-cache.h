@@ -100,6 +100,11 @@ public:
     // small ones in host mode with the whole cache; the context then reserves its compute buffers for the phase
     void set_phase(bool large);
 
+    // phases: the buffer type of the backend's compute buffers, which places them in the memory the cache lends while
+    // lend(true), from the end of set_phase(true) to the start of the change back; nullptr if none
+    ggml_backend_buffer_type_t lent_buft(ggml_backend_t backend) const;
+    void lend(bool on);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

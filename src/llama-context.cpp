@@ -609,6 +609,12 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: MoE cache phases: batches of more than %u tokens run in ubatches of %u, the others in ubatches of %u\n",
                     __func__, moe_phase_tokens, moe_ubatch_large, moe_ubatch_small);
                 moe_cache->init_batch((int32_t) moe_ubatch_large);
+                // the compute buffers of large batches in the memory the cache lends
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (ggml_backend_buffer_type_t lb = moe_cache->lent_buft(backend_ptrs[i]); lb != nullptr) {
+                        backend_buft[i] = lb;
+                    }
+                }
             }
         }
 
@@ -833,7 +839,9 @@ struct llama_context::expert_prefetch {
     // slots the size of the largest learned tensor
     bool alloc_slots() {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        // in the memory the MoE cache lends, if it does
+        ggml_backend_buffer_type_t buft = cache != nullptr && cache->lent_buft(backend) != nullptr ?
+            cache->lent_buft(backend) : ggml_backend_dev_buffer_type(dev);
         size_t size = 0;
         for (const ggml_tensor * t : order) {
             size = std::max(size, ggml_backend_buft_get_alloc_size(buft, t));
@@ -1132,6 +1140,9 @@ llama_context::expert_prefetch * llama_context::prefetch_for(ggml_backend_t back
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // the staging slots may be in the memory the MoE cache lends: they go first
+    prefetch.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -3808,6 +3819,7 @@ void llama_context::moe_set_phase(bool large) {
         // the cache gives its memory back first, the compute buffers and the staging slots then take it
         int64_t t = ggml_time_us();
         moe_cache->set_phase(true);
+        moe_cache->lend(true);
         t_cache = ggml_time_us() - t;
         t = ggml_time_us();
         cparams.n_ubatch      = moe_ubatch_large;
@@ -3822,6 +3834,7 @@ void llama_context::moe_set_phase(bool large) {
         }
         t_slots = ggml_time_us() - t;
     } else {
+        moe_cache->lend(false);
         int64_t t = ggml_time_us();
         if (prefetch) {
             prefetch->release_slots();
