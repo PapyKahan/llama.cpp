@@ -167,6 +167,40 @@ placement, the best of the placements tried. Same harness, 2026-10-28:
 Follow-up turns of 300 tokens and more are slower than stock's: up to 512 tokens the misses of each 128-token batch are
 computed on the host, and a larger batch uploads every expert the core lacks, about 3 s whatever its size.
 
+### Follow-up turns
+
+How a follow-up spends its time (server log, 2026-10-28): the server cuts it into batches at the start of the last user
+message, at 4 + `LLAMA_SERVER_CKPT_TAIL` and at 4 tokens before the end, each with a copy of the recurrent state (149 MiB
+on Ornith, about 35 ms). A small-phase batch costs about its tokens (Ornith 11 to 13 ms per token, Flash-Next 5 to
+6), so merging the small batches saves nothing; the tail batch also lets the cache adapt to the conversation. A batch of
+more than 512 tokens adds two changes of phase (about 200 ms each) and the upload of every expert the core lacks.
+
+- After a large batch, the experts of the lent slots went back in jobs of 16; a checkpoint restored by the next request,
+  and the inputs of its graphs, queued behind whole jobs: 350 to 470 ms before the restore. One expert per job
+  (`b1a241661`): 17 to 45 ms; Flash-Next follow-ups 0.1 to 0.2 s faster back to back, the same when 2 s apart.
+- `LLAMA_SERVER_CKPT_TAIL_MAX=512` (`1e888e4e7`), each turn 2 s after the previous answer, two runs each:
+
+| | +100 | +300 | +1000 | +3000 |
+|---|---|---|---|---|
+| Ornith-1.5-122B, tail always (s) | 1.73–1.80 | 3.55–3.61 | 4.55–4.66 | 4.68–4.77 |
+| Ornith-1.5-122B, tail after small batches only | 1.88–1.93 | 3.73–3.90 | 3.89–3.99 | 3.97–4.05 |
+| Flash-Next, tail always | 1.02–1.09 | 1.61–1.68 | 3.03–3.12 | 4.30–4.62 |
+| Flash-Next, tail after small batches only | 1.12–1.16 | 1.83–1.84 | 2.75–2.79 | 4.00–4.07 |
+
+Turns sent back to back show the same gains on large turns and lose a little more on the next small one, which then
+pays the re-admission the tail batch used to hide.
+
+### Ornith-1.5-122B decode
+
+The host computes the misses: 6 to 6.8 experts per layer and request, about 130 to 140 µs per expert of about 4.4 MB,
+the memory bandwidth of the host (30 to 34 GB/s), so about 0.8 to 0.9 ms per layer, then about 280 µs of device work to
+the next layer: 52 to 61 ms per step at 2 drafts. A replay of a decode trace against the cache policies (31 % of the
+selected experts missing, as measured): the service policy is at its best decay (0.9), no hysteresis helps, and 24 to
+192 replacements per graph give the same hits; a cache that knew the next 20 graphs would miss 14.5 %. Fewer
+replacements then only remove upload traffic from host memory: `LLAMA_MOE_HOST_SWAPS=48`, two runs each, decode
+45.2 tok/s against 42.9 (96), 51 to 54 ms per step against 57 to 58. Flash-Next keeps 96: at 48 it misses 21 % instead
+of 17 %.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the

@@ -68,7 +68,13 @@ what was tried and dropped so that nobody repeats it.
 ### Known issues
 
 - Follow-up turns are slower than Strata's except around 1000 new tokens: 0.95 / 1.5 / 3.1 / 4.3 s for +100 / +300 /
-  +1000 / +3000 tokens, against 0.72 / 0.96 / 3.14 / 3.34 s.
+  +1000 / +3000 tokens, against 0.72 / 0.96 / 3.14 / 3.34 s (see [measurements.md](measurements.md#follow-up-turns)).
+  Two pieces of work remain. A batch of 512 to about 3000 tokens uploads every expert the core lacks, about 3 s
+  whatever its size: a host share measured at run time, per layer, as Strata's `STRATA_PREFILL_CPU_SHARE=auto` does,
+  would give the host the experts few tokens route to (the fixed model of `LLAMA_MOE_BATCH_CPU` suits Flash-Next and
+  hurts Ornith-1.5-122B). And each change of phase maps or unmaps about 7.7 GB of device memory, about 175 ms each way
+  inside the driver whatever the number of calls: compute buffers of the large phase mapped onto the physical memory
+  the cache lends, instead of freed and allocated again, would remove both.
 - The start loads all 47.7 GiB of experts before the exclusive core releases its share: loading the exclusive experts
   straight into the cache would remove that peak.
 - The exclusive core needs the cache profile, so the very first session has none.

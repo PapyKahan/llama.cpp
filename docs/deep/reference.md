@@ -74,7 +74,8 @@ and [prefill.md](prefill.md).
 | `LLAMA_GRAPH_SLOTS` | 0 | 6 | keep the graphs of small decoding ubatches in this many slots |
 | `LLAMA_GRAPH_SLOT_TOKENS` | 16 | | largest ubatch kept in a slot |
 | `LLAMA_SERVER_BALANCED_CHUNKS` | on | | split a long prompt into equal chunks |
-| `LLAMA_SERVER_CKPT_TAIL` | `n_ubatch` | 32 | the batch after the last checkpoint is 4 + this many tokens |
+| `LLAMA_SERVER_CKPT_TAIL` | `n_ubatch` | 32 | the batch after the last checkpoint is 4 + this many tokens; 0: only the checkpoint 4 tokens before the end |
+| `LLAMA_SERVER_CKPT_TAIL_MAX` | off | (512) | that tail gets a batch of its own only after a batch of at most this many tokens; a longer prompt runs to its last 4 tokens at once |
 
 ## qwen4exp
 
@@ -167,3 +168,6 @@ first:
 | `170656bca` | exclusive core, memfd host buffers |
 | `c1ebe7a83` | merge with upstream `39febd2ad`: the tile map under the fused gate/up/GLU MMQ, negative-id rows zeroed after it |
 | `3f62edf67` | fused MoE gate/up/GLU tests with many experts and tokens |
+| `b1a241661` | one expert per re-admission job; the admission worker stops before the banks are freed |
+| `1e888e4e7` | server: tail checkpoint only after small batches (`LLAMA_SERVER_CKPT_TAIL_MAX`), a restored checkpoint not copied again |
+| `eb1dd9ce1` | qwen35moe MTP layer cropped to its output rows after the attention |
