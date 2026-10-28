@@ -7,12 +7,22 @@ what was tried and dropped so that nobody repeats it.
 
 ### Rebase and dependencies
 
-- Upstream moved: #30640 and #30965 are merged, the branch carries #30815's earlier version of the same QSA work.
-  Rebase on current `master`, keep #30965 as merged, and resolve what #30815 still adds (query chunks).
+- The branch merges upstream `master` (last on 2026-10-28, `39febd2ad`), so the commit hashes below stay valid. Upstream
+  now has #30640, #30965 and #31243 (the k-pool selection built over the cache cells, whatever the kq_mask shape): the
+  branch builds its selection the same way and adds the query chunks of #30815's earlier version. #30815 (open) has
+  since moved the chunks into code shared with glm5-next: resolve against it once it lands.
 - The MoE work builds on #30966 (`--moe-cache-cpu-share`, open): it must land first, or the offload work must be proposed
   together with it in agreement with its author. The fix in `5682d1c2b` (the CPU `MUL_MAT_ID` grouping must skip
-  negative ids, or `--moe-cache-cpu-share` crashes) belongs in #30966's review.
-- #30448 (AVX2 IQ3_S/IQ3_XXS dot products) is open and independent.
+  negative ids, or `--moe-cache-cpu-share` crashes) belongs in #30966's review. #30966 was rebased and extended on
+  2026-10-26 (the scheduler copies the CPU part's results, a backend sync for the asynchronous transfer queue); the
+  branch carries the 2026-10-22 version, whose CPU part host mode bypasses in the measured setup.
+- #26631 (merged) makes a -1 id in `MUL_MAT_ID` a skipped slot with a zero result row on every backend but CUDA
+  (`[TAG_MUL_MAT_ID_SKIP]`). The branch's CUDA path skips negative ids for a result marked by
+  `ggml_mul_mat_id_set_negative_ids`, after the fused gate/up/GLU kernels too: made unconditional, it would cover CUDA
+  and the mark could go.
+- Upstream's fused gate/up/GLU MMQ (#31188, #29948) runs through the branch's tile map and counting sort like the
+  unfused kernel.
+- #30448 (AVX2 IQ3_S/IQ3_XXS dot products) is no longer on GitHub (404 on 2026-10-28); the branch keeps its two commits.
 - #30380 (trimmed draft vocabulary) was closed upstream: talk to its author before building on it.
 
 ### Switches
@@ -32,8 +42,8 @@ what was tried and dropped so that nobody repeats it.
   stay off cleanly.
 - The host kernels (`ggml_cpu_row8_*`) and #30448 are AVX2: add the scalar path at least, and check ARM.
 - Host mode supports plain MoE layers (separate gate, up and down, no biases or scales) and a few activation clamps;
-  every other layer falls back. Verify the MoE work on at least one other MoE model, since all measurements are on
-  `qwen4exp`.
+  every other layer falls back. Besides `qwen4exp`, the MoE work runs Ornith-1.5-122B (`qwen35moe`: 256 experts, top-8,
+  DeltaNet with full attention every fourth layer, a separate MTP drafter); other architectures remain to check.
 - Host mode assumes a single device holds the cached layers; multi-GPU expert caches need a decision.
 
 ### Tests and validation

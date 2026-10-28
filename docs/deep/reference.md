@@ -130,8 +130,9 @@ New files: `src/llama-moe-host.{h,cpp}`, `ggml/src/ggml-cuda/moe-host.cu`, `ggml
 
 ## Commits
 
-Upstream base `f64a49819`. Merged pull requests: #30966 (`175c8336e`), #30815 (`f64d60f16`, includes #30640),
-#30448 (`a95a90a0d`), #30380 (`21fda432c`). Local commits, oldest first:
+Upstream base `f64a49819`, merged up to `39febd2ad` in `c1ebe7a83` (2026-10-28). Merged pull requests: #30966
+(`175c8336e`), #30815 (`f64d60f16`, includes #30640), #30448 (`a95a90a0d`), #30380 (`21fda432c`). Local commits, oldest
+first:
 
 | Commit | |
 |---|---|
@@ -164,3 +165,5 @@ Upstream base `f64a49819`. Merged pull requests: #30966 (`175c8336e`), #30815 (`
 | `e51d84af8` | graph slots |
 | `27adb1e7d` | n-gram rows of drafted tokens read ahead |
 | `170656bca` | exclusive core, memfd host buffers |
+| `c1ebe7a83` | merge with upstream `39febd2ad`: the tile map under the fused gate/up/GLU MMQ, negative-id rows zeroed after it |
+| `3f62edf67` | fused MoE gate/up/GLU tests with many experts and tokens |

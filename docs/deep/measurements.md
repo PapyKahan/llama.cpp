@@ -118,6 +118,55 @@ KL divergence against a GPU-only reference at ubatch 512 (wikitext-2, 6 × 512 t
 | tail skip, rank 7 | +0.020 to +0.027 | top-1 agreement −1 point |
 | host share of large batches 0.4 / 1.0 | 0.016 / 0.017 | the same as changing the ubatch from 1024 to 2048 |
 
+### After the merge with upstream
+
+2026-10-28: the branch at `3f62edf67` (upstream `39febd2ad` merged in) against `170656bca`, the same day, alternating,
+in the configuration of [README.md](README.md#running-it). Numerics first, against the base logits of earlier builds:
+
+| Check | merged | before | |
+|---|---|---|---|
+| Flash-Next host mode, 32-token batches, against GPU-only ubatch 512 (6 × 512) | 0.0242 ± 0.0020 | 0.0230 ± 0.0019 | |
+| Flash-Next large batches, no host share, against the same phases before the merge (2 × 2048) | 0.0180 ± 0.0020 | | the floor of any change in the arithmetic |
+| Flash-Next large batches, host share 0.4, against the same base | 0.0169 ± 0.0017 | 0.0159 ± 0.0014 | |
+| Ornith-1.5-122B host mode, 4-token batches, tail skip 7, against BF16 (30 × 512) | 0.1279 ± 0.0037 | 0.1284 ± 0.0038 | |
+| Ornith-1.5-122B 512-token batches in the large phase, against BF16 | 0.1264 ± 0.0037 | | the quant's own: 0.126 to 0.128 |
+
+Flash-Next, two runs of each build:
+
+| | merged | before |
+|---|---|---|
+| decode cold / warm / code (tok/s) | 111.7–113.7 / 108.4–112.5 / 98.1–102.1 | 111.9–114.2 / 107.9–110.9 / 93.2–97.0 |
+| prefill 2.4K / 11.6K / 34.8K / 92.8K (tok/s) | 544–550 / 1312–1321 / 1708–1713 / 1811–1827 | 550–557 / 1317–1329 / 1701–1716 / 1829–1834 |
+| follow-ups +100 / +300 / +1000 / +3000 (s) | 0.98 / 1.51 / 3.09–3.10 / 4.27–4.35 | 0.95–0.99 / 1.49–1.61 / 3.08–3.12 / 4.33–4.44 |
+| code task prefill 2.3K / 84K / 210K (tok/s) | 535–536 / 1870–1872 / 1726–1727 | 529–533 / 1867–1871 / 1727–1731 |
+| code task ms per step (drafts per step) at 2.3K / 84K / 210K | 28.2–28.4 (2.0) / 28.5–29.8 (2.0–2.1) / 31.8–33.2 (2.4–2.5) | 27.7–28.1 (1.8–1.9) / 29.6–29.8 (2.0–2.1) / 32.2–33.4 (2.5–2.6) |
+| lowest MemAvailable (GiB) | 12.3–12.6 | 12.3–12.6 |
+
+Both builds had about 0.6 GiB less memory available than on 2026-10-24: the machine, not the branch.
+
+### Ornith-1.5-122B
+
+An own GSQ-RCO IQ3_S build of Ornith-1.5-122B (`qwen35moe`: 48 layers, 256 experts with 8 selected per token, DeltaNet
+with full attention every fourth layer, vision; 53.4 GB), with a Q8_0 MTP drafter on the second GPU. `deep` runs it with
+a 13000 MiB decode cache, a 5800 MiB core (also the exclusive core; the full-attention mask of a large ubatch leaves no
+room for more), no host share of large batches, the prefetch from 256-token batches, the cumulative draft stop at 0.4
+and `--cache-ram 2048`. Stock is llama.cpp v0.8.0 with the same model, drafter, context, slots and KV types and `--fit`
+placement, the best of the placements tried. Same harness, 2026-10-28:
+
+| | stock v0.8.0, ub 4096 | stock v0.8.0, ub 8192 | `deep` before the merge | `deep` merged |
+|---|---|---|---|---|
+| decode cold / warm / code (tok/s) | 19.8 / 20.7 / 20.5 | 18.3 / 18.2 / 18.7 | 44.2 / 40.7 / 42.8 | 41.1 / 40.7 / 41.4 |
+| ms per step, short prompts | | | 55.3–61.0 | 56.7–61.4 |
+| prefill 2.3K / 11.6K / 34.8K / 92.8K (tok/s) | 620 / 893 / 843 / 750 | 581 / 1007 / 1052 / 886 | 494 / 1345 / 1612 / 1341 | 493 / 1350 / 1610 / 1338 |
+| follow-ups +100 / +300 / +1000 / +3000 (s) | 2.45 / 2.86 / 3.47 / 4.42 | 2.69 / 3.12 / 3.73 / 4.65 | 1.66 / 3.26 / 4.60 / 4.77 | 1.65 / 3.30 / 4.62 / 4.77 |
+| code task 91K: prefill / decode (tok/s) | 727 / 17.7 | 898 / 16.6 | 1335 / 36.1 | 1337 / 33.6 |
+| code task 230K: prefill / decode (tok/s) | 556 / 16.5 | 581 / 15.1 | 805 / 29.6 | 806 / 30.2 |
+| peak VRAM GPU0 / GPU1 (MiB) | 23211 / 5884 | 23339 / 5894 | 23979 / 6012 | 23987 / 6012 |
+| lowest MemAvailable (GiB) | 15.3 | 10.0 | 7.4 | 7.2 |
+
+Follow-up turns of 300 tokens and more are slower than stock's: up to 512 tokens the misses of each 128-token batch are
+computed on the host, and a larger batch uploads every expert the core lacks, about 3 s whatever its size.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the
