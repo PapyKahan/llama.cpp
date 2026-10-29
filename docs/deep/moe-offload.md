@@ -35,11 +35,11 @@ for a 3-to-4-token verification on the test machine). The slot table the graph r
 the host between requests.
 
 Host kernels: the workers use the type's `vec_dot`, and for an expert selected by two tokens or more (three for IQ4_XS,
-IQ4_NL and Q2_0, whose `vec_dot` is cheap) `ggml_cpu_row8_unpack` / `ggml_cpu_row8_dot` (commit `2b37cca0f`, AVX2):
-a weight row of IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL or Q2_0 is unpacked once into int8 weights with integer and float
-scales, then dotted against up to four activation rows per pass; the integer products are those of `vec_dot`, so the
-result is bit-exact for the Q8_K types. `LLAMA_MOE_HOST_ROW8=<n>` raises the threshold, 0 turns it off. The host is
-DRAM-bound with it (29–31 GB/s of expert reads on a dual-channel DDR4 system).
+IQ4_NL and Q2_0, whose `vec_dot` is cheap) `ggml_cpu_row8_unpack` / `ggml_cpu_row8_dot` (commits `2b37cca0f`,
+`1f42db592`, AVX2): a weight row of IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL or Q2_0 is unpacked once into int8
+weights with integer and float scales, then dotted against up to four activation rows per pass; the integer products are
+those of `vec_dot`, so the result is bit-exact for the Q8_K types. `LLAMA_MOE_HOST_ROW8=<n>` raises the threshold, 0
+turns it off. The host is DRAM-bound with it (29–31 GB/s of expert reads on a dual-channel DDR4 system).
 
 Upstream PR #30448 (AVX2 dot products for IQ3_S and IQ3_XXS, open) is merged into the branch and used by the host path.
 
@@ -100,7 +100,7 @@ Decoding wants the largest cache; prompt processing wants large ubatches, whose 
 memory. With phases the cache banks live in VMM buffers (`ggml_backend_vmm_buffer_alloc` / `_commit` proc addresses in
 ggml-cuda) whose physical memory can be released from their end:
 
-- a batch of more than `LLAMA_MOE_PHASE_TOKENS` tokens (default 256, 512 in the measured setup) runs in the *large
+- a batch of more than `LLAMA_MOE_PHASE_TOKENS` tokens (default 256, as in the measured setup) runs in the *large
   phase*: ubatches of `-ub`, the cache shrunk to its first slots (the core), the released memory used by the compute
   buffers and the expert prefetch. The context re-reserves only the prompt graph on a switch.
 - smaller batches run in the *small phase*: ubatches of `LLAMA_MOE_PHASE_UBATCH` (default 32, 128 measured) in host
@@ -171,8 +171,8 @@ device's own work is the longer already, the uploads are hidden and the host tak
 
 - the host's cost of an item (an expert's pass over its weights for up to 64 of its tokens) and of an entry (a token of
   an expert), in thread seconds, fitted to every item the workers time, per kind of layer (the types of its gate, up
-  and down): the layers of a GSQ-RCO model differ several fold, an IQ2_XS layer, which the row8 kernels do not unpack,
-  costing more than twice an IQ3_S one per entry;
+  and down): the layers of a GSQ-RCO model differ, an item of an IQ4_XS layer costing more than one of an IQ2_S
+  layer, and an entry of a layer with K-quants, whose rows are not unpacked, more than one of the others;
 - the upload rate, from timed events around each staging slot's uploads (a CUDA proc address,
   `ggml_backend_event_new_timed` with `ggml_backend_event_elapsed_ms`);
 - the device's time before each post, read from its clock in the batch mailbox: the post and the wait write it, and the

@@ -27,7 +27,7 @@ become parameters.
 | `LLAMA_MOE_CACHE_TAIL_SKIP` | 0 | 7 | skip a missing expert that every token ranks this far or further back (0-based); approximation |
 | `LLAMA_MOE_CACHE_TAIL_SKIP_W` | off | | also require its routing weight below this share of the token's total |
 | `LLAMA_MOE_CACHE_PREFILL_MIB` | off | 8200 | cache phases: the core kept while large batches run, in MiB |
-| `LLAMA_MOE_PHASE_TOKENS` | 256 | 512 | batches of more tokens run in the large phase |
+| `LLAMA_MOE_PHASE_TOKENS` | 256 | 256 | batches of more tokens run in the large phase |
 | `LLAMA_MOE_PHASE_UBATCH` | 32 | 128 | ubatch of the small phase |
 | `LLAMA_MOE_PREFETCH` | 0 | 3 | expert prefetch for large batches: staging slots |
 | `LLAMA_MOE_PREFETCH_ROUTED` | 1 | 0 | stage only the experts the routing selects; 0 stages whole tensors |
@@ -78,7 +78,7 @@ and [prefill.md](prefill.md).
 | `LLAMA_GRAPH_SLOT_TOKENS` | 16 | | largest ubatch kept in a slot |
 | `LLAMA_SERVER_BALANCED_CHUNKS` | on | | split a long prompt into equal chunks |
 | `LLAMA_SERVER_CKPT_TAIL` | `n_ubatch` | 32 | the batch after the last checkpoint is 4 + this many tokens; 0: only the checkpoint 4 tokens before the end |
-| `LLAMA_SERVER_CKPT_TAIL_MAX` | off | (512) | that tail gets a batch of its own only after a batch of at most this many tokens; a longer prompt runs to its last 4 tokens at once |
+| `LLAMA_SERVER_CKPT_TAIL_MAX` | off | 256 | that tail gets a batch of its own only after a batch of at most this many tokens; a longer prompt runs to its last 4 tokens at once |
 
 ## qwen4exp
 
@@ -181,3 +181,4 @@ first:
 | `3cce2f756` | large batches shared with the host by measure; the batch wait polls from one thread |
 | `b83aeb575` | the large phase's buffers in the memory the cache lends; queued re-admissions dropped at a switch |
 | `98714f4d5` | the measured share takes an expert only if it shortens the layer's cycle |
+| `1f42db592` | host kernels unpack IQ2_XS rows too |

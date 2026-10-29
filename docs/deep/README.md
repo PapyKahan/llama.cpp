@@ -52,12 +52,12 @@ the GPU adds the host's answer. The whole forward pass is one CUDA graph with no
 on the host moves experts in and out of the cache between requests, from selection counts it gathers, and the cache
 starts each session from a profile of past sessions.
 
-**Long prompts** (chunks of more than 512 tokens) run in 8192-token ubatches in the *large phase*
+**Long prompts** (chunks of more than 256 tokens) run in 8192-token ubatches in the *large phase*
 ([moe-offload.md](moe-offload.md#cache-phases)): the expert cache shrinks to its core and lends the rest of its memory to
 the compute buffers and to staging slots, into which a worker uploads the next layers' experts while the current layer
 computes; the memory it lends stays mapped, so a change of phase costs little. The host computes the least selected of
 the experts the core lacks for the whole batch meanwhile, as many as it is measured to save time with. Prompts of up to
-512 tokens stay in host mode in 128-token batches.
+256 tokens stay in host mode in 128-token batches.
 
 **The drafter** ([speculative.md](speculative.md)) is the model's MTP layer on the second GPU, with a trimmed output
 vocabulary; it drafts up to three tokens and stops when the chance that the whole draft is accepted falls below 0.3. The
@@ -90,11 +90,11 @@ Unsloth's MTP head, both on Hugging Face):
 
 ```bash
 LLAMA_MOE_HOST=1 LLAMA_MOE_CACHE_TAIL_SKIP=7 \
-LLAMA_MOE_CACHE_PREFILL_MIB=8200 LLAMA_MOE_PHASE_TOKENS=512 LLAMA_MOE_PHASE_UBATCH=128 LLAMA_MOE_HOST_MAX_TOKENS=128 \
+LLAMA_MOE_CACHE_PREFILL_MIB=8200 LLAMA_MOE_PHASE_TOKENS=256 LLAMA_MOE_PHASE_UBATCH=128 LLAMA_MOE_HOST_MAX_TOKENS=128 \
 LLAMA_MOE_PREFETCH=3 LLAMA_MOE_PREFETCH_ROUTED=0 \
 LLAMA_MOE_CACHE_PROFILE=$HOME/.cache/flash-next.moe-profile \
 LLAMA_MOE_CACHE_EXCLUSIVE=8200 GGML_CUDA_HOST_MEMFD=1 GGML_CUDA_HOST_MEMFD_GUARD=1 \
-LLAMA_SERVER_CKPT_TAIL=32 LLAMA_QSA_CHUNK=512 LLAMA_PLE_RAW=1 LLAMA_PLE_PREFETCH=1 \
+LLAMA_SERVER_CKPT_TAIL=32 LLAMA_SERVER_CKPT_TAIL_MAX=256 LLAMA_QSA_CHUNK=512 LLAMA_PLE_RAW=1 LLAMA_PLE_PREFETCH=1 \
 LLAMA_HOST_COMPUTE_PAGEABLE=1 LLAMA_SPEC_ASYNC_PROCESS=1 LLAMA_SPEC_P_CUM=1 LLAMA_GRAPH_SLOTS=6 \
 GGML_CUDA_MMVF_ROWS=1 GGML_CUDA_MMVF_FEW_ROWS=1 GGML_CUDA_FA_SPARSE_MIN_KV=8192 MALLOC_MMAP_THRESHOLD_=4194304 \
 llama-server \

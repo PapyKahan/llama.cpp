@@ -241,6 +241,60 @@ Numerics against the base logits of [the merge](#after-the-merge-with-upstream):
 phase, the lent memory alone 0.1264 ± 0.0037 (the same as before), with the measured share (the host took 53 % of the
 experts the core lacks over 30 batches) 0.1271 ± 0.0037; Flash-Next 2 × 2048, measured share 0.0149 ± 0.0013.
 
+### Phase threshold
+
+2026-10-29, `ed84b76ad`, each model with its profile's settings, follow-ups sent back to back after the 11.7K-token
+conversation, the tail checkpoint limit (`LLAMA_SERVER_CKPT_TAIL_MAX`) equal to the threshold:
+
+| `LLAMA_MOE_PHASE_TOKENS` | Flash-Next +100 / +300 / +1000 / +3000 (s) | Ornith-1.5-122B +100 / +300 / +1000 / +3000 (s) |
+|---|---|---|
+| 512 | 1.16 / 1.77 / 2.12 / 2.66 | 2.13 / 4.12 / 2.27 / 2.86 |
+| 256 | 1.28 / 1.42 / 2.32 / 2.53 | 2.03 / 1.78 / 2.27 / 2.88 |
+| 128 | 1.17 / 1.46 / 2.30 / 2.52 | 2.10 / 1.81 / 2.28 / 2.91 |
+| 64 | 2.08 / 1.43 / 2.28 / 2.49 | 2.98 / 1.95 / 2.27 / 2.87 |
+
+A +300 turn gains most from the large phase (Ornith 4.1 to 1.8 s), a +100 turn (about 120 tokens up to its tail) loses
+in it. Decode did not move (Flash-Next 97 to 114 tok/s, Ornith 44 to 46), nor the peaks (GPU0 about 23.9 GB, lowest
+MemAvailable about 11.3 GB); one build's runs spread by about ±0.15 s. The profiles take 256: 128 does as well at +300
+but moves the turns of 129 to 256 tokens into the large phase, closer to where it loses.
+
+### IQ2_XS on the host
+
+The row8 unpacker for IQ2_XS (`1f42db592`), timed by a standalone program against `vec_dot` and the type's
+dequantization (bit-exact with Q8_K activations), ns per row of 3072 weights and per entry against 176 to 178 for
+`vec_dot`:
+
+| entries per row | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| unpacked once (row8) | 255 | 151 | 111 | 88 | 84 | 78 | 72 | 65 |
+
+The K-quants keep their `vec_dot`, among the cheapest of the host's types (Q2_K 62, Q3_K 109, Q4_K 71, Q5_K 104 ns
+against 287 for IQ3_S): an unpacker carrying the minimums of Q4_K and Q5_K took 341 / 241 ns at one entry and 87 / 75
+at eight, never ahead.
+
+In Ornith-1.5-122B, whose layers 0 to 8 and 15 have IQ2_XS experts, the host's fitted cost per entry of a large batch
+(measured share, 30 × 512 tokens) went from 0.66 to 0.24 ms for an all-IQ2_XS layer (0.41 to 0.24 and 0.49 to 0.24 for
+the two mixed kinds), that of the IQ2_S and IQ3_S layers; its cost per item, the unpacking, from 0.11 to 1.0 ms.
+Numerics against its BF16 logits: 128-token batches in the small phase identical to the build before (KLD 0.1259 ±
+0.0038 both), large batches with the measured share 0.1246 ± 0.0038 against 0.1245 ± 0.0036 (two more runs of the new
+build: 0.1238, 0.1271, and one of the build before: 0.1283; the share follows timings, so which experts the host
+computes varies).
+
+Ornith follow-ups (+100 / +300 / +1000 / +3000, s) without the decode suite before them, the builds alternated: before
+1.98 / 1.80 / 2.27 / 2.87 and 1.95 / 1.79 / 2.26 / 2.89, after 1.83 / 1.81 / 2.23 / 2.86 and 1.85 / 1.78 / 2.23 / 2.85;
+the small phase's 128-token batches gain most. After the decode suite, one run each: before 2.03 / 1.78 / 2.27 / 2.88,
+after 2.04 / 1.92 / 2.40 / 2.99, its large batches about 0.1 s longer. Decode after: 43.1 / 44.7 / 40.9 tok/s (cold /
+warm / code, draft acceptance 0.76 / 0.72 / 0.70) against 45.2 / 44.3 / 44.3 (0.73 / 0.74 / 0.74), the host's time per
+missed expert unchanged (131 µs).
+
+### One pass per turn (experiment)
+
+The server cuts a turn at its checkpoints (the start of the last user message, 4 + `LLAMA_SERVER_CKPT_TAIL` and 4
+tokens before its end), and each small-phase batch reads its missed experts again. With the cuts of turns of up to 4096
+tokens skipped (`LLAMA_SERVER_CKPT_CUTS=0`, uncommitted: the turn then saves no checkpoint), Ornith-1.5-122B with
+`1f42db592`: 1.43 / 1.64 / 2.04 / 2.72 s against 1.83 to 1.85 / 1.78 to 1.81 / 2.23 / 2.85 to 2.86 with the cuts. Saving
+the recurrent state at the checkpoints within the one pass would keep most of that.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the

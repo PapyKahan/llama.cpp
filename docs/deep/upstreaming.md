@@ -67,13 +67,17 @@ what was tried and dropped so that nobody repeats it.
 
 ### Known issues
 
-- Short follow-up turns are slower than Strata's: a turn of up to 512 tokens runs in the small phase, 128-token batches
-  whose misses the host computes (Flash-Next 1.16 / 1.75 s for +100 / +300 tokens, against 0.72 / 0.96 s; Ornith-1.5-122B
-  about 2 / 4 s). From 1000 tokens on, the measured host share and the lent memory make the branch faster than Strata
-  (see [measurements.md](measurements.md#measured-host-share-and-lent-memory)). A lower phase threshold is the next
-  thing to try now that a change of phase costs little.
-- The host's row8 kernels have no unpacker for IQ2_XS, Q4_K or Q5_K: a host expert of such a layer takes a quantized dot
-  product per token, more than twice the cost per entry, which limits the host's share of those layers.
+- Short follow-up turns are slower than Strata's: a turn of up to 256 tokens runs in the small phase, 128-token batches
+  whose misses the host computes, and the server cuts each turn into batches at its checkpoints, each batch reading its
+  missed experts again (Flash-Next 1.16 to 1.28 s for +100 tokens against 0.72 s, 1.42 s for +300 against 0.96 s;
+  Ornith-1.5-122B about 1.85 / 1.8 s). From 1000 tokens on, the measured host share and the lent memory make the branch
+  faster than Strata (see [measurements.md](measurements.md#measured-host-share-and-lent-memory)). A turn in one pass,
+  the recurrent state at its checkpoints saved within it, is the next thing to try (Ornith-1.5-122B without the cuts:
+  1.43 / 1.64 / 2.04 / 2.72 s for +100 / +300 / +1000 / +3000, see
+  [measurements.md](measurements.md#one-pass-per-turn-experiment)).
+- The host's row8 kernels have no unpacker for the K-quants: their `vec_dot` is already among the cheapest of the host's
+  types, and an unpacker carrying their minimums did not beat it (see
+  [measurements.md](measurements.md#iq2_xs-on-the-host)).
 - The start loads all 47.7 GiB of experts before the exclusive core releases its share: loading the exclusive experts
   straight into the cache would remove that peak.
 - The exclusive core needs the cache profile, so the very first session has none.
@@ -116,7 +120,7 @@ Expert offload, after #30966, best preceded by a design discussion upstream (gra
 mailboxes, a service thread that must make no CUDA call):
 
 16. Expert prefetch for large batches (`0e80359ad` to `ddd0cfe81`, part of `65dc51115`).
-17. Host mode, its ops and the row8 host kernels (`e1cd4e00f`, `2b37cca0f`).
+17. Host mode, its ops and the row8 host kernels (`e1cd4e00f`, `2b37cca0f`, `1f42db592`).
 18. Service-thread policy, cache phases on VMM buffers, re-admission of lent slots, the large phase's buffers in the
     lent memory (`a29262c1e`, `991413bff`, part of `8060a31c7`, `b83aeb575`).
 19. Cache profile (part of `8060a31c7`).

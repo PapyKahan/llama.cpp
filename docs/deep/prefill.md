@@ -31,8 +31,11 @@ Commit `e2ff90695` (`ggml/src/ggml-cuda/mmq.cu`, `mmid.cu`):
 - **Checkpoint tail** (commit `f222e5947`, `LLAMA_SERVER_CKPT_TAIL=<n>`): the tokens after the checkpoint before the end
   of a prompt run as a batch of their own, `4 + n_ubatch` of them; with this the tail is `4 + n`, so a context whose
   ubatches are large does not process a long tail right after a large chunk (32 in the measured setup).
-- Prompts of up to 512 tokens (`LLAMA_MOE_PHASE_TOKENS`) stay in the small phase, in 128-token host-mode batches: a large
-  phase costs its full upload whatever the prompt, and 256-token to 1024-token batches did not beat it.
+- Prompts of up to 256 tokens (`LLAMA_MOE_PHASE_TOKENS`) stay in the small phase, in 128-token host-mode batches; longer
+  ones switch to the large phase. With the lent memory a change of phase costs little, and the measured host share
+  takes part of the uploads: from about 300 tokens the large phase beats the small one, whose every batch reads its
+  missed experts again, while a turn of about 120 tokens still loses in it (see
+  [measurements.md](measurements.md#phase-threshold)).
 
 ## The n-gram embedding gather
 
