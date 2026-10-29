@@ -157,11 +157,12 @@ struct moe_cache_slru {
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // with skip_rank > 0, a miss that every token ranks skip_rank-th or later (ids are sorted by score, best
     // first) reads a zero slot and is left out of the CPU part too: it is skipped, an approximation
+    // only the misses cpu_ok accepts may go to the CPU; the others are filled like any miss
     // returns false if the ids select more distinct experts than there are slots
-    template <typename F>
+    template <typename F, typename G>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, int32_t skip_rank,
-            F && n_cpu, uint64_t & rng, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip,
-            size_t max_admit, std::vector<fill> & admits) {
+            F && n_cpu, G && cpu_ok, uint64_t & rng, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit,
+            size_t & n_skip, size_t max_admit, std::vector<fill> & admits) {
         fills.clear();
         cpu.clear();
         admits.clear();
@@ -247,14 +248,16 @@ struct moe_cache_slru {
         }
 
         // the misses left to the CPU are picked at random, so that every expert can enter the cache; with asynchronous
-        // admission all of them go to the CPU, and the share that would be filled is admitted in the background
+        // admission all of them go to the CPU, and the share that would be filled is admitted in the background. They
+        // are picked among the misses cpu_ok accepts, moved first; when it accepts them all, nothing moves
+        const size_t  n_ok    = std::partition(misses.begin(), misses.end(), cpu_ok) - misses.begin();
         const bool    async   = max_admit > 0;
-        const size_t  n_share = std::min(n_cpu(misses.size()), misses.size());
-        const size_t  n_c     = async ? misses.size() : n_share;
-        size_t        n_admit = async ? std::min(misses.size() - n_share, max_admit) : 0;
+        const size_t  n_share = std::min(n_cpu(misses.size()), n_ok);
+        const size_t  n_c     = async ? n_ok : n_share;
+        size_t        n_admit = async ? std::min(n_ok - n_share, max_admit) : 0;
         for (size_t i = 0; i < n_c; ++i) {
             rng = rng*6364136223846793005ull + 1442695040888963407ull;
-            std::swap(misses[i], misses[i + (rng >> 33) % (misses.size() - i)]);
+            std::swap(misses[i], misses[i + (rng >> 33) % (n_ok - i)]);
         }
         if (n_c > 0) {
             size_t n_keep = n_c;
@@ -2976,11 +2979,17 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             l.cpu_acc = acc & 0xffff;
             return (size_t) (acc >> 16);
         };
+        // the CPU part reads an expert at its own position in the host tensor: with the exclusive core, only an expert
+        // whose host copy is still there may go to it; one moved elsewhere, or with no copy, is uploaded from hsrc instead
+        auto cpu_ok = [&](int32_t e) {
+            const int32_t key = il*hp_ne + e;
+            return !excl_on || hloc[key] == key;
+        };
         size_t n_hit = 0;
         size_t n_skip = 0;
         const size_t max_admit = async_admit && has_cpu ? async_max - std::min(async_max, in_flight) : 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, has_cpu ? skip_rank : 0,
-                n_cpu, rng, fills, cpu, n_hit, n_skip, max_admit, admits)) {
+                n_cpu, cpu_ok, rng, fills, cpu, n_hit, n_skip, max_admit, admits)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
