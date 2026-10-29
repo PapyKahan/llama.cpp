@@ -1716,9 +1716,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+    // the column each slot ends at; with state marks, group 0 ends at the last column and the group of each mark
+    // before the mark
+    std::vector<std::pair<int64_t, int64_t>> keep;
+    if (!rs_marks.empty()) {
+        keep.emplace_back(conv_input->ne[0] - state_cols, 0);
+        for (const auto & [m, slot] : rs_marks) {
+            if (slot > 0) {
+                keep.emplace_back(m, slot);
+            }
+        }
+    } else {
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            keep.emplace_back(std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot), slot);
+        }
+    }
 
+    for (const auto & [s_idx, slot] : keep) {
         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
                 conv_input->nb[1], conv_input->nb[2],

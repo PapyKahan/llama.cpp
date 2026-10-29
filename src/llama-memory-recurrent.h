@@ -79,6 +79,12 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // while mark_seq >= 0, the state of mark_seq is written from rollback group mark_plane, where a decode kept a
+    // state mark, at position mark_pos (llama_state_seq_get_data_mark)
+    llama_seq_id mark_seq   = -1;
+    uint32_t     mark_plane = 0;
+    llama_pos    mark_pos   = -1;
+
     // computed before each graph build
     uint32_t n = 0;
 

@@ -867,6 +867,11 @@ struct llm_graph_params {
     // the batch is shared with the host (llama_moe_cache::batch_shared): its MoE layers post to the host
     bool moe_batch = false;
 
+    // the state marks the ubatch keeps (llama_set_state_marks): for each, the tokens of the ubatch before it and the
+    // rollback group that holds the recurrent state there. Not empty for every ubatch of a sequence with marks: one
+    // without (a single entry for group 0) keeps only its final state, which leaves the groups of the marks alone
+    std::vector<std::pair<int32_t, int32_t>> rs_marks;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -908,6 +913,10 @@ struct llm_graph_params {
         }
 
         if (moe_batch != other.moe_batch) {
+            return false;
+        }
+
+        if (rs_marks != other.rs_marks) {
             return false;
         }
 
@@ -1133,6 +1142,9 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     const llama_vocab_subset * vsub;
+
+    // see llm_graph_params::rs_marks
+    const std::vector<std::pair<int32_t, int32_t>> rs_marks;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

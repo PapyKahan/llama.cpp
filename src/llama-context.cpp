@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -2514,6 +2516,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    // the state marks set for this decode replace those of the last one
+    marks_seq = marks_seq_next;
+    marks     = std::move(marks_next);
+    marks_kept.assign(marks.size(), false);
+    marks_seq_next = -1;
+    marks_next.clear();
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2695,7 +2704,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        marks_ubatch = marks_in(ubatch);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (res) {
+            for (const auto & mark : marks_ubatch) {
+                if (mark.second > 0) {
+                    marks_kept[mark.second - 1] = true;
+                }
+            }
+        }
+        marks_ubatch.clear();
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3424,6 +3442,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.vsub        =*/ vsub.get(),
         /*.moe_batch   =*/ moe_cache != nullptr && moe_cache->batch_shared(),
+        /*.rs_marks    =*/ marks_ubatch,
     };
 }
 
@@ -4605,6 +4624,77 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+llama_memory_recurrent * llama_context::marks_mem() const {
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        return hybrid->get_mem_recr();
+    }
+    return dynamic_cast<llama_memory_recurrent *>(memory.get());
+}
+
+int32_t llama_context::n_state_marks() const {
+    // the models whose recurrent states are all kept by build_conv_state(_at) and build_recurrent_attn, which keep the
+    // marks; the rollback groups past the first hold them
+    switch (model.arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+            break;
+        default:
+            return 0;
+    }
+    const llama_memory_recurrent * mem = marks_mem();
+    return mem != nullptr ? (int32_t) std::min(cparams.n_rs_seq, mem->n_rs_seq) : 0;
+}
+
+void llama_context::set_state_marks(llama_seq_id seq_id, const llama_pos * pos, int32_t n) {
+    marks_seq_next = seq_id;
+    marks_next.assign(pos, pos + std::max(0, std::min(n, n_state_marks())));
+}
+
+std::vector<std::pair<int32_t, int32_t>> llama_context::marks_in(const llama_ubatch & ubatch) const {
+    std::vector<std::pair<int32_t, int32_t>> res;
+    // the graph splits the tokens of the ubatch at the marks, so it holds the sequence alone
+    if (marks.empty() || ubatch.n_seqs_unq != 1 || ubatch.seq_id_unq[0] != marks_seq || ubatch.pos == nullptr) {
+        return res;
+    }
+    for (size_t i = 0; i < marks.size(); ++i) {
+        const llama_pos m = marks[i] - ubatch.pos[0];
+        if (m > 0 && m <= (llama_pos) ubatch.n_tokens) {
+            res.emplace_back((int32_t) m, (int32_t) i + 1);
+        }
+    }
+    // the other ubatches of the sequence keep only their final state, rather than rollback snapshots over the marks
+    if (res.empty()) {
+        res.emplace_back((int32_t) ubatch.n_tokens, 0);
+    }
+    return res;
+}
+
+size_t llama_context::state_seq_mark(llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags, const std::function<size_t()> & write) {
+    llama_memory_recurrent * mem = marks_mem();
+    // the attention caches write nothing for a partial state, except a sliding window, which a mark does not keep
+    if (mem == nullptr || seq_id < 0 || seq_id != marks_seq || i < 0 || i >= (int32_t) marks.size() || !marks_kept[i] ||
+            !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) ||
+            model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return 0;
+    }
+    mem->mark_seq   = seq_id;
+    mem->mark_plane = (uint32_t) i + 1;
+    mem->mark_pos   = marks[i] - 1;
+    const size_t n = write();
+    mem->mark_seq = -1;
+    return n;
+}
+
+size_t llama_context::state_seq_get_size_mark(llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags) {
+    return state_seq_mark(seq_id, i, flags, [&] { return state_seq_get_size(seq_id, flags); });
+}
+
+size_t llama_context::state_seq_get_data_mark(llama_seq_id seq_id, int32_t i, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    return state_seq_mark(seq_id, i, flags, [&] { return state_seq_get_data(seq_id, dst, size, flags); });
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -5298,6 +5388,14 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+int32_t llama_n_state_marks(const llama_context * ctx) {
+    return ctx->n_state_marks();
+}
+
+void llama_set_state_marks(llama_context * ctx, llama_seq_id seq_id, const llama_pos * pos, int32_t n) {
+    ctx->set_state_marks(seq_id, pos, n);
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -5717,6 +5815,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_size_mark(llama_context * ctx, llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags) {
+    return ctx->state_seq_get_size_mark(seq_id, i, flags);
+}
+
+size_t llama_state_seq_get_data_mark(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_mark(seq_id, i, dst, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

@@ -1631,6 +1631,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     vsub             (params.vsub),
+    rs_marks         (params.rs_marks),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

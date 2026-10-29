@@ -13,12 +13,14 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <functional>
 #include <map>
 #include <vector>
 
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_memory_recurrent;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -165,6 +167,12 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // state marks, see llama_set_state_marks()
+    int32_t n_state_marks() const;
+    void    set_state_marks(llama_seq_id seq_id, const llama_pos * pos, int32_t n);
+    size_t  state_seq_get_size_mark(llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags);
+    size_t  state_seq_get_data_mark(llama_seq_id seq_id, int32_t i, uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -297,6 +305,20 @@ private:
     uint32_t moe_ubatch_small = 32;
     uint32_t moe_phase_tokens = 256;
     void moe_set_phase(bool large);
+
+    // state marks: the positions set for the next decode, then those of the last decode, which of them its ubatches
+    // kept, and the rollback planes of the recurrent memory that hold them (mark i in plane i + 1)
+    llama_seq_id           marks_seq_next = -1;
+    std::vector<llama_pos> marks_next;
+    llama_seq_id           marks_seq = -1;
+    std::vector<llama_pos> marks;
+    std::vector<bool>      marks_kept;
+    llama_memory_recurrent * marks_mem() const;
+    // the marks a ubatch keeps: (tokens of the ubatch before the mark, plane); those of the ubatch being processed
+    std::vector<std::pair<int32_t, int32_t>> marks_in(const llama_ubatch & ubatch) const;
+    std::vector<std::pair<int32_t, int32_t>> marks_ubatch;
+    // runs a state write of seq_id with mark i in place of its current state, 0 if the mark was not kept
+    size_t state_seq_mark(llama_seq_id seq_id, int32_t i, llama_state_seq_flags flags, const std::function<size_t()> & write);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);

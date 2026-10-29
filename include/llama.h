@@ -960,6 +960,33 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // State marks: the next decode also keeps the recurrent state of seq_id as it is before each position pos[i]
+    // (ascending, at most llama_n_state_marks()), so that a prompt runs in one batch past the positions a caller
+    // checkpoints at. Until a later decode, llama_state_seq_get_*_mark() read the state of mark i as
+    // llama_state_seq_get_*_ext() read the current one, with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY only. A mark is kept
+    // when its position falls inside the batch, in a ubatch of that sequence alone; the size is 0 otherwise.
+    LLAMA_API int32_t llama_n_state_marks(const struct llama_context * ctx);
+
+    LLAMA_API void llama_set_state_marks(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                 const llama_pos * pos,
+                         int32_t   n);
+
+    LLAMA_API size_t llama_state_seq_get_size_mark(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   i,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_mark(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t   i,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //

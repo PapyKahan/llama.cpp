@@ -796,7 +796,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             uint32_t rs_idx_cur = 0;
 
             if (n_rs_seq != 0) {
-                if (seq_id != -1) {
+                if (seq_id != -1 && seq_id == mark_seq) {
+                    rs_idx_cur = mark_plane;
+                } else if (seq_id != -1) {
                     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
                     rs_idx_cur = rs_idx[seq_id];
                 } else {
@@ -894,7 +896,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
-            const llama_pos pos      = cell.pos;
+            const llama_pos pos      = seq_id != -1 && seq_id == mark_seq ? mark_pos : cell.pos;
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
             io.write(&pos,      sizeof(pos));

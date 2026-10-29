@@ -491,6 +491,29 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+    } else if (!rs_marks.empty()) {
+        // state marks: the last columns in group 0, and in the group of each mark the columns that end before it
+        std::vector<std::pair<int64_t, int64_t>> keep = { { conv_input->ne[0] - conv_states->ne[0], 0 } };
+        for (const auto & [m, slot] : rs_marks) {
+            if (slot > 0) {
+                keep.emplace_back(m, slot);
+            }
+        }
+        for (const auto & [s_idx, s_slot] : keep) {
+            ggml_tensor * conv_state_mark =
+                ggml_view_3d(ctx0, conv_input,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, s_idx));
+
+            ggml_tensor * conv_state_update =
+                ggml_view_2d(ctx0,
+                        conv_states_all, row_count, n_seqs,
+                        conv_states_all->nb[1],
+                        (s_slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_mark, conv_state_update));
+        }
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
@@ -558,6 +581,52 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
+
+    if (!rs_marks.empty()) {
+        // state marks: the op runs once per stretch of tokens up to a mark, and saves its state into the group of the
+        // mark. The next stretch starts from that copy: a fused op writes its state straight into the group
+        // (ggml_cuda_try_gdn_cache_fusion), not after its own output
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+        auto stretch = [&](ggml_tensor * x, int64_t t0, int64_t t1) {
+            return ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], t1 - t0, x->ne[3], x->nb[1], x->nb[2], x->nb[3], t0*x->nb[2]);
+        };
+        auto group = [&](int64_t slot) {
+            return ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], (slot*mem_size + kv_head)*row_size);
+        };
+
+        std::vector<std::pair<int64_t, int64_t>> ends;
+        for (const auto & [m, slot] : rs_marks) {
+            if (slot > 0) {
+                ends.emplace_back(m, slot);
+            }
+        }
+        if (ends.empty() || ends.back().first < n_seq_tokens) {
+            ends.emplace_back(n_seq_tokens, 0);
+        }
+
+        ggml_tensor * output = nullptr;
+        ggml_tensor * state  = s;
+        int64_t t0 = 0;
+        for (const auto & [t1, slot] : ends) {
+            auto attn_out = build_delta_net(stretch(q, t0, t1), stretch(k, t0, t1), stretch(v, t0, t1),
+                                            stretch(g, t0, t1), stretch(b, t0, t1), state, il);
+            output = output != nullptr ? ggml_concat(ctx0, output, attn_out.first, 2) : attn_out.first;
+
+            ggml_tensor * saved = ggml_cpy(ctx0, attn_out.second, group(slot));
+            ggml_build_forward_expand(gf, saved);
+            state = ggml_reshape_4d(ctx0, saved, S_v, S_v, H_v, n_seqs);
+            t0 = t1;
+        }
+        // a mark at the end of the ubatch holds the final state too
+        if (ends.back().second != 0) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, state, group(0)));
+        }
+        cb(output, "attn_output", il);
+
+        return output;
+    }
+
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
