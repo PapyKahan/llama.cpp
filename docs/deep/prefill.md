@@ -31,6 +31,16 @@ Commit `e2ff90695` (`ggml/src/ggml-cuda/mmq.cu`, `mmid.cu`):
 - **Checkpoint tail** (commit `f222e5947`, `LLAMA_SERVER_CKPT_TAIL=<n>`): the tokens after the checkpoint before the end
   of a prompt run as a batch of their own, `4 + n_ubatch` of them; with this the tail is `4 + n`, so a context whose
   ubatches are large does not process a long tail right after a large chunk (32 in the measured setup).
+- **One pass per turn** (commits `d14f39714`, `3e6618196`, `LLAMA_SERVER_ONE_PASS`, default on): a hybrid model cannot
+  rewind its recurrent state, so the server keeps checkpoints of it at the start of the last user message and 4 +
+  `LLAMA_SERVER_CKPT_TAIL` and 4 tokens before the end of a prompt. It used to end a batch at each, and each small-phase
+  batch reads its missed experts again. The prompt now runs on: `llama_set_state_marks()` has the decode keep the
+  recurrent state at those positions in the rollback groups (`n_rs_seq`, which the drafter sizes), and the checkpoints
+  are copied from there right after it. The graph runs the gated delta net once per stretch of tokens between marks,
+  each stretch from the state the one before saved into its group, keeps the convolution window that ends at each mark
+  (`build_recurrent_attn`, `build_conv_state`, and qwen4exp's `build_conv_state_at`, which keeps the PLE history too),
+  and the other ubatches of the sequence keep only their final state. A batch with marks holds its slot alone; a prompt
+  after media, with a shared prefix, an aLoRA or children, or a context without rollback groups, is cut as before.
 - Prompts of up to 256 tokens (`LLAMA_MOE_PHASE_TOKENS`) stay in the small phase, in 128-token host-mode batches; longer
   ones switch to the large phase. With the lent memory a change of phase costs little, and the measured host share
   takes part of the uploads: from about 300 tokens the large phase beats the small one, whose every batch reads its

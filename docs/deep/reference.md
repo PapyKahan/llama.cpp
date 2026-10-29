@@ -78,6 +78,7 @@ and [prefill.md](prefill.md).
 | `LLAMA_GRAPH_SLOT_TOKENS` | 16 | | largest ubatch kept in a slot |
 | `LLAMA_SERVER_BALANCED_CHUNKS` | on | | split a long prompt into equal chunks |
 | `LLAMA_SERVER_CKPT_TAIL` | `n_ubatch` | 32 | the batch after the last checkpoint is 4 + this many tokens; 0: only the checkpoint 4 tokens before the end |
+| `LLAMA_SERVER_ONE_PASS` | on | on | a prompt runs past its checkpoints in one batch, the recurrent state kept at each (state marks) |
 | `LLAMA_SERVER_CKPT_TAIL_MAX` | off | 256 | that tail gets a batch of its own only after a batch of at most this many tokens; a longer prompt runs to its last 4 tokens at once |
 
 ## qwen4exp
@@ -132,6 +133,8 @@ and [prefill.md](prefill.md).
 | `llama_prefetch_token` | `src/llama-ext.h` | read ahead the file-backed rows a token will need |
 | `common_context_set_wait`, `common_context_wait`, `common_context_defer` | common | serialize access to a context a background decode uses |
 | `llama_batch_ext_set_pad`, `common_batch::token::pad`, `llama_ubatch::pad` | llama, common | pad entries of a batch |
+| `llama_n_state_marks`, `llama_set_state_marks`, `llama_state_seq_get_size_mark` / `_get_data_mark` | llama | keep the recurrent state at given positions of a decode in the rollback groups, read it as a partial sequence state |
+| `common_prompt_checkpoint::update_tgt_mark` | common | a checkpoint from a state mark |
 
 New files: `src/llama-moe-host.{h,cpp}`, `ggml/src/ggml-cuda/moe-host.cu`, `ggml/src/ggml-cuda/mmvf-rows.cu`,
 `tests/test-draft-vocab.cpp`, and from PR #30966 `scripts/moe-cache-tune.py` and `docs/moe-cache.md`.
@@ -182,3 +185,5 @@ first:
 | `b83aeb575` | the large phase's buffers in the memory the cache lends; queued re-admissions dropped at a switch |
 | `98714f4d5` | the measured share takes an expert only if it shortens the layer's cycle |
 | `1f42db592` | host kernels unpack IQ2_XS rows too |
+| `d14f39714` | state marks: the recurrent state kept at given positions of a decode |
+| `3e6618196` | server: a turn in one pass, its checkpoints from state marks (`LLAMA_SERVER_ONE_PASS`) |

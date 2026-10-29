@@ -54,6 +54,9 @@ what was tried and dropped so that nobody repeats it.
   answering in a test).
 - Unit tests for the cache bookkeeping: the service policy, the phases, and the exclusive core's invariants (every expert
   either cached in an exclusive slot with no host copy, or with exactly one host copy; spares never referenced).
+- State marks against cut batches: a test needs a small hybrid model (a standalone program compared the states, the
+  final logits, the tokens after them and the marks restored: bit-identical on the CPU, within the noise of the batch
+  shapes on CUDA).
 - Perplexity and KL divergence for every approximation (tail skip) and every path that changes the arithmetic (host mode,
   the host share of large batches), on standard sets and on more than one model.
 
@@ -68,13 +71,11 @@ what was tried and dropped so that nobody repeats it.
 ### Known issues
 
 - Short follow-up turns are slower than Strata's: a turn of up to 256 tokens runs in the small phase, 128-token batches
-  whose misses the host computes, and the server cuts each turn into batches at its checkpoints, each batch reading its
-  missed experts again (Flash-Next 1.16 to 1.28 s for +100 tokens against 0.72 s, 1.42 s for +300 against 0.96 s;
-  Ornith-1.5-122B about 1.85 / 1.8 s). From 1000 tokens on, the measured host share and the lent memory make the branch
-  faster than Strata (see [measurements.md](measurements.md#measured-host-share-and-lent-memory)). A turn in one pass,
-  the recurrent state at its checkpoints saved within it, is the next thing to try (Ornith-1.5-122B without the cuts:
-  1.43 / 1.64 / 2.04 / 2.72 s for +100 / +300 / +1000 / +3000, see
-  [measurements.md](measurements.md#one-pass-per-turn-experiment)).
+  whose misses the host computes, now in one pass (Flash-Next 1.08 s for +100 tokens against 0.72 s, 1.20 to 1.23 s for
+  +300 against 0.96 s; Ornith-1.5-122B about 1.65 / 1.65 s, see
+  [measurements.md](measurements.md#one-pass-per-turn)). The three checkpoints of a turn are copied to host memory
+  before its first token, about 0.1 s. From 1000 tokens on, the measured host share and the lent memory make the branch
+  faster than Strata (see [measurements.md](measurements.md#measured-host-share-and-lent-memory)).
 - The host's row8 kernels have no unpacker for the K-quants: their `vec_dot` is already among the cheapest of the host's
   types, and an unpacker carrying their minimums did not beat it (see
   [measurements.md](measurements.md#iq2_xs-on-the-host)).
@@ -115,18 +116,19 @@ Speculative decoding, general:
 13. Graph slots and `ggml_backend_sched_new_shared` (`e51d84af8`).
 14. Cumulative draft stop as a parameter, with the draft trace (`ce345f505`, `027048e39`).
 15. Asynchronous catch-up of prompt chunks and the context wait/defer helpers (parts of `acab26f2b`, `8fa30b1ee`).
+16. State marks and a turn in one pass (`d14f39714`, `3e6618196`).
 
 Expert offload, after #30966, best preceded by a design discussion upstream (graph ops that wait on host threads, mapped
 mailboxes, a service thread that must make no CUDA call):
 
-16. Expert prefetch for large batches (`0e80359ad` to `ddd0cfe81`, part of `65dc51115`).
-17. Host mode, its ops and the row8 host kernels (`e1cd4e00f`, `2b37cca0f`, `1f42db592`).
-18. Service-thread policy, cache phases on VMM buffers, re-admission of lent slots, the large phase's buffers in the
+17. Expert prefetch for large batches (`0e80359ad` to `ddd0cfe81`, part of `65dc51115`).
+18. Host mode, its ops and the row8 host kernels (`e1cd4e00f`, `2b37cca0f`, `1f42db592`).
+19. Service-thread policy, cache phases on VMM buffers, re-admission of lent slots, the large phase's buffers in the
     lent memory (`a29262c1e`, `991413bff`, part of `8060a31c7`, `b83aeb575`).
-19. Cache profile (part of `8060a31c7`).
-20. Large batches shared with the host, the share measured (`d8b10a771`, `70d3d4ba7`, `3cce2f756`).
-21. Tail skip, opt-in (`012d9f7ef`).
-22. Exclusive core and memfd host buffers (`170656bca`).
+20. Cache profile (part of `8060a31c7`).
+21. Large batches shared with the host, the share measured (`d8b10a771`, `70d3d4ba7`, `3cce2f756`).
+22. Tail skip, opt-in (`012d9f7ef`).
+23. Exclusive core and memfd host buffers (`170656bca`).
 
 ## Tried and dropped
 

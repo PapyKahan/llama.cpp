@@ -287,13 +287,28 @@ after 2.04 / 1.92 / 2.40 / 2.99, its large batches about 0.1 s longer. Decode af
 warm / code, draft acceptance 0.76 / 0.72 / 0.70) against 45.2 / 44.3 / 44.3 (0.73 / 0.74 / 0.74), the host's time per
 missed expert unchanged (131 µs).
 
-### One pass per turn (experiment)
+### One pass per turn
 
-The server cuts a turn at its checkpoints (the start of the last user message, 4 + `LLAMA_SERVER_CKPT_TAIL` and 4
-tokens before its end), and each small-phase batch reads its missed experts again. With the cuts of turns of up to 4096
-tokens skipped (`LLAMA_SERVER_CKPT_CUTS=0`, uncommitted: the turn then saves no checkpoint), Ornith-1.5-122B with
-`1f42db592`: 1.43 / 1.64 / 2.04 / 2.72 s against 1.83 to 1.85 / 1.78 to 1.81 / 2.23 / 2.85 to 2.86 with the cuts. Saving
-the recurrent state at the checkpoints within the one pass would keep most of that.
+The server cut a turn at its checkpoints (the start of the last user message, 4 + `LLAMA_SERVER_CKPT_TAIL` and 4 tokens
+before its end), and each small-phase batch reads its missed experts again. An experiment that skipped the cuts of turns
+of up to 4096 tokens, and so saved no checkpoint, gave Ornith-1.5-122B with `1f42db592` 1.43 / 1.64 / 2.04 / 2.72 s for
++100 / +300 / +1000 / +3000 against 1.83 to 1.85 / 1.78 to 1.81 / 2.23 / 2.85 to 2.86 with the cuts.
+
+With the checkpoints taken from state marks (`d14f39714`, `3e6618196`), follow-ups alone, the same session:
+
+| | +100 | +300 | +1000 | +3000 |
+|---|---|---|---|---|
+| Ornith-1.5-122B, cut (s) | 1.83 | 1.78 | 2.23 | 2.86 |
+| Ornith-1.5-122B, one pass | 1.64 | 1.66 | 2.07 | 2.75 |
+| Flash-Next, cut | 1.20 | 1.30 | 2.18 | 2.58 |
+| Flash-Next, one pass (two runs) | 1.08 | 1.20 to 1.23 | 2.10 to 2.11 | 2.45 to 2.52 |
+
+The three checkpoints of a short turn are copied in about 35 ms each on Ornith (149 MiB) and 30 ms on Flash-Next
+(112.6 MiB), most of what separates one pass from the experiment. After a greedy conversation (each turn sent twice, the
+second restoring the checkpoint before the end of its prompt and processing 4 tokens), Ornith 1.52 / 2.03 / 2.36 /
+2.85 s against 1.77 to 1.89 / 2.13 to 2.14 / 2.46 / 2.91 to 2.92, and the conversation's second to fourth turns 616 /
+1539 / 636 ms against 747 to 776 / 1741 to 1755 / 802 to 868 ms. Greedy replies differ now and then between two sends
+of a turn, cut or not: which experts the cache holds changes the arithmetic.
 
 ## Pitfalls of measuring here
 
