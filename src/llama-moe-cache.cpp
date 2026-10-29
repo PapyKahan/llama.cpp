@@ -2821,6 +2821,17 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         return hsrc(b.il, b.ip, (int32_t) e);
     }
 
+    ggml_backend_t excl_backend(const ggml_tensor * w) const {
+        if (!excl_on) {
+            return nullptr;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end() || layers[it->second.il].ig < 0) {
+            return nullptr;
+        }
+        return backend(it->second.il);
+    }
+
     bool cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -3122,6 +3133,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
 
 const void * llama_moe_cache::host_data(const ggml_tensor * w, int64_t e) const {
     return pimpl->host_data(w, e);
+}
+
+ggml_backend_t llama_moe_cache::excl_backend(const ggml_tensor * w) const {
+    return pimpl->excl_backend(w);
 }
 
 bool llama_moe_cache::cached(ggml_backend_t backend, const ggml_tensor * w, int64_t e) const {

@@ -1849,6 +1849,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     if (slots == nullptr && ids != nullptr && ids == moe_negative_ids) {
         ggml_mul_mat_id_set_negative_ids(res);
     }
+    // with the exclusive core the host experts are not where w places them: a batch too small to be offloaded would
+    // read them on the CPU, so the device computes it from the experts the scheduler copies (sched_copy_experts)
+    if (slots == nullptr && moe_cache != nullptr) {
+        if (ggml_backend_t b = moe_cache->excl_backend(w); b != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, res, b);
+        }
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);

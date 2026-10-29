@@ -54,6 +54,11 @@ public:
     // the expert has none, it is then in the cache
     const void * host_data(const ggml_tensor * w, int64_t e) const;
 
+    // with the exclusive core, the device that must compute the experts of the host weight w that no slot or host part
+    // takes: their host copies are not where w places them, so the CPU cannot read them from w, and the device gets
+    // them through copy_experts and host_data instead; nullptr without the exclusive core or for a weight not cached
+    ggml_backend_t excl_backend(const ggml_tensor * w) const;
+
     // host mode (LLAMA_MOE_HOST): for small batches the device computes the cached experts of a layer and the host the
     // others (llama-moe-host), a layer posts its request and waits for the answer with these
     struct host_part {
