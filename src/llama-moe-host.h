@@ -57,6 +57,10 @@ public:
     // makes the service thread poll without sleeping for a while: call before a graph that posts requests
     void wake();
 
+    // waits until the service thread serves no request, from the moment it sees one to its answer, while the workers
+    // read the experts from host memory, which other transfers from it slow down; false if timeout_us passed first
+    bool wait_idle(int64_t timeout_us);
+
     // called by the service thread for each request: before_answer while the device waits for the answer, so the
     // device reads no slot table and no slot meanwhile except the slots of layer il, then after_answer, while the
     // device runs on to the next request

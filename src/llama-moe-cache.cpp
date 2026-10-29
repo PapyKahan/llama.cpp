@@ -476,6 +476,15 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     std::vector<publication>          done;
     bool                              quit = false;
 
+    // LLAMA_MOE_UPLOAD_GATE (default on, host mode): the worker starts each upload while the host serves no request,
+    // one at a time, as an upload reads the same memory the host reads the missing experts from; past the timeout it
+    // starts anyway, so the long requests of large batches do not hold the uploads back
+    std::atomic<llama_moe_host *> gate_host{nullptr};
+    int64_t                       gate_timeout_us = 2000;
+    std::atomic<uint64_t>         gate_waits{0};
+    std::atomic<uint64_t>         gate_wait_us{0};
+    std::atomic<uint64_t>         gate_timeouts{0};
+
     // host mode (LLAMA_MOE_HOST): the device posts the experts it does not cache to the host, see llama-moe-host
     // the cache then follows the selection counts the host gathers: every host_period graphs, the experts selected most
     // that are not cached are uploaded in the background, into free slots or over cached experts selected less
@@ -1469,6 +1478,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
 
         LLAMA_LOG_INFO("%s: host mode: up to %d tokens, %d threads, a plan every %d graphs (%d fills, %d swaps), decay %.3f, hysteresis %.2f\n",
             __func__, host_max_tokens, n_threads, host_period, host_max_fills, host_max_swaps, host_decay, host_hyst);
+
+        if (env_i("LLAMA_MOE_UPLOAD_GATE", 1) != 0) {
+            gate_host.store(host.get(), std::memory_order_release);
+            LLAMA_LOG_INFO("%s: host mode: an upload starts while the host serves no request, one at a time\n", __func__);
+        }
 
         if (const char * path = getenv("LLAMA_MOE_CACHE_PROFILE"); path != nullptr && *path != '\0') {
             profile_path = path;
@@ -2632,8 +2646,25 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             if (job.gate) {
                 ggml_backend_event_wait(side[job.dev], gate_ev[job.dev]);
             }
+            llama_moe_host * h = gate_host.load(std::memory_order_acquire);
             for (const upload & u : job.uploads) {
+                if (h != nullptr) {
+                    const int64_t t0 = ggml_time_us();
+                    if (!h->wait_idle(gate_timeout_us)) {
+                        gate_timeouts++;
+                    }
+                    const int64_t dt = ggml_time_us() - t0;
+                    if (dt > 2) {
+                        gate_waits++;
+                        gate_wait_us += dt;
+                    }
+                }
                 ggml_backend_tensor_set_async(side[job.dev], u.bank, u.src, u.offs, u.size);
+                if (h != nullptr) {
+                    // one upload in flight: a request arriving meanwhile waits for one upload at most
+                    ggml_backend_event_record(done_ev[job.dev], side[job.dev]);
+                    ggml_backend_event_synchronize(done_ev[job.dev]);
+                }
             }
             ggml_backend_event_record(done_ev[job.dev], side[job.dev]);
             ggml_backend_event_synchronize(done_ev[job.dev]);
@@ -2679,6 +2710,10 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             if (host_n_fills + host_n_swaps + svc_n_fills + svc_n_swaps > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %zu admitted again after large batches, %lld graphs, %.1f us before each graph\n",
                     host_n_fills + svc_n_fills, host_n_swaps + svc_n_swaps, n_readmitted, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
+            }
+            if (gate_waits > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: uploads waited %llu times for the host to answer, %.1f us each on average, %llu past the timeout\n",
+                    (unsigned long long) gate_waits.load(), (double) gate_wait_us.load()/gate_waits.load(), (unsigned long long) gate_timeouts.load());
             }
             if (excl_on) {
                 size_t n_spare = 0;

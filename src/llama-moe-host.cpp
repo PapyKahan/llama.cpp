@@ -303,6 +303,20 @@ struct llama_moe_host::impl {
     int64_t  t_answer    = 0;
     bool     warned      = false;
 
+    // whether a request is being served, for wait_idle; seq_cst with the count of waiters, so that either the service
+    // thread sees a waiter and notifies it, or the waiter sees the request answered
+    std::atomic<bool>       serving{false};
+    std::atomic<int>        idle_waiters{0};
+    std::mutex              mtx_idle;
+    std::condition_variable cv_idle;
+    void set_serving(bool on) {
+        serving.store(on);
+        if (!on && idle_waiters.load() > 0) {
+            std::lock_guard<std::mutex> lk(mtx_idle);
+            cv_idle.notify_all();
+        }
+    }
+
     // LLAMA_MOE_HOST_STATS=<n>: the misses of every n requests, to follow the hit rate along a conversation
     uint64_t st_every    = 0;
     uint64_t st_prev[5]  = {}; // requests, tokens, entries, misses, skipped at the last report
@@ -1101,6 +1115,7 @@ struct llama_moe_host::impl {
                 if (seq != last_seq[m]) {
                     last_seq[m] = seq;
                     const int64_t t_seen = moe_host_now_ns();
+                    set_serving(true);
                     if (t_seen - t_answer < 5*1000*1000) {
                         st_turn_ns += t_seen - t_answer;
                         st_turn_n++;
@@ -1108,11 +1123,13 @@ struct llama_moe_host::impl {
                     if (is_batch[m]) {
                         serve_batch(mailboxes[m], seq);
                         t_answer = moe_host_now_ns();
+                        set_serving(false);
                         got = true;
                         continue;
                     }
                     const int32_t il = serve(mailboxes[m], seq);
                     t_answer = moe_host_now_ns();
+                    set_serving(false);
                     st_serve_ns += t_answer - t_seen;
                     if (lis != nullptr && il >= 0) {
                         lis->after_answer(il);
@@ -1189,6 +1206,18 @@ void llama_moe_host::add_batch_mailbox(void * mailbox, int32_t max_batch) {
 
 void llama_moe_host::wake() {
     pimpl->wake();
+}
+
+bool llama_moe_host::wait_idle(int64_t timeout_us) {
+    impl & p = *pimpl;
+    if (!p.serving.load()) {
+        return true;
+    }
+    std::unique_lock<std::mutex> lk(p.mtx_idle);
+    p.idle_waiters++;
+    const bool idle = p.cv_idle.wait_for(lk, std::chrono::microseconds(timeout_us), [&] { return !p.serving.load(); });
+    p.idle_waiters--;
+    return idle;
 }
 
 void llama_moe_host::set_listener(listener * l) {
