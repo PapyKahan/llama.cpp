@@ -2495,6 +2495,25 @@ void common_prompt_checkpoint::update_tgt(
     }
 }
 
+bool common_prompt_checkpoint::update_tgt_mark(
+        llama_context * ctx,
+        llama_seq_id seq_id,
+        int32_t i,
+        llama_state_seq_flags flags) {
+    const size_t ckpt_size = ctx != nullptr ? llama_state_seq_get_size_mark(ctx, seq_id, i, flags) : 0;
+    if (ckpt_size == 0) {
+        return false;
+    }
+
+    data_tgt.resize(ckpt_size);
+
+    const size_t n = llama_state_seq_get_data_mark(ctx, data_tgt.data(), ckpt_size, seq_id, i, flags);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    return true;
+}
+
 void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,

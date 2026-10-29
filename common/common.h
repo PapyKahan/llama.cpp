@@ -1338,6 +1338,13 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
+    // the state the last decode kept at its state mark i (llama_set_state_marks), false if it kept none
+    bool update_tgt_mark(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t i,
+            llama_state_seq_flags flags);
+
     void update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,

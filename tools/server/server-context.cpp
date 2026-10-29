@@ -174,6 +174,12 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // the slot whose prompt runs in this batch past positions it checkpoints at: the decode keeps the recurrent state
+    // at each (llama_set_state_marks), which becomes a checkpoint after it; the batch then holds this slot alone
+    server_slot *          mark_slot = nullptr;
+    std::vector<int64_t>   mark_n_tokens;
+    std::vector<llama_pos> mark_pos;
+
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
@@ -211,6 +217,9 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        mark_slot         = nullptr;
+        mark_n_tokens.clear();
+        mark_pos.clear();
     }
 
     int32_t size() const {
@@ -2771,14 +2780,50 @@ private:
         return true;
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // the checkpoints of the marks the last decode kept (server_batch::mark_slot), the oldest first, each under the
+    // conditions a batch starting there would have created it with; the marks outside the decoded view stay for the next
+    void create_mark_checkpoints() {
+        server_slot & slot = *batch.mark_slot;
+        const auto last_user_pos = slot.task->params.message_spans.last_user_message_pos();
+
+        std::vector<int64_t>   n_tokens_left;
+        std::vector<llama_pos> pos_left;
+        for (size_t i = 0; i < batch.mark_n_tokens.size(); ++i) {
+            const int64_t   n_tokens = batch.mark_n_tokens[i];
+            const llama_pos pos      = batch.mark_pos[i];
+            if (llama_state_seq_get_size_mark(ctx_tgt, slot.id, (int32_t) i, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+                n_tokens_left.push_back(n_tokens);
+                pos_left.push_back(pos);
+                continue;
+            }
+            const auto & checkpoints     = slot.prompt.checkpoints;
+            const bool   near_prompt_end = slot.task->n_tokens() < n_tokens + llama_n_ubatch(ctx_tgt);
+            if (checkpoints.empty() || n_tokens == last_user_pos || near_prompt_end ||
+                    n_tokens > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                create_checkpoint(slot, n_tokens, pos - 1, pos - 1, (int32_t) i);
+            }
+        }
+
+        batch.mark_n_tokens = std::move(n_tokens_left);
+        batch.mark_pos      = std::move(pos_left);
+        if (batch.mark_n_tokens.empty()) {
+            batch.mark_slot = nullptr;
+        }
+    }
+
+    // n_tokens_new: the tokens the checkpoint covers; mark: the state mark the last decode kept there
+    // (llama_set_state_marks), -1 for the current state
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_new, llama_pos pos_min, llama_pos pos_max, int32_t mark = -1) {
         const int id_task = slot.task->id;
+
+        if (mark >= 0 && llama_state_seq_get_size_mark(ctx_tgt, slot.id, mark, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            SLT_WRN(slot, "no state kept at n_tokens = %" PRId64 ", no context checkpoint there\n", n_tokens_new);
+            return;
+        }
 
         // the state is a checkpoint already, the one just restored: it becomes the newest checkpoint of this task, as a
         // new copy would, without the copy
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             auto & checkpoints = slot.prompt.checkpoints;
             const auto it = std::find_if(checkpoints.begin(), checkpoints.end(),
                     [&](const common_prompt_checkpoint & c) { return c.n_tokens == n_tokens_new; });
@@ -2821,7 +2866,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -2839,9 +2883,13 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_new, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (mark >= 0) {
+            cur.update_tgt_mark(ctx_tgt, slot.id, mark, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4053,6 +4101,11 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
+                // a prompt with state marks has the batch to itself
+                if (batch.mark_slot != nullptr) {
+                    return;
+                }
+
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
                     return;
                 }
@@ -4551,9 +4604,31 @@ private:
                         return v != nullptr && atoi(v) > 0 ? atoi(v) : INT32_MAX;
                     }();
                     const int32_t n_tail = slot.task->n_tokens() - n_ckpt_tail - slot.prompt.n_tokens() > n_ckpt_tail_max ? 4 : n_ckpt_tail;
+                    // the prompt runs on past the positions it checkpoints at: the decode keeps the recurrent state at
+                    // each (llama_set_state_marks), and the checkpoints are taken from those once it is done, instead of
+                    // after a batch that ends there; the batch then holds this slot alone. LLAMA_SERVER_ONE_PASS=0 ends a
+                    // batch at each checkpoint
+                    static const bool one_pass = [] {
+                        const char * v = getenv("LLAMA_SERVER_ONE_PASS");
+                        return v == nullptr || atoi(v) != 0;
+                    }();
+                    const int32_t n_marks_max = one_pass && do_checkpoint && batch.size() == 0 && !has_mtmd &&
+                        slot.task->n_tokens_shared == 0 && !slot.task->is_parent() && alora_scale <= 0.0f ?
+                        llama_n_state_marks(ctx_tgt) : 0;
+                    // keeps the checkpoint a batch ending here would leave as a mark, false when there are as many as
+                    // the context keeps
+                    auto mark_here = [&]() {
+                        if ((int32_t) batch.mark_n_tokens.size() >= n_marks_max) {
+                            return false;
+                        }
+                        batch.mark_slot = &slot;
+                        batch.mark_n_tokens.push_back(slot.prompt.n_tokens());
+                        batch.mark_pos.push_back(slot.prompt.tokens.pos_next());
+                        return true;
+                    };
                     int32_t n_batch_slot = n_batch;
                     if (balanced_chunks && batch.size() == 0) {
-                        const int32_t n_end  = slot.task->n_tokens() - (do_checkpoint ? n_tail : 0);
+                        const int32_t n_end  = slot.task->n_tokens() - (do_checkpoint && n_marks_max == 0 ? n_tail : 0);
                         const int32_t n_left = n_end - slot.prompt.n_tokens();
                         if (n_left > n_batch) {
                             const int32_t n_chunks = (n_left + n_batch - 1)/n_batch;
@@ -4604,8 +4679,10 @@ private:
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
+                            const int64_t n_last = !batch.mark_n_tokens.empty() ? batch.mark_n_tokens.back() :
+                                                   !checkpoints.empty() ? checkpoints.back().n_tokens : -1;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if ((pos == last_user_pos || n_last < 0 || pos > n_last + params_base.checkpoint_min_step) && !mark_here()) {
                                 break;
                             }
                         }
@@ -4626,10 +4703,19 @@ private:
                                     break;
                                 }
                             }
-                            if (should_break) {
+                            if (should_break && !mark_here()) {
                                 break;
                             }
                         }
+                    }
+
+                    // a mark where the batch ends is the state the next batch starts from, which it checkpoints itself
+                    while (!batch.mark_n_tokens.empty() && batch.mark_n_tokens.back() == slot.prompt.n_tokens()) {
+                        batch.mark_n_tokens.pop_back();
+                        batch.mark_pos.pop_back();
+                    }
+                    if (batch.mark_n_tokens.empty()) {
+                        batch.mark_slot = nullptr;
                     }
 
                     // the number of tokens added to the batch for the current slot
@@ -4685,7 +4771,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_start, pos_min, pos_max);
                     }
                 }
 
@@ -4787,6 +4873,11 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // the state marks of the prompt in the batch, see server_batch::mark_slot
+        if (batch.mark_slot != nullptr) {
+            llama_set_state_marks(ctx_tgt, batch.mark_slot->id, batch.mark_pos.data(), (int32_t) batch.mark_pos.size());
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4848,6 +4939,12 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
+        }
+
+        // the marks the decode kept become checkpoints before the next decode replaces them, and before the drafter
+        // catches up on the batch, as a batch ending at each would have left them
+        if (batch.mark_slot != nullptr) {
+            create_mark_checkpoints();
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
