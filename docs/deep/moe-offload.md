@@ -22,7 +22,9 @@ upload its misses and does not split its graph between the GPU and the CPU backe
    expert ids, their routing weights, the layer input and, per selected expert, its cache slot or -1. It then publishes a
    sequence number.
 2. The device computes its cached experts and the shared expert as usual; a missing expert reads one of the zero slots
-   that follow the cached ones in each bank, so it contributes nothing on the device.
+   that follow the cached ones in each bank, so it contributes nothing on the device. qwen4exp and qwen35moe (commit
+   `14b13ca2c`) add the host's experts after the shared expert (`moe_host_defer`), so it runs before the wait rather
+   than after the answer.
 3. On the host, a service thread polls the mailboxes and hands the missing experts of each request to a worker pool
    (`LLAMA_MOE_HOST_THREADS`, default half the hardware threads minus one), which computes them with ggml-cpu's dot
    products on the host copies, and writes the answer `y` into the mailbox.

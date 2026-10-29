@@ -189,3 +189,5 @@ first:
 | `d14f39714` | state marks: the recurrent state kept at given positions of a decode |
 | `3e6618196` | server: a turn in one pass, its checkpoints from state marks (`LLAMA_SERVER_ONE_PASS`) |
 | `8c02bccc0` | the cache's uploads start while the host serves no request (`LLAMA_MOE_UPLOAD_GATE`) |
+| `14b13ca2c` | qwen35moe computes its shared expert before the host's answer |
+| `6fa669b10` | CUDA: a thread per element for a non-contiguous concat with a short dim 0 |

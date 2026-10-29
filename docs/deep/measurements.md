@@ -352,6 +352,31 @@ and 129.5, 767 and 799 µs per request with CPU work against 827 and 820, the sa
 Flash-Next, whose host phase is shorter, one run each: 73.1 µs per expert against 73.9, decode 112.84 / 107.89 / 103.22
 against 113.52 / 109.28 / 100.06.
 
+### Ornith-1.5-122B decode: slots, drafter, the device's own work
+
+Two slots instead of three take 596 MiB of recurrent state and rollback groups off the GPU, given to the expert cache
+(13600 MiB): 48.17 / 47.56 / 44.63 and 47.86 / 44.92 / 46.60 tok/s, misses 32.3 and 32.6 %, against 44.98 and 44.29
+on average with three slots and 13000 MiB, the same build (`8c02bccc0`); its follow-ups peaked at 24115 MiB on GPU0,
+against at most 24027 with three slots, so the profile takes 13500 MiB (23957 to 23959 MiB at peak).
+
+The drafter requantized from Q8_0 (a draft call, up to three tokens, `dur(g)` of the speculative statistics; the share of
+the drafts accepted at each position; decode on average over cold, warm and code), two runs each:
+
+| drafter | per draft call | accepted at positions 1 / 2 / 3 | decode |
+|---|---|---|---|
+| Q8_0 | 3.05, 3.19 ms | 0.78 to 0.84 / 0.46 to 0.51 / 0.24 to 0.27 | 46.8, 46.5 |
+| Q6_K | 2.61, 2.66 ms | 0.77 to 0.78 / 0.42 to 0.43 / 0.20 to 0.22 | 46.7, 44.7 |
+| Q5_K_M | 2.54, 2.54 ms | 0.79 to 0.81 / 0.40 to 0.43 / 0.19 to 0.21 | 45.9, 45.7 |
+
+The lighter drafters save about half a millisecond a step and lose more in the later drafts: Q8_0 stays.
+
+The device's own work between an answer and the next request (the host statistics' turnaround), with the shared expert
+before the wait (`14b13ca2c`) and the concat of a thread per element (`6fa669b10`), alternated with `2ac12a39e`, two
+slots and 13500 MiB both: 243.1 and 234.9 µs against 273.1 and 272.3; decode 47.69 / 49.43 / 46.19 and 46.48 / 48.17 /
+46.30 against 45.56 / 45.50 / 45.49 and 46.27 / 45.34 / 47.29; follow-ups 2.01 to 2.17 / 1.74 to 1.75 / 2.08 to 2.10 /
+2.74 to 2.77 s against 2.03 to 2.12 / 1.72 to 1.79 / 2.08 to 2.18 / 2.77 to 2.87. Small phase KLD 0.1269 ± 0.0038
+against 0.1259 (the sums in another order).
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the
