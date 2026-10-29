@@ -118,3 +118,7 @@ at 84K.
 - n-gram drafting (`ngram-simple`) ahead of the MTP: its drafts are not capped by `--spec-draft-n-max`, so 10–23-token
   windows broke the verification shape; capped at three tokens it found no drafts.
 - A fifth verification slot (`n_max 4`): a 5-token verification costs more than its extra drafts return here.
+- A DSpark drafter on Mistral-Small-4-119B (RedHatAI's speculator, Q8_0 on the 3090, `b33086b5f`), whose model has
+  no MTP layer: 48–57 % of the drafts accepted at temperature 0.7 (2.4–2.7 tokens a step), decode 28–34 tok/s against
+  32–35 without a drafter; capped at three tokens with `p_min` 0.4, 22–31 tok/s. Each verified token adds the experts
+  the host reads, and with four experts of 128 per layer a few tokens already select most of the misses.

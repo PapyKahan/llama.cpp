@@ -234,6 +234,14 @@ have no host copy:
   `hloc`, the host slot of each expert or -1). Host mode, the uploads, the expert prefetch and the scheduler's expert
   copies all read it (`llama_moe_cache::host_data`, `llama_moe_host::layer::ptrs`). A host slot is any expert position
   of a layer of the same group, since they all have the same size.
+- **Two expert reads cannot go through the table**, since ggml reads an expert at its own position in the tensor. The
+  CPU part of a batch (`--moe-cache-cpu-share`) takes only the misses whose host copy is still at its own position
+  (`hloc` equal to its key, commit `dee73e4e0`); the others are uploaded like any miss. An expert batch that neither a
+  slot map nor a host part takes, such as the last ubatch of a large-phase batch below the CUDA offload threshold
+  (`GGML_OP_OFFLOAD_MIN_BATCH`), runs on the device that caches the layer (`llama_moe_cache::excl_backend`, commit
+  `be68ef8f6`), which reads its experts through the scheduler's copies. Before these two, Mistral-Small-4-119B (Q3_K
+  experts) read moved or released copies on the CPU: a segfault under the guard below, another expert's weights
+  without it.
 - **At start**, once the profile filled the slots, each layer is compacted: the experts that keep a host copy and sit in
   the last positions move into the positions of the layer's exclusive experts in front of them. The positions left at the
   end of each bank are given back once (`ggml_backend_host_release` punches them out of the memfd), except a few spare
@@ -257,7 +265,7 @@ serving 13.0–13.3 GiB instead of 5.4–5.5. About 48 downloads per decode grap
 The full 47.7 GiB is still loaded first: the release happens about 20 s after the model is loaded.
 
 `GGML_CUDA_HOST_MEMFD_GUARD=1` makes the given-back pages inaccessible, so a stray read faults instead of bringing
-memory back; it caught nothing in any run.
+memory back; it caught nothing on Flash-Next or Ornith, and the two CPU reads above on Mistral-Small-4-119B.
 
 ### memfd host buffers
 

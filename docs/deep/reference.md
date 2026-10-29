@@ -191,3 +191,6 @@ first:
 | `8c02bccc0` | the cache's uploads start while the host serves no request (`LLAMA_MOE_UPLOAD_GATE`) |
 | `14b13ca2c` | qwen35moe computes its shared expert before the host's answer |
 | `6fa669b10` | CUDA: a thread per element for a non-contiguous concat with a short dim 0 |
+| `dee73e4e0` | exclusive core: the CPU part takes only the misses whose host copy is in place |
+| `be68ef8f6` | exclusive core: the device computes the expert batches no slot map or host part takes |
+| `b33086b5f` | DFlash and DSpark drafters for deepseek2 / mistral4 targets (layer inputs, converter vocabulary) |
