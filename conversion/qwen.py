@@ -820,6 +820,9 @@ class DFlashModel(Qwen3Model):
             target_hparams = json.load(f)
         target_arch = get_model_architecture(target_hparams, ModelType.TEXT)
         target_cls = get_model_class(target_arch)
+        # a wrapper that converts through an inner model names the class whose set_vocab reads the tokenizer
+        if hasattr(target_cls, "vocab_class"):
+            target_cls = target_cls.vocab_class(target_hparams)  # ty: ignore[unresolved-attribute]
 
         if target_cls is not type(self):
             if target_arch == "NemotronHForCausalLM":

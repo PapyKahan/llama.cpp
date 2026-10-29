@@ -76,6 +76,14 @@ class Mistral3Model(TextModel):
         else:
             self.impl = Mistral3Model.Ministral3Model(dir_model, *args, **kwargs)
 
+    @staticmethod
+    def vocab_class(hparams: dict) -> type[TextModel]:
+        # the inner model whose set_vocab converts this config's tokenizer, for a drafter (DFlash, DSpark) that takes
+        # its vocabulary from a Mistral 3 or 4 target and has no inner model of its own
+        if hparams.get("text_config", hparams).get("model_type") == "mistral4":
+            return Mistral3Model.Mistral4Model
+        return Mistral3Model.Ministral3Model
+
     def set_vocab(self):
         self.impl.set_vocab()
 
