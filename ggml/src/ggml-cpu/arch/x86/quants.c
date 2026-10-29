@@ -4207,6 +4207,25 @@ static inline void row8_put(int8_t * q, __m256i v, int16_t * sc, int lo, int hi,
     *d = dv;
 }
 
+static void row8_unpack_iq2_xs(const block_iq2_xs * GGML_RESTRICT x, int64_t n, int8_t * GGML_RESTRICT q, int16_t * GGML_RESTRICT sc, float * GGML_RESTRICT d) {
+    for (int64_t i = 0; i < n/QK_K; ++i) {
+        // (0.5 + scale)*0.25 = (2*scale + 1)*0.125
+        const float db = GGML_CPU_FP16_TO_FP32(x[i].d)*0.125f;
+        const uint16_t * qs = x[i].qs;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            // per 8 weights, 9 bits of grid index and 7 picking their signs among the sign bytes of even parity
+            const __m256i g = _mm256_set_epi64x(iq2xs_grid[qs[3] & 511], iq2xs_grid[qs[2] & 511],
+                                                iq2xs_grid[qs[1] & 511], iq2xs_grid[qs[0] & 511]);
+            const __m256i sg = row8_signs32(ksigns_iq2xs[qs[0] >> 9] | ((uint32_t) ksigns_iq2xs[qs[1] >> 9] << 8) |
+                                            ((uint32_t) ksigns_iq2xs[qs[2] >> 9] << 16) | ((uint32_t) ksigns_iq2xs[qs[3] >> 9] << 24));
+            qs += 4;
+            const int s = x[i].scales[ib32];
+            row8_put(q, _mm256_sub_epi8(_mm256_xor_si256(g, sg), sg), sc, 2*(s & 0xf) + 1, 2*(s >> 4) + 1, d, db);
+            q += 32; sc += 2; d += 1;
+        }
+    }
+}
+
 static void row8_unpack_iq2_s(const block_iq2_s * GGML_RESTRICT x, int64_t n, int8_t * GGML_RESTRICT q, int16_t * GGML_RESTRICT sc, float * GGML_RESTRICT d) {
     for (int64_t i = 0; i < n/QK_K; ++i) {
         // (0.5 + scale)*0.25 = (2*scale + 1)*0.125
@@ -4319,6 +4338,7 @@ static void row8_unpack_q2_0(const block_q2_0 * GGML_RESTRICT x, int64_t n, int8
 
 bool ggml_row8_unpack_avx2(enum ggml_type type, const void * GGML_RESTRICT row, int64_t n, int8_t * GGML_RESTRICT q, int16_t * GGML_RESTRICT sc, float * GGML_RESTRICT d) {
     switch (type) {
+        case GGML_TYPE_IQ2_XS:  row8_unpack_iq2_xs ((const block_iq2_xs  *) row, n, q, sc, d); return true;
         case GGML_TYPE_IQ2_S:   row8_unpack_iq2_s  ((const block_iq2_s   *) row, n, q, sc, d); return true;
         case GGML_TYPE_IQ3_XXS: row8_unpack_iq3_xxs((const block_iq3_xxs *) row, n, q, sc, d); return true;
         case GGML_TYPE_IQ3_S:   row8_unpack_iq3_s  ((const block_iq3_s   *) row, n, q, sc, d); return true;

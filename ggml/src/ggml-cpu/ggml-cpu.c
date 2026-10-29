@@ -422,6 +422,7 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
 bool ggml_cpu_row8_supported(enum ggml_type type) {
 #if defined(__AVX2__)
     switch (type) {
+        case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
