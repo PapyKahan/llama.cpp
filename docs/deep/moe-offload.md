@@ -65,7 +65,9 @@ admissions into free slots, then replacements of cached experts by uncached ones
 While the device waits for the answer of a layer, the thread publishes the uploads that are done and evicts the victims
 of a few swaps (not of that layer, whose slots the device may be reading); right after the answer it hands their
 uploads to an upload worker on a second stream, while the device computes up to the next request and the CPU has
-nothing to do.
+nothing to do. The CPU and the uploads read the same host memory and share its bandwidth, and the uploads of two swaps
+outlast the device's work up to the next request: the worker starts each upload while the host serves no request, one
+at a time, and one waiting past 2 ms starts anyway (commit `8c02bccc0`, `LLAMA_MOE_UPLOAD_GATE`).
 
 The service thread makes no CUDA call: a graph that waits for an answer may hold the driver while it is being launched,
 and a call from the thread that must answer would deadlock until the wait's timeout.
@@ -75,6 +77,7 @@ and a call from the thread that must answer would deadlock until the wait's time
 | `LLAMA_MOE_HOST_SWAPS` | 96 | replacements planned per graph |
 | `LLAMA_MOE_HOST_FILLS` | 192 | admissions into free slots per graph |
 | `LLAMA_MOE_HOST_PER_REQUEST` | 2 | swaps started per request |
+| `LLAMA_MOE_UPLOAD_GATE` | 1 | an upload starts while the host serves no request; 0: as soon as queued |
 | `LLAMA_MOE_HOST_DECAY` | 0.9 | decay of the selection counts per plan |
 | `LLAMA_MOE_HOST_HYST` | 1.0 | a victim must be selected this many times less than its successor |
 | `LLAMA_MOE_HOST_POLICY=graph` | | the earlier policy: a plan every `LLAMA_MOE_HOST_PERIOD` (4) graphs on the main thread, `LLAMA_MOE_HOST_MAX_SWAPS` (32), `LLAMA_MOE_HOST_MAX_FILLS` (1024), decay 0.97, hysteresis 1.25 |

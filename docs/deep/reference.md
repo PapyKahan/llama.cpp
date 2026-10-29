@@ -17,6 +17,7 @@ become parameters.
 | `LLAMA_MOE_HOST_SWAPS` | 96 | | service policy: replacements planned per graph |
 | `LLAMA_MOE_HOST_FILLS` | 192 | | service policy: admissions into free slots per graph |
 | `LLAMA_MOE_HOST_PER_REQUEST` | 2 | | service policy: swaps started per host request |
+| `LLAMA_MOE_UPLOAD_GATE` | on | on | an upload of the cache starts while the host serves no request, one at a time |
 | `LLAMA_MOE_HOST_DECAY` | 0.9 (graph policy 0.97) | | decay of the selection counts per plan |
 | `LLAMA_MOE_HOST_HYST` | 1.0 (graph policy 1.25) | | a victim is selected this many times less than its successor |
 | `LLAMA_MOE_HOST_PERIOD` | 4 | | graph policy: graphs between two plans |
@@ -187,3 +188,4 @@ first:
 | `1f42db592` | host kernels unpack IQ2_XS rows too |
 | `d14f39714` | state marks: the recurrent state kept at given positions of a decode |
 | `3e6618196` | server: a turn in one pass, its checkpoints from state marks (`LLAMA_SERVER_ONE_PASS`) |
+| `8c02bccc0` | the cache's uploads start while the host serves no request (`LLAMA_MOE_UPLOAD_GATE`) |

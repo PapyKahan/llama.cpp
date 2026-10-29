@@ -310,6 +310,48 @@ second restoring the checkpoint before the end of its prompt and processing 4 to
 1539 / 636 ms against 747 to 776 / 1741 to 1755 / 802 to 868 ms. Greedy replies differ now and then between two sends
 of a turn, cut or not: which experts the cache holds changes the arithmetic.
 
+### Ornith-1.5-122B decode, where the time goes
+
+2026-10-29, `bd5510406`, the profile's settings. An Nsight Systems trace of 4 s of decoding with the kernels inside the
+graphs (`--cuda-graph-trace=node`, which slows the step a little), per verification step (median of 64, about 2.4
+tokens): 54.0 ms of graph, of which 34.2 ms the device waits for the host, 18.1 ms of its own kernels and 1.8 ms between
+them, then 7.5 ms before the next graph, 3.5 ms of it the three drafts on the second GPU. A DeltaNet layer runs 51
+kernels: six Q6_K matrix-vector products over 80 MB of weights take 113 µs (708 GB/s), the cached experts 133 µs while
+the host computes the others, and about 40 small kernels 125 µs (a non-contiguous concat 15 µs, the gather of the 4 MiB
+recurrent state 9 µs). Between graphs the main thread spends about 0.6 ms of its own (sampling, `seq_rm` over the 262K
+cells, graph preparation), the rest waiting on the devices; a draft token reads about 350 MB of Q8_0 weights (the layer,
+and the head's 49K rows), about 1.07 ms.
+
+The host's misses are bound by host memory. On this machine plain reads reach 34.5 GB/s from two threads up: the DDR4
+runs at 2400 MT/s, as configured, its DIMMs being rated 3200 with their XMP profile. The host's dot products of a
+request of 7 IQ3_S experts read 33.8 GB/s at 11 threads, 35.4 to 36.1 from 12 to 23 (IQ4_XS: memory-bound at any count);
+the engine's workers about 31 GB/s. The GPU reading host memory adds nothing: with it reading at 13.3 GB/s, by copies or
+by a kernel, the CPU's dot products fall from 35.5 to 24.1 to 25.1 GB/s.
+
+Decode with other settings (tok/s cold / warm / code, then the experts missing, the experts the CPU computes per request
+and its time per expert):
+
+| | decode | missing | per request | per expert |
+|---|---|---|---|---|
+| profile (two runs) | 46.25 / 44.27 / 42.54, 46.87 / 43.95 / 42.86 | 31.0 %, 32.1 % | 5.90, 6.11 | 129 µs |
+| 24 replacements per graph | 44.14 / 41.94 / 42.77 | 36.2 % | 6.85 | 127 µs |
+| 12 replacements per graph | 41.97 / 41.44 / 40.79 | 37.6 % | 6.98 | 123 µs |
+| 12 host threads | 42.19 / 43.85 / 41.37 | 33.2 % | 6.22 | 132 µs |
+| one slot, a 14100 MiB cache | 47.96 / 46.41 / 45.42 | 28.1 % | 5.41 | 131 µs |
+
+A replay of a decode trace (`simsweep3.py`, the service policy, 48 replacements) gives the hits a larger cache would
+have: 69.4 % at the profile's 28.2 % of the expert bytes, 71.6 % at 30.6 %, 73.2 % at 32.5 %, 74.9 % at 34.7 %. A
+second, static tier holding the experts the trace selects most among those the first lacks adds 0.64 points at 3 % of
+the bytes and 1.11 at 4.5 %: a cache that follows the conversation already holds what matters.
+
+The uploads of the replacements overlapped the host's requests 64 % of their time, as if at random (the host serves a
+request 68 % of the time), the downloads of the exclusive core 5 %. With each upload started while the host serves no
+request (`8c02bccc0`), alternated with the uploads as queued, two runs each: 121.6 and 122.4 µs per expert against 130.2
+and 129.5, 767 and 799 µs per request with CPU work against 827 and 820, the same misses (33.1 / 34.1 % against 33.4 /
+32.9 %); decode 47.04 / 46.45 / 41.46 and 46.86 / 42.69 / 43.32 against 45.25 / 42.59 / 42.32 and 42.61 / 44.43 / 45.95.
+Flash-Next, whose host phase is shorter, one run each: 73.1 µs per expert against 73.9, decode 112.84 / 107.89 / 103.22
+against 113.52 / 109.28 / 100.06.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the
