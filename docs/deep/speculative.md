@@ -109,6 +109,64 @@ draft as it is drafted; a thread owned by the model reads its rows, and the veri
 rows not read yet. The gather then costs 0.043 ms per verification; the step is 1.0 % faster at short context and 1.4 %
 at 84K.
 
+## Mistral-Small-4's EAGLE head
+
+Commit `f28d03ff7`. Mistral-Small-4-119B has no MTP layer; Mistral ships an EAGLE drafter for it
+(`mistralai/Mistral-Small-4-119B-2603-eagle`, 392M parameters in FP8). `eagle_linear` projects the concatenation of the
+embedding of the token just sampled and the target's last hidden state after its final norm (embedding first, no
+input norms); two MLA decoder layers with a dense SwiGLU FFN follow, then the head's own final norm and the target's
+LM head, and a further draft step feeds the head's normed output back (vLLM's `mistral_large_3_eagle.py`). That is the
+deepseek2 family's MTP head with more than one layer, so it runs as one:
+
+- `<arch>.nextn_head_layers` (default 1) gives the number of nextn layers that form one head. The MTP driver counts
+  heads (`llama_model_n_layer_nextn_head()`), so the two layers are one draft step, not two heads chained one per step.
+- The deepseek2 loader gives a nextn layer without a router a dense FFN, requires `nextn.eh_proj` only on a head's
+  first layer, and lets a stacked head go without `enorm`/`hnorm`. `graph_mtp` runs each layer of the head and applies
+  the trunk's attention temperature scaling when the model has it.
+- `mistral4` builds deepseek2's graphs, the MTP graph included; before, it built the trunk graph for an MTP context too.
+
+The drafter GGUF is MTP-only: `block_count` 38, the head's layers as blocks 36 and 37 in Q8_0, plus the target's token
+embedding, output norm and LM head copied in, so the head runs whole on the 3070 Ti (0.8 GiB of weights and a q8_0
+KV). Mistral's consolidated checkpoint has the layout of the target's Hugging Face tensors (byte-identical on layer 0),
+each FP8 weight multiplied by its `qscale_weight` (equal to the Hugging Face file's `weight_scale_inv`), and `wkv_b`
+splits into `k_b` and `v_b` as for the target: converted that way, the target's layer 0 matches llama.cpp's own
+conversion bit for bit.
+
+Measured on the GSQ-RCO IQ3_S build, in host mode with a 17000 MiB decode cache, the head on the 3070 Ti, temperature
+0.7:
+
+- The head drafts well: with three drafts a step, 84–86 % of the first drafts are accepted, and about 80 % of each next
+  draft once the one before it was (unconditionally 0.84–0.86, 0.68–0.72, 0.54–0.59), 3.1 tokens a step. A draft
+  step costs 1.8 ms on the 3070 Ti.
+- The verification is what costs. With synthetic acceptance (`--spec-synth-rates 1.0,…`, which accepts the drafts
+  whatever they are; DSpark's drafts, with a 14500 MiB cache so that DSpark fits), a step that verifies 1, 2, 3 or 4
+  tokens costs 28.8, 44.7, 66.6 or 79.6 ms with the drafter's time taken out. Each token after the first adds
+  0.45–0.75 of a step, the experts it brings for the host to read; with every draft accepted, one draft a step would
+  gain 19 % and three 37 %. A draft therefore pays only when its chance is above about 0.6, and the stop rule decides
+  the outcome.
+- On eight prompts (half with reasoning, about 4.5K generated tokens; no drafter 35.9 and 35.5 tok/s in two runs):
+
+  | Draft rule | tok/s | Accepted |
+  |---|---|---|
+  | three drafts, `p_min 0` | 33.7 | 57 % |
+  | three drafts, `p_min 0.7` | 34.6 | 58 % |
+  | three drafts, `p_min 0.8` | 36.8 | 74 % |
+  | two drafts, `p_min 0.6` | 38.9 | 86 % |
+  | two drafts, `p_min 0.7` | 39.0–39.5 | 90 % |
+  | two drafts, `p_min 0.8` | 39.2 | 94 % |
+  | one draft, `p_min 0.7` | 38.0 | 93 % |
+  | one draft, `p_min 0.5` | 37.8 | 86 % |
+
+- The cumulative draft stop loses here: at `p_min 0.3` the three-prompt decode suite ran at 33.3 tok/s against 41.7
+  without a drafter, with only 45 % of the first drafts accepted. A draft trace shows that, at a given confidence, its
+  drafts are accepted as often as with a fixed draft length, but a draft cut at an uncertain token makes the next step
+  start there, so more of the first drafts are uncertain ones. The trimmed draft vocabulary loses too: Mistral's
+  tokenizer gives common tokens ids beyond the first 32K, so the first-draft acceptance fell from 86 to 81 % for 1 ms
+  less a step.
+- With two drafts at `p_min 0.7` and the asynchronous catch-up, prefill from 2.9K to 93K tokens and the follow-ups
+  stay within 3 % of no drafter (the 3000-token follow-up 6 % slower), decode at 225K rises from 25.7 to 27.3 tok/s,
+  and the 3090 peaks about 190 MiB higher.
+
 ## What did not work
 
 - Drafting the next window on the second GPU while the target verifies: a hit (window wholly accepted and the drafter's
@@ -121,4 +179,5 @@ at 84K.
 - A DSpark drafter on Mistral-Small-4-119B (RedHatAI's speculator, Q8_0 on the 3090, `b33086b5f`), whose model has
   no MTP layer: 48–57 % of the drafts accepted at temperature 0.7 (2.4–2.7 tokens a step), decode 28–34 tok/s against
   32–35 without a drafter; capped at three tokens with `p_min` 0.4, 22–31 tok/s. Each verified token adds experts for
-  the host to read, which probably costs about what the accepted drafts return (not profiled).
+  the host to read, 0.45–0.75 of a step (measured since, see [Mistral-Small-4's EAGLE head](#mistral-small-4s-eagle-head)),
+  about what the accepted drafts return.

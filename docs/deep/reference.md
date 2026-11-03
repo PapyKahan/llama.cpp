@@ -194,3 +194,4 @@ first:
 | `dee73e4e0` | exclusive core: the CPU part takes only the misses whose host copy is in place |
 | `be68ef8f6` | exclusive core: the device computes the expert batches no slot map or host part takes |
 | `b33086b5f` | DFlash and DSpark drafters for deepseek2 / mistral4 targets (layer inputs, converter vocabulary) |
+| `f28d03ff7` | stacked MTP heads (`<arch>.nextn_head_layers`): Mistral-Small-4's EAGLE head; mistral4 builds the MTP graph |
