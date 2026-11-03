@@ -1413,6 +1413,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
+    ml.get_key(LLM_KV_NEXTN_HEAD_LAYERS,       hparams.n_layer_nextn_head, false);
+    GGML_ASSERT(hparams.n_layer_nextn_head >= 1);
+    GGML_ASSERT(hparams.n_layer_nextn % hparams.n_layer_nextn_head == 0);
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
@@ -3440,6 +3443,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+int32_t llama_model_n_layer_nextn_head(const llama_model * model) {
+    return model->hparams.n_layer_nextn_head;
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

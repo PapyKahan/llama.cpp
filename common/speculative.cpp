@@ -1504,7 +1504,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
-    //   neither (qwen35 / qwen35moe): a single trained MTP head.
+    //   neither (qwen35 / qwen35moe, mistral4's EAGLE head): a single trained MTP head.
+    // n_mtp_layers counts heads: the stacked layers of one head (llama_model_n_layer_nextn_head) are one draft step.
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
@@ -1571,7 +1572,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
-        n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        n_mtp_layers = std::max(1, (int) (llama_model_n_layer_nextn(llama_get_model(ctx_dft)) /
+                                          llama_model_n_layer_nextn_head(llama_get_model(ctx_dft))));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
