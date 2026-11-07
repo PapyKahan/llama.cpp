@@ -88,14 +88,20 @@ more.
 The MMA kernel now takes the cache type as a template parameter: for q5_1 and q8_0 its tile loader
 (`flash_attn_ext_f16_load_tile_quant`) dequantizes the blocks into the F16 tiles in shared memory, one thread per
 block of 32 elements, so that the kernel reads the cache in place and the launcher converts nothing. When V is a view of
-K (MLA), the V tile is reused from the K tile, chosen at run time by the tensors. The loader is synchronous (single
-stage, no `cp.async`), and every query tile dequantizes the cache again, so the path is taken for batches of at most 16
-queries (decoding and verification); longer batches convert once as before. Kernels exist for 320/256 with 32 heads
-per K/V head and for 256/256 with more than 4; `GGML_CUDA_FA_DIRECT_KV=0` keeps the conversion. The scratch that the
-conversion needed in the compute buffer (up to 168 MB per layer at 262K cells) is not reserved for these shapes.
+K (MLA), the V tile is reused from the K tile, chosen at run time by the tensors. The loading is single-stage (no
+multi-stage `cp.async` pipeline), and every query tile dequantizes the cache again, so the path is taken for batches
+of at most 16 queries (decoding and verification); longer batches convert once as before. Kernels exist for 320/256
+with 32 heads per K/V head and for 256/256 with more than 4; `GGML_CUDA_FA_DIRECT_KV=0` keeps the conversion. The
+scratch that the conversion needed in the compute buffer (up to 168 MB per layer at 262K cells) is not reserved for
+these shapes.
+
+For q5_1 the raw rows of a tile are staged: `cp.async` copies the next tile's rows (whole blocks, 16-byte chunks)
+into a dense shared-memory area after the mask tile while the current tile computes, and the loader dequantizes from
+there (commit `c5da9066b`, `flash_attn_ext_f16_prefetch_raw`; the first tile is prefetched before the loop, a separate V is staged with
+K). The global loads of a tile then overlap the previous tile's work instead of being waited for.
 
 `test-backend-ops` covers both shapes with q5_1 and q8_0 against the CPU reference (V separate and as a view of K),
-and its perf list times them: at 64K cells on the 3090, one query of 320/256 takes 79 µs in q5_1 (181 before; 85 in
-F16), three queries 194 (271 before); a 4-token batch of 256/256 with 16 heads per K/V head takes 242 µs (553
-before, 187 in F16). The loader is still well under the memory bandwidth (latency-bound per tile); register
-double-buffering of the next tile's blocks would be the next step.
+and its perf list times them: at 64K cells on the 3090, one query of 320/256 takes 73 µs in q5_1 (181 before; 79
+without the staging; 85 in F16), three queries 166 (271 before); a 4-token batch of 256/256 with 16 heads per K/V head
+takes 214 µs (553 before, 187 in F16). What remains is the kernel's own compute at these tile sizes, which the F16
+kernel shares: its 85 µs are not bandwidth either.

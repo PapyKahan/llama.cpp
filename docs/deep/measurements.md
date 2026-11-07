@@ -391,7 +391,8 @@ deepseek2), the same profile and prompts: 91K decode 40.0 tok/s (33.7), 225K 36.
 802 and 370 tok/s both ways, peak GPU0 23552 against 23566 MiB, turnaround 240 µs. At 131K context with a 15800 MiB
 cache: 38.1 against 34.1 at 91K, 35.2 against 34.3 short; an F16 K cache there gave 34.3 and 35.0, so the conversion's
 cost was in its traffic, not in the bytes of the cache. The op itself at 64K cells: one query 79 µs (q5_1), three
-194; q8_0 82 and 207.
+194; q8_0 82 and 207; with the q5_1 rows staged by `cp.async` a tile ahead, 73 and 166 (Ornith's 4-query shape 214
+against 242), and the profile's prompts 39.3 / 37.7 / 37.3 tok/s at 91K / 225K / short.
 
 Ornith-1.5-122B (its harness defaults: 13000 MiB cache, three slots, the MTP drafter with three drafts, q5_1 K/V),
 whose twelve full-attention layers took the conversion for every verification batch: 91K decode 40.0 tok/s against

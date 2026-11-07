@@ -199,3 +199,4 @@ first:
 | `80b7de7db` | CUDA: the asynchronous set/get tensor paths select their device (a second GPU's cache banks) |
 | `a6a5858e3` | deepseek2 computes its shared expert before the host's answer |
 | `dddc4365f` | CUDA: the MMA flash-attention kernel reads a q5_1/q8_0 cache in place (`GGML_CUDA_FA_DIRECT_KV`) |
+| `c5da9066b` | CUDA: the q5_1 rows of an attention tile staged by cp.async a tile ahead |
