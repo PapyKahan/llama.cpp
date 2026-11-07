@@ -12211,7 +12211,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
                                         if (nr2 ==  8 && hsk != 192) continue;
                                         if (nr2 == 12 && hsk != 128) continue;
-                                        if (nr2 == 16 && hsk != 192) continue;
+                                        if (nr2 == 16 && hsk != 192 && hsk != 256) continue;
                                         if (nr2 == 20 && (nh != 1 || hsk != 576)) continue;
                                         if (nr2 == 32 && (nh != 1 || hsk != 320)) continue;
                                         //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
@@ -12221,11 +12221,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                     for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                        // a q5_1 or q8_0 cache read in place by the CUDA MMA kernel: Mistral4 MLA, and 256/256 with
+                                                        // 16 query heads per K/V head (Ornith-1.5)
+                                                        const bool direct_quant = (hsk == 320 || (hsk == 256 && nr2 == 16)) && (type_KV == GGML_TYPE_Q5_1 || type_KV == GGML_TYPE_Q8_0);
+                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && !direct_quant) continue;
                                                         // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                         const bool v_is_view_of_k = hsk == 576;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, true, v_is_view_of_k));
+                                                        if (direct_quant && hsk == 320) {
+                                                            test_cases.emplace_back(new test_flash_attn_ext(
+                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV, {0, 1, 2, 3}, true, true));
+                                                        }
                                                         // run fewer test cases permuted
                                                         if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
                                                             test_cases.emplace_back(new test_flash_attn_ext(
@@ -12952,6 +12959,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+
+    // Mistral Small 4 MLA decode (320/256, 32 heads on one K/V head, V a view of K) across KV depths and cache types,
+    // one query and a 3-token verification batch.
+    for (int64_t kv : {16384, 65536}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true, 0));
+            test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 3, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true, 0));
+            // Ornith-1.5 full attention (256/256, 16 query heads per K/V head, 2 K/V heads): a 4-token verification batch
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, kv, 4, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0));
+        }
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

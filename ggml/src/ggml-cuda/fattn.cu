@@ -379,6 +379,39 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// the K/V block types the MMA kernel reads in place for a head size pair, instead of converting the cache to F16.
+// Every query tile dequantizes the cache again, so this is for the few queries of decoding and verification: a long
+// batch converts once and lets its tiles read F16.
+static bool ggml_cuda_fattn_mma_f16_direct_kv(const ggml_tensor * dst) {
+    static const bool on = [] { const char * v = getenv("GGML_CUDA_FA_DIRECT_KV"); return v == nullptr || atoi(v) != 0; }();
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (!on || K->type != V->type || (K->type != GGML_TYPE_Q5_1 && K->type != GGML_TYPE_Q8_0) || Q->ne[1] > 16) {
+        return false;
+    }
+    if (K->ne[0] == 320 && V->ne[0] == 256) {
+        return true;
+    }
+    if (K->ne[0] != 256 || V->ne[0] != 256) {
+        return false;
+    }
+    // 256/256 with more than 4 query heads per K/V head: the (ncols1, 8) kernels, under the GQA conditions of the switch
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; t != nullptr && i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                use_gqa_opt = false;
+            }
+        }
+    }
+    return use_gqa_opt && Q->ne[2] / K->ne[2] > 4;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -560,6 +593,31 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
+            if (ggml_cuda_fattn_mma_f16_direct_kv(dst)) {
+                // the ncols1 choice of the switch for ncols2 = 8, with the cache read in place
+                if (K->type == GGML_TYPE_Q5_1) {
+                    if (Q->ne[1] <= 1) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, GGML_TYPE_Q5_1>(ctx, dst);
+                    } else if (Q->ne[1] <= 2) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 8, GGML_TYPE_Q5_1>(ctx, dst);
+                    } else if (Q->ne[1] <= 4) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 8, GGML_TYPE_Q5_1>(ctx, dst);
+                    } else {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8, GGML_TYPE_Q5_1>(ctx, dst);
+                    }
+                } else {
+                    if (Q->ne[1] <= 1) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 1, 8, GGML_TYPE_Q8_0>(ctx, dst);
+                    } else if (Q->ne[1] <= 2) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 2, 8, GGML_TYPE_Q8_0>(ctx, dst);
+                    } else if (Q->ne[1] <= 4) {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 4, 8, GGML_TYPE_Q8_0>(ctx, dst);
+                    } else {
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8, GGML_TYPE_Q8_0>(ctx, dst);
+                    }
+                }
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
         case 320:
@@ -575,6 +633,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 const int gqa_ratio = Q->ne[2] / K->ne[2];
                 GGML_ASSERT(gqa_ratio % 32 == 0);
 
+                if (ggml_cuda_fattn_mma_f16_direct_kv(dst)) {
+                    // the ncols1 choice of the switch for ncols2 = 32, with the cache read in place
+                    if (K->type == GGML_TYPE_Q5_1) {
+                        if (Q->ne[1] <= 1) {
+                            ggml_cuda_flash_attn_ext_mma_f16_case<320, 256, 1, 32, GGML_TYPE_Q5_1>(ctx, dst);
+                        } else {
+                            ggml_cuda_flash_attn_ext_mma_f16_case<320, 256, 2, 32, GGML_TYPE_Q5_1>(ctx, dst);
+                        }
+                    } else {
+                        if (Q->ne[1] <= 1) {
+                            ggml_cuda_flash_attn_ext_mma_f16_case<320, 256, 1, 32, GGML_TYPE_Q8_0>(ctx, dst);
+                        } else {
+                            ggml_cuda_flash_attn_ext_mma_f16_case<320, 256, 2, 32, GGML_TYPE_Q8_0>(ctx, dst);
+                        }
+                    }
+                    break;
+                }
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 32>(ctx, dst);
             }
             break;
@@ -971,9 +1046,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !ggml_cuda_fattn_mma_f16_direct_kv(dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
