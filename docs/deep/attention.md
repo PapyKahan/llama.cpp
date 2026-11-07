@@ -1,4 +1,4 @@
-# QSA attention at long context
+# Attention at long context
 
 `qwen4exp`'s attention layers use QSA: the cache is cut into blocks (pools) of `compress_ratio` cells in sequence order,
 a lightning indexer scores each block's pooled key against the query, and a token attends to the top blocks plus the
@@ -71,3 +71,31 @@ Commit `e2ff90695` (`ggml/src/ggml-cuda/fattn.cu`, `fattn-common.cuh`):
 - A long mask row is scanned for its listed cells by many blocks instead of one.
 - `GGML_CUDA_FA_SPARSE_MIN_KV=<cells>` lowers the threshold from which query tiles gather instead of using the
   worst-case bound, as the queries of a tile mostly select the same cells (8192 in the measured setup).
+
+## A quantized cache read in place by the tensor-core kernel
+
+Commit `dddc4365f` (`ggml/src/ggml-cuda/fattn-mma-f16.cuh`, `fattn.cu`,
+`template-instances/fattn-mma-f16-instance-kv-quant-*.cu`).
+
+Dense attention over a quantized cache goes to the vector kernel for a single query of up to 256 dimensions, and to
+the tensor-core (MMA) kernel otherwise, which reads F16: its launcher converted the whole K/V cache view to F16
+before every call, per layer and step. Mistral-Small-4's MLA attention (320 key dimensions, 256 value dimensions, V a
+view of K, 32 query heads on one K/V head) has no vector kernel, so every decode step converted its whole cache: at
+91K tokens of q5_1 K that is 22 MB read and 58 MB written per layer, then read again. Ornith-1.5's full-attention
+layers (256/256, 16 query heads per K/V head) took the same conversion for every verification batch of two tokens or
+more.
+
+The MMA kernel now takes the cache type as a template parameter: for q5_1 and q8_0 its tile loader
+(`flash_attn_ext_f16_load_tile_quant`) dequantizes the blocks into the F16 tiles in shared memory, one thread per
+block of 32 elements, so that the kernel reads the cache in place and the launcher converts nothing. When V is a view of
+K (MLA), the V tile is reused from the K tile, chosen at run time by the tensors. The loader is synchronous (single
+stage, no `cp.async`), and every query tile dequantizes the cache again, so the path is taken for batches of at most 16
+queries (decoding and verification); longer batches convert once as before. Kernels exist for 320/256 with 32 heads
+per K/V head and for 256/256 with more than 4; `GGML_CUDA_FA_DIRECT_KV=0` keeps the conversion. The scratch that the
+conversion needed in the compute buffer (up to 168 MB per layer at 262K cells) is not reserved for these shapes.
+
+`test-backend-ops` covers both shapes with q5_1 and q8_0 against the CPU reference (V separate and as a view of K),
+and its perf list times them: at 64K cells on the 3090, one query of 320/256 takes 79 µs in q5_1 (181 before; 85 in
+F16), three queries 194 (271 before); a 4-token batch of 256/256 with 16 heads per K/V head takes 242 µs (553
+before, 187 in F16). The loader is still well under the memory bandwidth (latency-bound per tile); register
+double-buffering of the next tile's blocks would be the next step.

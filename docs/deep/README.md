@@ -77,7 +77,7 @@ evicted one is first downloaded into a spare host slot. Host memory then holds o
 |---|---|
 | [moe-offload.md](moe-offload.md) | the expert offload: host mode, the service-thread cache policy, cache phases, expert prefetch, large batches shared with the host, the cache profile, the tail skip, host kernels, the exclusive core and memfd host buffers |
 | [speculative.md](speculative.md) | the MTP drafter: trimmed draft vocabulary, the cumulative draft stop, graph slots, padded verifications, the asynchronous catch-up, backend sampling, the n-gram row prefetch, Mistral-Small-4's EAGLE head as a stacked MTP head |
-| [attention.md](attention.md) | QSA at long context: k-pool tables, the lightning indexer, sparse flash attention, chunked QSA |
+| [attention.md](attention.md) | QSA at long context: k-pool tables, the lightning indexer, sparse flash attention, chunked QSA; a quantized cache read in place by the tensor-core kernel (Mistral-Small-4's MLA, Ornith's full attention) |
 | [prefill.md](prefill.md) | prompt processing: MMQ for MoE at large batches, balanced prompt chunks, the checkpoint tail, the n-gram gather |
 | [reference.md](reference.md) | every switch (environment and command line) with its default, the new ggml ops and backend entry points, the commits |
 | [measurements.md](measurements.md) | hardware, model files, harness, method, results and the pitfalls of measuring this model |

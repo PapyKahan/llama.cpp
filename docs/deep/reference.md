@@ -62,6 +62,7 @@ become parameters.
 | `GGML_CUDA_MMID_SORT` | on | | ids of many tokens grouped by a stable counting sort |
 | `GGML_CUDA_FA_COMPACT` | on | | sparse flash attention gathers the listed cells into compact buffers |
 | `GGML_CUDA_FA_SPARSE_MIN_KV` | 0 (worst-case bound) | 8192 | cells from which query tiles gather |
+| `GGML_CUDA_FA_DIRECT_KV` | on | | the MMA flash-attention kernel reads a q5_1/q8_0 cache in place for batches of up to 16 queries (320/256 and 256/256 with GQA); 0 converts it to F16 |
 | `GGML_CUDA_LID_MMA` | on | | lightning indexer for four heads on tensor cores |
 
 ## Speculative decoding and server
@@ -195,3 +196,6 @@ first:
 | `be68ef8f6` | exclusive core: the device computes the expert batches no slot map or host part takes |
 | `b33086b5f` | DFlash and DSpark drafters for deepseek2 / mistral4 targets (layer inputs, converter vocabulary) |
 | `f28d03ff7` | stacked MTP heads (`<arch>.nextn_head_layers`): Mistral-Small-4's EAGLE head; mistral4 builds the MTP graph |
+| `80b7de7db` | CUDA: the asynchronous set/get tensor paths select their device (a second GPU's cache banks) |
+| `a6a5858e3` | deepseek2 computes its shared expert before the host's answer |
+| `dddc4365f` | CUDA: the MMA flash-attention kernel reads a q5_1/q8_0 cache in place (`GGML_CUDA_FA_DIRECT_KV`) |

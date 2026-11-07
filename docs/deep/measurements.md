@@ -377,6 +377,28 @@ slots and 13500 MiB both: 243.1 and 234.9 µs against 273.1 and 272.3; decode 47
 2.74 to 2.77 s against 2.03 to 2.12 / 1.72 to 1.79 / 2.08 to 2.18 / 2.77 to 2.87. Small phase KLD 0.1269 ± 0.0038
 against 0.1259 (the sums in another order).
 
+### Mistral-Small-4 at long context: the cache read in place
+
+Mistral-Small-4-119B GSQ-RCO IQ3_S (its profile: 16800 MiB cache, 10000 MiB core, 262K context, q5_1 K, dio, no
+drafter for these runs) decoded the 91K-token code prompt at 33.7 tok/s and the 225K one at 25.6, against 35.4 on the
+short prompts, although the host's share of a step hardly changes with the context: the device's turnaround between an
+answer and the next request grew from 232 to 310 µs per layer. The MMA flash-attention kernel converted the layer's
+whole q5_1 cache to F16 on every call (see [attention.md](attention.md#a-quantized-cache-read-in-place-by-the-tensor-core-kernel)):
+at 64K cells the op took 180 µs for one query against 85 in F16.
+
+With the cache read in place by the kernel and the shared expert computed before the host wait (`moe_host_defer` in
+deepseek2), the same profile and prompts: 91K decode 40.0 tok/s (33.7), 225K 36.2 (25.6), short 36.7 (35.4), prefill
+802 and 370 tok/s both ways, peak GPU0 23552 against 23566 MiB, turnaround 240 µs. At 131K context with a 15800 MiB
+cache: 38.1 against 34.1 at 91K, 35.2 against 34.3 short; an F16 K cache there gave 34.3 and 35.0, so the conversion's
+cost was in its traffic, not in the bytes of the cache. The op itself at 64K cells: one query 79 µs (q5_1), three
+194; q8_0 82 and 207.
+
+Ornith-1.5-122B (its harness defaults: 13000 MiB cache, three slots, the MTP drafter with three drafts, q5_1 K/V),
+whose twelve full-attention layers took the conversion for every verification batch: 91K decode 40.0 tok/s against
+38.3, 230K 34.8 against 29.1, the short suite 47.1 / 48.1 / 48.6 against 48.4 / 46.9 / 46.5 (acceptance 0.61 to 0.70
+between runs), prefill 1452 / 621 against 1455 / 620, peak GPU0 23758 against 23756 MiB; turnaround 277 against 315 µs.
+The op for its shape at 64K cells (256/256, 16 query heads per K/V head, 4 queries): 242 µs against 553 (187 in F16).
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the
