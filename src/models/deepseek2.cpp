@@ -691,6 +691,8 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
+            // in host mode, the host's experts are added after the shared expert, which the device computes in the meantime
+            moe_host_defer = true;
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,
@@ -704,6 +706,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 il,
                 nullptr,
                 model.layers[il].ffn_gate_up_exps);
+            moe_host_defer = false;
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
@@ -719,6 +722,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
                 cb(cur, "ffn_out", il);
             }
+            cur = build_moe_host_wait(cur, il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
 
