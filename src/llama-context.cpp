@@ -1753,6 +1753,7 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
 }
 
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
+    sampling_fetch_lazy();
     output_reorder();
 
     if (!sampling.probs.has_data()) {
@@ -1772,6 +1773,7 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
 }
 
 float * llama_context::get_sampled_logits_ith(int32_t idx) {
+    sampling_fetch_lazy();
     output_reorder();
 
     if (!sampling.logits.has_data()) {
@@ -2457,6 +2459,15 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     return 0;
 }
 
+// the element counts of the rows a lazy copy will fill, see llama_context::sampling_fetch_lazy
+static void count_tensor_rows(const std::vector<ggml_tensor *> & tensors, uint32_t row_offset, std::vector<uint32_t> & counts) {
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const uint32_t row = row_offset + i;
+        GGML_ASSERT(row < counts.size());
+        counts[row] = tensors[i] != nullptr ? ggml_nelements(tensors[i]) : 0;
+    }
+}
+
 template<typename T>
 static void copy_tensor_async_rows(
     const std::vector<ggml_tensor *> & tensors,
@@ -2492,6 +2503,17 @@ static void copy_tensor_async_rows(
     }
 }
 
+void llama_context::sampling_fetch_lazy() {
+    if (sampling.lazy_sched == nullptr) {
+        return;
+    }
+    const auto stride = model.vocab.n_tokens();
+    copy_tensor_async_rows(sampling.lazy_logits, sampling.logits, stride, sampling.lazy_row, sampling.lazy_sched);
+    copy_tensor_async_rows(sampling.lazy_probs,  sampling.probs,  stride, sampling.lazy_row, sampling.lazy_sched);
+    ggml_backend_sched_synchronize(sampling.lazy_sched);
+    sampling.lazy_sched = nullptr;
+}
+
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
@@ -2511,6 +2533,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     const int64_t t_decode0 = ggml_time_us();
+    sampling.lazy_sched = nullptr; // the previous decode's device-side sampled outputs are gone
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2869,8 +2892,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched_cur);
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched_cur, &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched_cur, &sampling.probs_count);
+            if (n_outputs_all == 1 && n_outputs == 1) {
+                // the logits and probs of a single output (two copies of a vocabulary each) only when asked for
+                count_tensor_rows(res->t_sampled_logits, n_outputs_prev, sampling.logits_count);
+                count_tensor_rows(res->t_sampled_probs,  n_outputs_prev, sampling.probs_count);
+                sampling.lazy_logits = res->t_sampled_logits;
+                sampling.lazy_probs  = res->t_sampled_probs;
+                sampling.lazy_sched  = sched_cur;
+                sampling.lazy_row    = n_outputs_prev;
+            } else {
+                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits, stride, n_outputs_prev, sched_cur, &sampling.logits_count);
+                copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,  stride, n_outputs_prev, sched_cur, &sampling.probs_count);
+            }
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_cur, &sampling.candidates_count);
         }
 

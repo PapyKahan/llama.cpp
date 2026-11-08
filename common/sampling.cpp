@@ -170,6 +170,12 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // a token sampled on the backend fills cur_p with that token only; the candidates are built from the sampled
+    // logits and probs (two vocabularies read back from the device) when something asks for them
+    bool                   cur_stub = false;
+    struct llama_context * stub_ctx = nullptr;
+    int                    stub_idx = 0;
 };
 
 std::string common_params_sampling::print() const {
@@ -616,8 +622,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -629,16 +633,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
-                }
-            }
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0]   = llama_token_data{id, 0.0f, 1.0f};
+            cur_p           = { gsmpl->cur.data(), 1, 0, false };
+            gsmpl->cur_stub = true;
+            gsmpl->stub_ctx = ctx;
+            gsmpl->stub_idx = idx;
 
             return id;
         }
     }
+
+    gsmpl->cur_stub = false;
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -864,6 +871,19 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
     const auto tm = gsmpl->tm();
+
+    if (gsmpl->cur_stub) {
+        // the candidates of the backend-sampled token, now that they are wanted
+        const llama_token id = gsmpl->cur[0].id;
+        gsmpl->cur_stub = false;
+        gsmpl->set_logits(gsmpl->stub_ctx, gsmpl->stub_idx);
+        for (size_t i = 0; i < gsmpl->cur_p.size; ++i) {
+            if (gsmpl->cur_p.data[i].id == id) {
+                gsmpl->cur_p.selected = i;
+                break;
+            }
+        }
+    }
 
     auto * res = &gsmpl->cur_p;
 

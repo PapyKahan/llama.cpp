@@ -244,6 +244,9 @@ private:
 
     void output_reorder();
 
+    // copies the sampled logits and probs a decode left on the device
+    void sampling_fetch_lazy();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -385,6 +388,13 @@ private:
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
         std::vector<uint32_t> candidates_count;
+
+        // the sampled logits and probs of a single-output decode stay on the device until they are asked for (the
+        // sampled token is what the usual decode reads), see sampling_fetch_lazy
+        std::vector<ggml_tensor *> lazy_logits;
+        std::vector<ggml_tensor *> lazy_probs;
+        ggml_backend_sched_t       lazy_sched = nullptr;
+        uint32_t                   lazy_row   = 0;
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;

@@ -888,11 +888,23 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 // host memory in memfd buffers whose registrations were split (GGML_CUDA_HOST_MEMFD) is copied in pieces
 static void ggml_cuda_memcpy_host_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream);
 static bool ggml_cuda_host_memfd_is_split(const void * p, size_t size);
+// small copies by kernels, see ggml_cuda_kcopy
+#define GGML_CUDA_KCOPY_MAX (256u << 10)
+static const void * ggml_cuda_host_mapped_ptr(const void * host);
+static char * ggml_cuda_kcopy_bounce();
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    // a small input from pageable memory goes through the pinned staging buffer, so that the copy is a kernel
+    if (size > 0 && size <= GGML_CUDA_KCOPY_MAX && ggml_cuda_host_mapped_ptr(data) == nullptr) {
+        char * bounce = ggml_cuda_kcopy_bounce();
+        if (bounce != nullptr) {
+            memcpy(bounce, data, size);
+            data = bounce;
+        }
+    }
     ggml_cuda_memcpy_host_async((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1703,6 +1715,70 @@ static std::vector<std::pair<size_t, size_t>> ggml_cuda_ranges_minus(size_t b, s
 // A copy between device memory and host memory, the host side possibly in a memfd buffer whose registrations were split:
 // it goes in pieces that each lie within one registration, or outside all of them. Host memory given back must never be
 // read or written: a copy of it aborts.
+// A copy of at most GGML_CUDA_KCOPY_MAX bytes between the device and mapped pinned host memory by a kernel on the
+// stream instead of a copy engine: the engines serve every stream's copies in order, so a graph's small copies (the
+// sampled token, the inputs) would wait behind the expert transfers queued by the other streams. The limit keeps the
+// expert transfers themselves (pieces of 512 KB and up) on the engines.
+
+static __global__ void k_copy_bytes(const char * __restrict__ src, char * __restrict__ dst, const size_t n, const bool vec) {
+    const size_t stride = (size_t) gridDim.x*blockDim.x;
+    const size_t i0     = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (vec) {
+        for (size_t i = i0*16; i + 16 <= n; i += stride*16) {
+            *(int4 *) (dst + i) = *(const int4 *) (src + i);
+        }
+        for (size_t i = (n/16)*16 + i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (size_t i = i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// the device-visible address of mapped pinned host memory, nullptr for other memory
+static const void * ggml_cuda_host_mapped_ptr(const void * host) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, host) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return attr.type == cudaMemoryTypeHost ? attr.devicePointer : nullptr;
+}
+
+static bool ggml_cuda_kcopy(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    if (size == 0 || size > GGML_CUDA_KCOPY_MAX || (kind != cudaMemcpyHostToDevice && kind != cudaMemcpyDeviceToHost)) {
+        return false;
+    }
+    const void * host = kind == cudaMemcpyHostToDevice ? src : dst;
+    const void * mapped = ggml_cuda_host_mapped_ptr(host);
+    if (mapped == nullptr) {
+        return false;
+    }
+    const char * s = kind == cudaMemcpyHostToDevice ? (const char *) mapped : (const char *) src;
+    char       * d = kind == cudaMemcpyHostToDevice ? (char *) dst : const_cast<char *>((const char *) mapped);
+    const bool vec = ((uintptr_t) s % 16 == 0) && ((uintptr_t) d % 16 == 0);
+    const int nblocks = (int) std::min<size_t>(64, (size + 16*256 - 1)/(16*256));
+    k_copy_bytes<<<nblocks, 256, 0, stream>>>(s, d, size, vec);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// a pinned, mapped staging buffer per thread for the small synchronous copies from pageable memory
+static char * ggml_cuda_kcopy_bounce() {
+    static thread_local char * buf = nullptr;
+    if (buf == nullptr) {
+        void * p = nullptr;
+        if (cudaHostAlloc(&p, GGML_CUDA_KCOPY_MAX, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        buf = (char *) p;
+    }
+    return buf;
+}
+
 static void ggml_cuda_memcpy_host_async(void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
 #if defined(__linux__)
     if (size > 0 && ggml_cuda_host_memfd_split.load(std::memory_order_acquire)) {
@@ -1745,6 +1821,9 @@ static void ggml_cuda_memcpy_host_async(void * dst, const void * src, size_t siz
         }
     }
 #endif
+    if (ggml_cuda_kcopy(dst, src, size, kind, stream)) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
 }
 
@@ -3595,6 +3674,17 @@ static int ggml_cuda_graph_chunk_size() {
     return chunk_size;
 }
 
+// nodes of the first chunk: the device idles while a chunk is launched and runs the earlier ones during the later
+// launches, so the first chunk is kept short and the next ones double up to the chunk size (a launch takes about a
+// sixth of its chunk's run, so the launches stay ahead)
+static int ggml_cuda_graph_first_chunk_size() {
+    static const int first_chunk = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_FIRST_CHUNK");
+        return env != nullptr ? atoi(env) : 64;
+    }();
+    return first_chunk;
+}
+
 // end the capture of chunk `idx`, update or create its executable and launch it
 static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, size_t idx) {
     cudaGraph_t cuda_graph = nullptr;
@@ -4373,6 +4463,34 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             scale_in->src[0]->type == GGML_TYPE_F32 && scale_out->type == GGML_TYPE_F32 &&
             ggml_are_same_shape(scale_in->src[0], scale_out)) {
             int out_nodes[] = { node_idx + 3 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
+    // the power-of-two scale of each row from its max. |x| (llm_graph_context::build_amax_src1_f16)
+    std::initializer_list<enum ggml_op> amax_pow2_ops = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                                          GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY };
+
+    if (is_equal(amax_pow2_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 8 })) {
+        const ggml_tensor * abs    = cgraph->nodes[node_idx];
+        const ggml_tensor * pool   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * scale1 = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * scale2 = cgraph->nodes[node_idx + 4];
+        const ggml_tensor * ceil   = cgraph->nodes[node_idx + 5];
+        const ggml_tensor * scale3 = cgraph->nodes[node_idx + 7];
+        const ggml_tensor * exp    = cgraph->nodes[node_idx + 8];
+        const int32_t * pp = (const int32_t *) pool->op_params; // op, k0, s0, p0
+
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 0, 5}, {7, 0, 6}, {8, 0, 7}}) &&
+            ggml_get_unary_op(abs) == GGML_UNARY_OP_ABS && ggml_get_unary_op(ceil) == GGML_UNARY_OP_CEIL &&
+            ggml_get_unary_op(exp) == GGML_UNARY_OP_EXP &&
+            pp[0] == GGML_OP_POOL_MAX && pp[1] >= abs->ne[0] && pp[3] == 0 && pool->ne[0] == 1 &&
+            ggml_get_op_params_f32(scale1, 1) == 0.0f && ggml_get_op_params_f32(scale2, 1) == 0.0f &&
+            ggml_get_op_params_f32(scale3, 1) == 0.0f &&
+            abs->src[0]->type == GGML_TYPE_F32 && exp->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(abs->src[0]) && ggml_is_contiguous(exp)) {
+            int out_nodes[] = { node_idx + 8 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
         return false;
@@ -5383,6 +5501,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                        GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY },
+                           { GGML_UNARY_OP_ABS, GGML_UNARY_OP_CEIL, GGML_UNARY_OP_EXP })) {
+        ggml_cuda_op_amax_pow2(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4], cgraph->nodes[i + 6],
+                               cgraph->nodes[i + 7], cgraph->nodes[i + 8]);
+        return 8;
+    }
+
     return 0;
 }
 
@@ -5400,7 +5526,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
     const int         chunk_size = ggml_cuda_graph_chunk_size();
-    int               chunk_end  = chunk_size;
+    int               chunk_cur  = chunk_size > 0 ? std::min(chunk_size, std::max(1, ggml_cuda_graph_first_chunk_size())) : chunk_size;
+    int               chunk_end  = chunk_cur;
     size_t            n_chunks   = 0;
 #endif // USE_CUDA_GRAPH
 
@@ -5499,7 +5626,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-                    chunk_end = i + chunk_size;
+                    chunk_cur = std::min(chunk_size, 2*chunk_cur);
+                    chunk_end = i + chunk_cur;
                 }
 #endif // USE_CUDA_GRAPH
                 if (is_concurrent_event_active) {

@@ -612,6 +612,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         int32_t            dev;
         std::vector<stage> stages;
     };
+    static constexpr size_t     excl_piece = 512*1024; // bytes per download, see the worker
     std::vector<ggml_backend_t> excl_side;  // per device, the downloads
     void (*excl_sync)(ggml_backend_t) = nullptr; // waits for a download, sleeping if the backend can
     std::thread                 excl_worker;
@@ -2552,10 +2553,14 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 for (size_t ip = 0; ip < g.banks.size(); ++ip) {
                     const ggml_tensor * w = at.experts[ip];
                     const size_t es = w->nb[2];
-                    ggml_backend_tensor_get_async(b, g.banks[ip], (uint8_t *) w->data + (size_t) (x.loc % hp_ne)*es, (size_t) x.slot*es, es);
+                    // in pieces: the downloads of all streams of a device share a copy engine in order, so a graph's
+                    // small ones (the logits read back, the drafter's input) wait for at most one piece
+                    for (size_t off = 0; off < es; off += excl_piece) {
+                        const size_t n = std::min(excl_piece, es - off);
+                        ggml_backend_tensor_get_async(b, g.banks[ip], (uint8_t *) w->data + (size_t) (x.loc % hp_ne)*es + off, (size_t) x.slot*es + off, n);
+                    }
                 }
-                // one expert in flight at a time: the downloads of all streams of a device share a copy engine in order,
-                // so the small ones of the graphs (results read back, the drafter's input) would wait for all those queued
+                // one expert in flight at a time, for the same reason
                 excl_sync(b);
             }
             std::lock_guard<std::mutex> lk(mtx);

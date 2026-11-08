@@ -30,8 +30,12 @@ static __device__ __forceinline__ void moe_host_store_release(int32_t * p, int32
 #endif
 }
 
-// one block: the slots of the selected experts, then the request in the mailbox, then its sequence number; a pad
-// token gets the zero slots and id -1, which the host skips
+// the blocks of a post: the input rows go to host memory, whose writes from one block are too few in flight
+#define MOE_HOST_POST_BLOCKS 8
+
+// several blocks: block 0 writes the slots of the selected experts and the request's ids and weights into the mailbox,
+// every block its share of the input rows; the last block to finish (state[3] counts them) writes the header and the
+// sequence number. A pad token gets the zero slots and id -1, which the host skips.
 static __global__ void k_moe_host_post(
         const char * __restrict__ ids, const int64_t ids_nb0, const int64_t ids_nb1,
         const char * __restrict__ w,   const int64_t w_nb0,   const int64_t w_nb1,
@@ -50,7 +54,7 @@ static __global__ void k_moe_host_post(
     float   * mb_x     = (float   *) (mb + off_x);
 
     const int n = n_used*n_tokens;
-    for (int i = tid; i < n; i += blockDim.x) {
+    for (int i = tid; blockIdx.x == 0 && i < n; i += blockDim.x) {
         const int k = i % n_used;
         const int t = i / n_used;
         const bool    p = pad != nullptr && pad[t] != 0;
@@ -63,15 +67,17 @@ static __global__ void k_moe_host_post(
         mb_w[i]     = p ? 0.0f : *(const float *) (w + k*w_nb0 + t*w_nb1);
     }
 
+    const int stride = gridDim.x*blockDim.x;
+    const int first  = blockIdx.x*blockDim.x + tid;
     if (x_nb0 == (int64_t) sizeof(float) && n_embd % 4 == 0 && x_nb1 % 16 == 0 && (uintptr_t) x % 16 == 0 && off_x % 16 == 0) {
         const int n4 = n_embd/4;
-        for (int i = tid; i < n4*n_tokens; i += blockDim.x) {
+        for (int i = first; i < n4*n_tokens; i += stride) {
             const int j = i % n4;
             const int t = i / n4;
             ((float4 *) mb_x)[i] = ((const float4 *) (x + t*x_nb1))[j];
         }
     } else {
-        for (int i = tid; i < n_embd*n_tokens; i += blockDim.x) {
+        for (int i = first; i < n_embd*n_tokens; i += stride) {
             const int j = i % n_embd;
             const int t = i / n_embd;
             mb_x[i] = *(const float *) (x + j*x_nb0 + t*x_nb1);
@@ -82,6 +88,12 @@ static __global__ void k_moe_host_post(
     __syncthreads();
 
     if (tid == 0) {
+        // the last block to arrive publishes the request; the others' writes are fenced before their arrival
+        if (atomicAdd(state + 3, 1) != (int32_t) gridDim.x - 1) {
+            return;
+        }
+        state[3] = 0;
+        __threadfence();
         const int32_t seq = state[0] + 1;
         state[0] = seq;
         int32_t * hdr = (int32_t *) mb;
@@ -357,7 +369,7 @@ void ggml_cuda_op_moe_host_post(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int32_t off_table = ggml_get_op_params_i32(dst, 8);
     const int32_t n_expert  = ggml_get_op_params_i32(dst, 9);
 
-    k_moe_host_post<<<1, 512, 0, ctx.stream()>>>(
+    k_moe_host_post<<<MOE_HOST_POST_BLOCKS, 512, 0, ctx.stream()>>>(
         (const char *) ids->data,     ids->nb[0],     ids->nb[1],
         (const char *) weights->data, weights->nb[0], weights->nb[1],
         (const char *) x->data,       x->nb[0],       x->nb[1],
