@@ -12963,7 +12963,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Mistral Small 4 MLA decode (320/256, 32 heads on one K/V head, V a view of K) across KV depths and cache types,
     // one query and a 3-token verification batch.
-    for (int64_t kv : {16384, 65536}) {
+    for (int64_t kv : {4096, 16384, 65536}) {
         for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true, 0));
             test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 3, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true, 0));

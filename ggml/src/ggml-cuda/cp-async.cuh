@@ -55,3 +55,29 @@ static __device__ __forceinline__ void cp_async_wait_all() {
     NO_DEVICE_CODE;
 #endif // CP_ASYNC_AVAILABLE
 }
+
+// An L2 cache policy that marks the lines a copy touches as the first to evict, for data streamed once
+// (the K/V rows of an attention tile), so that it does not push out data that is read again soon after.
+static __device__ __forceinline__ uint64_t cp_async_policy_evict_first() {
+#ifdef CP_ASYNC_AVAILABLE
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+#else
+    NO_DEVICE_CODE;
+    return 0;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// As cp_async_cg_16, with the L2 cache policy applied (no prefetch hint).
+static __device__ __forceinline__ void cp_async_cg_16_policy(const unsigned int dst, const void * src, const uint64_t policy) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;"
+        : : "r"(dst), "l"(src), "l"(policy));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    GGML_UNUSED(policy);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}

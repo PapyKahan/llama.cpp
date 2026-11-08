@@ -741,8 +741,47 @@ bool ggml_cuda_fattn_compact_supported(const ggml_tensor * K, const ggml_tensor 
 void ggml_cuda_fattn_compact_kv(const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask, int32_t * lists,
         int64_t n_rows, half * K_c, half * V_c, half * mask_c, cudaStream_t stream);
 
+// Folds one block's partial result (its VKQ value for this thread's dim, its KQ max and rowsum) into the running one.
+static __device__ __forceinline__ void flash_attn_stream_k_fixup_merge(
+        float & dst_val, float & max_val, float & rowsum, const float dst_add, const float2 meta_add) {
+    const float max_val_new = fmaxf(max_val, meta_add.x);
+
+    const float diff_val = max_val    - max_val_new;
+    const float diff_add = meta_add.x - max_val_new;
+
+    const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+    const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+    dst_val = scale_val*dst_val + scale_add*dst_add;
+    rowsum  = scale_val*rowsum  + scale_add*meta_add.y;
+
+    max_val = max_val_new;
+}
+
+// The partials of several blocks are loaded before any of them is merged, so that their global loads overlap
+// instead of each waiting behind the previous merge (a tile may have hundreds of blocks).
+#define FATTN_STREAM_K_FIXUP_NLOAD 8
+
+// The uniform fixup splits a tile's dims over dsplit blocks (gridDim.x = ntiles_dst*dsplit) of blockDim.y groups of
+// blockDim.x threads, two dims per thread (one 4-byte F16 load per partial); each group takes every ngroups-th block,
+// FATTN_STREAM_K_FIXUP_NLOAD_UNIFORM per round with the loads issued together. A round first takes the max. of its
+// blocks' KQ maxima, so that the blocks' scales are independent exps rather than a chain of rescalings; the groups'
+// states are then combined the same way by group 0 after one exchange through shared memory. The launcher sizes the
+// blocks: FATTN_STREAM_K_FIXUP_NTHREADS threads (two blocks per SM) and the split that keeps the grid within one
+// wave; the groups are at most FATTN_STREAM_K_FIXUP_GROUPS_MAX (32 threads per group at the least).
+#define FATTN_STREAM_K_FIXUP_NLOAD_UNIFORM 12
+#define FATTN_STREAM_K_FIXUP_NTHREADS      512
+#define FATTN_STREAM_K_FIXUP_DSPLIT_MAX    4
+#define FATTN_STREAM_K_FIXUP_GROUPS_MAX    16
+
+// The scale of a partial with KQ max. m against the max. M, zero when it would underflow (the merge's threshold).
+static __device__ __forceinline__ float flash_attn_stream_k_fixup_scale(const float m, const float M) {
+    const float diff = m - M;
+    return diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
-__launch_bounds__(D, 1)
+__launch_bounds__(FATTN_STREAM_K_FIXUP_NTHREADS, 2)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
@@ -752,23 +791,31 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const int blocks_per_tile,
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
-        const uint3 fd_iter_j) {
+        const uint3 fd_iter_j,
+        const int dsplit) {
     constexpr int ncols = ncols1*ncols2;
+    constexpr int nload = FATTN_STREAM_K_FIXUP_NLOAD_UNIFORM;
+    constexpr int ngmax = FATTN_STREAM_K_FIXUP_GROUPS_MAX;
     ggml_cuda_pdl_lc();
     float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
     const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
 
-    const int tile_idx = blockIdx.x; // One block per output tile.
+    const int tile_idx = blockIdx.x / dsplit; // One block per output tile and dim split.
+    const int dpart    = blockIdx.x % dsplit;
     const int j        = blockIdx.y;
     const int c        = blockIdx.z;
     const int jc       = j*ncols2 + c;
     const int tid      = threadIdx.x;
+    const int group    = threadIdx.y;
+    const int ngroups  = blockDim.y;
+    const int d0       = dpart*(2*blockDim.x) + 2*tid; // this thread's first dim
 
-    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
+    // nblocks_stream_k is a multiple of ntiles_dst, so each tile gets the same number of blocks.
     const int b_first = tile_idx * blocks_per_tile;
     const int b_last  = b_first + blocks_per_tile - 1;
 
-    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
+    // the blocks' partial results follow the max. values and row sums, as F16
+    const half * dst_fixup_data = (const half *) (dst_fixup + nblocks_stream_k*(2*ncols));
 
     // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
     const uint2 dm0 = fast_div_modulo(tile_idx, fd_iter_j_z_ne12);
@@ -786,41 +833,86 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + d0;
+
+    __shared__ float2 group_val [ngmax][D/2];
+    __shared__ float2 group_meta[ngmax];
 
     ggml_cuda_pdl_sync();
-    // Load the partial result that needs a fixup
-    float dst_val = *dst;
-    float max_val;
-    float rowsum;
-    {
+    // Group 0 starts from the partial result that needs a fixup, the others from an empty state.
+    float2 val    = make_float2(0.0f, 0.0f);
+    float  max_v  = -INFINITY;
+    float  rowsum = 0.0f;
+    if (group == 0) {
+        val = *(const float2 *) dst;
         const float2 tmp = dst_fixup[b_last*ncols + jc];
-        max_val = tmp.x;
-        rowsum  = tmp.y;
+        max_v  = tmp.x;
+        rowsum = tmp.y;
     }
 
-    // Combine with all previous blocks in this tile.
-    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
-        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
-
-        const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
-
-        const float max_val_new = fmaxf(max_val, tmp.x);
-
-        const float diff_val = max_val - max_val_new;
-        const float diff_add = tmp.x   - max_val_new;
-
-        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
-        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
-
-        dst_val = scale_val*dst_val + scale_add*dst_add;
-        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
-
-        max_val = max_val_new;
+    // Combine with all previous blocks in this tile, every ngroups-th from this group's first, nload blocks per round
+    // with their loads issued together. A round's missing blocks read the tile's first block and get a KQ max. of
+    // -inf, which scales them to zero, so that the rounds are free of branches.
+    for (int bidx = b_last - 1 - group; bidx >= b_first; bidx -= nload*ngroups) {
+        half2  val_add [nload];
+        float2 meta_add[nload];
+#pragma unroll
+        for (int u = 0; u < nload; ++u) {
+            const bool present = bidx - u*ngroups >= b_first;
+            const int  b       = present ? bidx - u*ngroups : b_first;
+            val_add [u]   = *(const half2 *) (dst_fixup_data + (int64_t(b)*ncols + jc)*D + d0);
+            meta_add[u]   = dst_fixup[(nblocks_stream_k + b)*ncols + jc];
+            meta_add[u].x = present ? meta_add[u].x : -INFINITY;
+        }
+        float max_new = max_v;
+#pragma unroll
+        for (int u = 0; u < nload; ++u) {
+            max_new = fmaxf(max_new, meta_add[u].x);
+        }
+        const float scale = flash_attn_stream_k_fixup_scale(max_v, max_new);
+        val.x  *= scale;
+        val.y  *= scale;
+        rowsum *= scale;
+#pragma unroll
+        for (int u = 0; u < nload; ++u) {
+            const float  s = flash_attn_stream_k_fixup_scale(meta_add[u].x, max_new);
+            const float2 t = __half22float2(val_add[u]);
+            val.x  += s*t.x;
+            val.y  += s*t.y;
+            rowsum += s*meta_add[u].y;
+        }
+        max_v = max_new;
     }
 
-    // Write back final result:
-    *dst = dst_val / rowsum;
+    // The groups' states go through shared memory, and group 0 combines them the same way.
+    if (group > 0) {
+        group_val[group][tid] = val;
+        if (tid == 0) {
+            group_meta[group] = make_float2(max_v, rowsum);
+        }
+    }
+    __syncthreads();
+    if (group > 0) {
+        return;
+    }
+    float max_new = max_v;
+    for (int g = 1; g < ngroups; ++g) {
+        max_new = fmaxf(max_new, group_meta[g].x);
+    }
+    const float scale = flash_attn_stream_k_fixup_scale(max_v, max_new);
+    val.x  *= scale;
+    val.y  *= scale;
+    rowsum *= scale;
+    for (int g = 1; g < ngroups; ++g) {
+        const float2 meta = group_meta[g];
+        const float  s    = flash_attn_stream_k_fixup_scale(meta.x, max_new);
+        const float2 t    = group_val[g][tid];
+        val.x  += s*t.x;
+        val.y  += s*t.y;
+        rowsum += s*meta.y;
+    }
+
+    *(float2 *) dst = make_float2(val.x / rowsum, val.y / rowsum);
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -847,7 +939,8 @@ static __global__ void flash_attn_stream_k_fixup_general(
     const int jc    = j*ncols2 + c;
     const int tid   = threadIdx.x;
 
-    const float * dst_fixup_data = ((const float *) dst_fixup) + gridDim.x*(2*2*ncols);
+    // the blocks' partial results follow the max. values and row sums, as F16
+    const half * dst_fixup_data = (const half *) (dst_fixup + gridDim.x*(2*ncols));
 
     const int kbc0      = int64_t(bidx0 + 0)*total_work / gridDim.x;
     const int kbc0_stop = int64_t(bidx0 + 1)*total_work / gridDim.x;
@@ -893,41 +986,45 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
     // Iterate over previous blocks and compute the combined results.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
+    // The blocks are walked backwards in groups: the group's members are found first (which needs no loads), then
+    // their partials are loaded together and merged in order.
     const int tile_kbc0 = fastdiv(kbc0, fd_iter_k);
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
-    while(true) {
-        const int kbc = int64_t(bidx)*total_work / gridDim.x;
-        if (kbc == kbc_stop) { // Did not have any data.
+    bool done = false;
+    while (!done) {
+        int bidx_load[FATTN_STREAM_K_FIXUP_NLOAD];
+        int nload = 0;
+        while (nload < FATTN_STREAM_K_FIXUP_NLOAD && !done) {
+            const int kbc = int64_t(bidx)*total_work / gridDim.x;
+            if (kbc == kbc_stop) { // Did not have any data.
+                bidx--;
+                kbc_stop = kbc;
+                continue;
+            }
+            bidx_load[nload++] = bidx;
+
+            // If this block started in a previous tile we are done and don't need to combine additional partial results.
+            done = fastmodulo(kbc, fd_iter_k) == 0 || fastdiv(kbc, fd_iter_k) < tile_kbc0;
             bidx--;
             kbc_stop = kbc;
-            continue;
         }
 
-        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
-
-        const float2 tmp = dst_fixup[(gridDim.x + bidx)*ncols + jc];
-
-        // Scale the current and new value accumulators depending on the max. values.
-        const float max_val_new = fmaxf(max_val, tmp.x);
-
-        const float diff_val = max_val - max_val_new;
-        const float diff_add = tmp.x   - max_val_new;
-
-        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
-        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
-
-        dst_val = scale_val*dst_val + scale_add*dst_add;
-        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
-
-        max_val = max_val_new;
-
-        // If this block started in a previous tile we are done and don't need to combine additional partial results.
-        if (fastmodulo(kbc, fd_iter_k) == 0 || fastdiv(kbc, fd_iter_k) < tile_kbc0) {
-            break;
+        float  dst_add [FATTN_STREAM_K_FIXUP_NLOAD];
+        float2 meta_add[FATTN_STREAM_K_FIXUP_NLOAD];
+#pragma unroll
+        for (int u = 0; u < FATTN_STREAM_K_FIXUP_NLOAD; ++u) {
+            if (u < nload) {
+                dst_add [u] = __half2float(dst_fixup_data[bidx_load[u]*ncols*D + jc*D + tid]);
+                meta_add[u] = dst_fixup[(gridDim.x + bidx_load[u])*ncols + jc];
+            }
         }
-        bidx--;
-        kbc_stop = kbc;
+#pragma unroll
+        for (int u = 0; u < FATTN_STREAM_K_FIXUP_NLOAD; ++u) {
+            if (u < nload) {
+                flash_attn_stream_k_fixup_merge(dst_val, max_val, rowsum, dst_add[u], meta_add[u]);
+            }
+        }
     }
 
     // Write back final result:
@@ -1242,7 +1339,8 @@ void launch_fattn(
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            // per block and column: the max. value and row sum (2 float2) and the F16 partial result (DV/4 float2)
+            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/4)));
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1331,14 +1429,21 @@ void launch_fattn(
             const uint3 fd1 = init_fastdiv_values(ntiles_x * ntiles_z_gqa);
             const uint3 fd2 = init_fastdiv_values(ntiles_x);
 
-            const dim3 block_dim_combine(DV, 1, 1);
-            const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
+            // the split that keeps the grid within one wave of two blocks per SM, groups of at least 32 threads
+            const int nblocks_fix = ntiles_dst*ncols1*ncols2;
+            int dsplit = 1;
+            while (dsplit < FATTN_STREAM_K_FIXUP_DSPLIT_MAX && DV/(2*dsplit) >= 64 && nblocks_fix*2*dsplit <= 2*nsm) {
+                dsplit *= 2;
+            }
+            const int tpg = DV/dsplit/2; // threads per group
+            const dim3 block_dim_combine(tpg, std::min(FATTN_STREAM_K_FIXUP_NTHREADS/tpg, FATTN_STREAM_K_FIXUP_GROUPS_MAX), 1);
+            const dim3 blocks_num_combine = {(unsigned)(ntiles_dst*dsplit), ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
-                 gqa_ratio, bpt, fd0, fd1, fd2);
+                 gqa_ratio, bpt, fd0, fd1, fd2, dsplit);
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
