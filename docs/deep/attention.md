@@ -105,3 +105,22 @@ and its perf list times them: at 64K cells on the 3090, one query of 320/256 tak
 without the staging; 85 in F16), three queries 166 (271 before); a 4-token batch of 256/256 with 16 heads per K/V head
 takes 214 µs (553 before, 187 in F16). What remains is the kernel's own compute at these tile sizes, which the F16
 kernel shares: its 85 µs are not bandwidth either.
+
+Two further rounds work on that compute (commit `70153c22e`). The stream-k fixup, which merges
+the partial results of the blocks that shared a tile's cells, had walked them one dependent load at a time in a block
+per output column: it now reads partials stored as F16, loads several per round, takes the maximum of a round's KQ
+maxima first so that the partials' scales are independent exponentials rather than a chain of rescalings, spreads the
+blocks over groups of threads and over the head's dims (the launcher sizes its grid to one wave of two blocks per SM),
+and combines the groups after one exchange through shared memory. The q5_1 dequantization unpacks a block's nibble
+words with byte permutes into halves offset by 1024 instead of converting one value at a time, the last round of blocks
+is split in halves between warp pairs so that no warp idles, and a thread's loads of all its blocks are issued before
+any is converted (the round bounds are decided at compile time, so no branch separates them). The mask tile and the
+K rows are prefetched a tile ahead into double buffers, the first tile's before the Q load, so that no warp fetches
+synchronously inside the loop; the Q rows are loaded in one batch; the head-320 configurations hold 32 or 64 cells per
+tile with the Q fragments in registers. The K-row copies carry an L2 evict-first policy, so that the rows streamed once
+do not push out the partials the fixup reads right after. At 64K cells one query of 320/256 takes 48 µs (73), three
+queries 123 (166), the 256/256 4-token batch 176 (214); at 16K cells 23 and 44 µs; the fixup itself 4.6 to 5.0 µs
+against 7.1 to 7.6. Nsight Compute on the one-query kernel (two blocks per SM at 255 registers, the tensor pipe busy
+37 % of the time) puts the dequantization at about a third of the loop, the KQ product at a quarter, and the
+once-per-block prologue (Q load, the first tile's prefetch, the instruction fetch of a 129 KB kernel) at a fifth of the
+samples at 64K cells and half at 16K: those are what is left.

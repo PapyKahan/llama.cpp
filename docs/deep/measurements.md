@@ -394,6 +394,14 @@ cost was in its traffic, not in the bytes of the cache. The op itself at 64K cel
 194; q8_0 82 and 207; with the q5_1 rows staged by `cp.async` a tile ahead, 73 and 166 (Ornith's 4-query shape 214
 against 242), and the profile's prompts 39.3 / 37.7 / 37.3 tok/s at 91K / 225K / short.
 
+Two rounds on the kernel's own compute (the fixup, the dequantization, the prefetches, the tile configurations; see
+[attention.md](attention.md#a-quantized-cache-read-in-place-by-the-tensor-core-kernel)) take the op at 64K cells to
+48 µs for one query and 123 for three (73 and 166), 23 and 44 at 16K, Ornith's 4-query shape to 176 (214). The
+profile's prompts, one run each: 41.5 / 39.1 / 36.9 tok/s at 91K / 225K / short (the staged loader's 39.3 / 37.7 /
+37.3, and 37.5 to 40.1 at 91K between two runs of the same build), prefill 906 / 424 tok/s (800 / 370), peak GPU0 23488
+against 23516 MiB. Decode is bound by the host's expert traffic, so the attention's 40 layers' savings of a few µs each
+stay within the run-to-run spread; the gains are the kernel's.
+
 Ornith-1.5-122B (its harness defaults: 13000 MiB cache, three slots, the MTP drafter with three drafts, q5_1 K/V),
 whose twelve full-attention layers took the conversion for every verification batch: 91K decode 40.0 tok/s against
 38.3, 230K 34.8 against 29.1, the short suite 47.1 / 48.1 / 48.6 against 48.4 / 46.9 / 46.5 (acceptance 0.61 to 0.70
