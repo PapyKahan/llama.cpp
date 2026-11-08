@@ -408,6 +408,30 @@ whose twelve full-attention layers took the conversion for every verification ba
 between runs), prefill 1452 / 621 against 1455 / 620, peak GPU0 23758 against 23756 MiB; turnaround 277 against 315 µs.
 The op for its shape at 64K cells (256/256, 16 query heads per K/V head, 4 queries): 242 µs against 553 (187 in F16).
 
+### Mistral-Small-4 decode: the step on the device
+
+An Nsight Systems trace of the profile above decoding the 91K prompt (the kernels of the compute stream, split into
+steps at the gaps between them; see [moe-offload.md](moe-offload.md#the-decode-step-on-the-device)) put the step at
+25 ms: 11 of them in the kernel that waits for the host's experts, 12 of other kernels, 2.2 between the steps. Per layer,
+the attention side 219 µs (kernels 154), the device's own MoE work 182 (run while the host computes, critical in the
+layers with few misses), the request 26, the wait 311 on average (50 to 435 between runs). The host path itself is at
+the memory's ceiling (the IQ3_S dot product streams 4.6 GB/s per core, 11 workers 45 GB/s, the two DDR4-3200 channels
+46), so the step's other parts were the levers.
+
+With the request kernel on eight blocks, the activation scale chain fused, the exclusive core's victims downloaded in
+512 KB pieces, the small copies made by a kernel, the sampled probabilities copied on demand and the graph chunks
+ramping from 64 nodes: the gap between steps 0.85 ms (2.2), the device's MoE work 142 µs per layer (182), the request
+18 (26), the attention side 183 (219); the traced steps averaged 21.7 ms against 24.7 with the same host wait (11 ms per
+step). The CUDA graph chunk size itself (512, 128, 48 nodes) made no measurable difference. End to end, without the
+profiler, two runs per build against the installed `37cdbf98b`: the short suite 37.1 and 37.4 tok/s against 36.9 and
+36.6, the 91K prompt 39.9 and 39.5 against 40.2 and 40.4, prefill 920 against 918 tok/s, peak GPU0 23454 against 23496
+MiB: within the run-to-run spread. The step is bound by the host path at this context; the trace proves the mechanics,
+not a throughput gain.
+
+The fused scale chain is bit-identical to the ten operations it replaces (the same float operations in the same
+order), and the kernel copies' limit must stay below the download piece size: a 1 MB limit took the pieces as kernels
+on the compute stream and cost the attention side 70 µs per layer.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the

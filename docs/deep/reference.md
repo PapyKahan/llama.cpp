@@ -201,3 +201,4 @@ first:
 | `dddc4365f` | CUDA: the MMA flash-attention kernel reads a q5_1/q8_0 cache in place (`GGML_CUDA_FA_DIRECT_KV`) |
 | `c5da9066b` | CUDA: the q5_1 rows of an attention tile staged by cp.async a tile ahead |
 | `70153c22e` | CUDA: faster head-320 MMA flash attention on a quantized cache (fixup, dequantization, prefetches, tile configurations) |
+| `437994c62` | CUDA: the decode step's device-side mechanics (amax chain fusion, kernel copies, graph chunk ramp, lazy sampled probabilities) |

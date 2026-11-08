@@ -289,3 +289,37 @@ the same speed as from `cudaMallocHost` memory (13.1 GB/s in 0.7 MB pieces, 13.4
   downloads with 16 spares per group and 5 % with 64.
 - Transparent huge pages on the 47 GiB of host experts: the synchronous compaction they trigger counted as memory pressure
   long enough for systemd-oomd to kill the whole login session the server ran in.
+
+## The decode step on the device
+
+Commit `437994c62`. An Nsight Systems trace of Mistral-Small-4 decoding at 91K context (one query per step, 36 MoE
+layers, the production profile) put the 25 ms step at: 11 ms in the kernel that waits for the host's experts, 12 ms of
+other kernels, and 2.2 ms between the last kernel of a step and the first of the next. Per layer, the attention side
+(between a host answer and the next request) is about 220 µs, the device's own MoE work (the cached experts, the shared
+expert, the request) 180 µs, run while the host computes, and the wait 310 µs on average but under 50 in layers with few
+misses. The host path itself is bound by DRAM: the IQ3_S dot product streams 4.6 GB/s per core and 11 workers reach the
+46 GB/s of the two DDR4 channels, so the levers were on the device and between the steps.
+
+- **The request kernel** (`k_moe_host_post`) wrote the layer's 16 KB input into the mailbox from one block, whose writes to
+  host memory are too few in flight: it took 26 µs on the host's critical path. Eight blocks write it, the last to finish
+  publishes the request (18 µs).
+- **The activation scale** of `build_amax_src1_f16` (the power of two from each row's max. |x| that keeps the Q8
+  activations' F16 sums in range) ran as ten kernels, the `pool1d` max over a row with one thread per row (31 µs). The
+  CUDA backend fuses the chain into one kernel and reduces whole-row pools with a block, with the same float operations
+  in the same order (the outputs are identical).
+- **The gap between steps.** The exclusive core's victims are downloaded by a worker thread; the copy engine serves every
+  stream's copies in the order they were queued, so the step's own copies (the sampled token, the inputs of the next
+  step) waited behind the queued expert transfers, up to a millisecond. The downloads go in 512 KB pieces, and the
+  small copies (up to 256 KB, below the piece size) are made by a kernel on the compute stream instead
+  (`ggml_cuda_kcopy`; the inputs from pageable memory pass through a pinned staging buffer).
+- **The sampled probabilities.** With backend sampling the device returns the token, but the context also copied back the
+  sampled logits and probabilities (two vocabularies, 1 MB per token) and `common_sampler_sample` built a candidate array
+  of the whole vocabulary from them before looking at the token. The token is checked first, the copies and the array
+  are made when something asks for the candidates (`n_probs`).
+- **The CUDA graph chunks.** The step's graph is captured as chunks of 512 nodes; the device idles while the first chunk
+  is launched (0.4 ms for 300 kernels) and runs it during the later launches. The first chunk holds 64 nodes
+  (`GGML_CUDA_GRAPH_FIRST_CHUNK`) and the next ones double up to the chunk size, so the launches stay ahead of the work
+  (equal small chunks stalled again after the first).
+
+The gap between steps went from 2.2 to 0.85 ms, the device's MoE work per layer from 182 to 142 µs; see
+[measurements.md](measurements.md#mistral-small-4-decode-the-step-on-the-device).
