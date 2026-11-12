@@ -26,8 +26,15 @@
 
 namespace {
 
-// SLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
-struct moe_cache_slru {
+// ClassLRU: one LRU list per frequency class, over the experts of a group of layers
+// slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
+// CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
+// class = floor(log2(CRF)), at most n_class - 1; each slot is in the LRU list of the class, as of its last use
+// victim: an empty slot, or the least recently used slot of each list not in the current plan() with the max age/2^class
+struct moe_cache_lru {
+    static constexpr int   n_class  = 8; // floor(log2(1/(1 - 2^(-1/crf_half_life)))) = 7, class of CRF_max for half-life of 128
+    static constexpr float crf_half_life = 128.0f; // tokens
+
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
     int32_t empty    = 0; // slot of the experts that are not cached
@@ -35,26 +42,29 @@ struct moe_cache_slru {
     // [n_layer] data of the slot maps, the experts at slot n_slots or later are not cached
     // the experts computed on the CPU read zero slots after the cached ones on the device
     std::vector<int32_t *> slot_map;
-    std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
+    std::vector<int32_t>   key_of;   // [n_slots] key of the expert in the slot, -1 if empty
 
-    // probation and protected LRU lists; hits promote slots to the protected half
-    std::vector<int32_t> prev;
-    std::vector<int32_t> next;
-    int32_t head[2] = { -1, -1 };
-    int32_t tail[2] = { -1, -1 };
-    std::vector<bool> is_protected;
-    int32_t n_protected = 0;
-    int32_t n_filled    = 0; // slots that hold an expert
+    // one LRU list per class, the head is the least recently used end
+    std::vector<int32_t> prev;    // [n_slots] -1 at the ends
+    std::vector<int32_t> next;    // [n_slots]
+    int32_t head[n_class];
+    int32_t tail[n_class];
+    std::vector<int8_t>  list_of; // [n_slots] class list of the slot
+    int32_t n_filled = 0;         // slots that hold an expert
 
-    std::vector<uint32_t> seen; // [n_expert]
+    std::vector<float>   crf;      // [n_layer*n_expert]
+    std::vector<int64_t> last_use; // [n_layer*n_expert] layer clock at the last use, -1 if not used
+    std::vector<int64_t> clock;    // [n_layer] tokens seen by the layer (as added by plan() for each ubatch)
+
+    std::vector<uint32_t> seen; // [n_expert] seen[e] == seen_gen if expert e is selected by the current plan()
     uint32_t seen_gen = 0;
-    std::vector<int32_t> uniq;
+    std::vector<int32_t> uniq;  // the distinct selected experts
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
 
     // asynchronous admission: slots being uploaded, by key of their expert; not mapped and never victims until published
     std::vector<bool> pending;
-    std::unordered_map<int32_t, int32_t> pend; // il*n_expert + expert -> slot
+    std::unordered_map<int32_t, int32_t> pend; // key -> slot
 
     // exclusive slots (LLAMA_MOE_CACHE_EXCLUSIVE): the host slot a victim was downloaded into, -1 if none, and whether
     // that download is in flight; kept: the slot is a victim of the current plan
@@ -74,6 +84,7 @@ struct moe_cache_slru {
     }
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+        GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
         this->empty    = n_slots;
@@ -85,9 +96,16 @@ struct moe_cache_slru {
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
+        for (int c = 0; c < n_class; ++c) {
+            head[c] = -1;
+            tail[c] = -1;
+        }
         head[0] = 0;
         tail[0] = n_slots - 1;
-        is_protected.assign(n_slots, false);
+        list_of.assign(n_slots, 0);
+        crf.assign((size_t) n_layer*n_expert, 0.0f);
+        last_use.assign((size_t) n_layer*n_expert, -1);
+        clock.assign(n_layer, 0);
         seen.assign(n_expert, 0);
         pending.assign(n_slots, false);
         staged.assign(n_slots, -1);
@@ -95,10 +113,10 @@ struct moe_cache_slru {
         kept.assign(n_slots, false);
     }
 
-    // move slot s to the most recently used end of a segment
-    void move(int32_t s, bool protect) {
-        const bool from = is_protected[s];
-        if (from == protect && s == tail[from]) {
+    // move slot s to the most recently used end of list c
+    void move(int32_t s, int c) {
+        const int from = list_of[s];
+        if (from == c && s == tail[from]) {
             return;
         }
         if (prev[s] >= 0) {
@@ -112,39 +130,82 @@ struct moe_cache_slru {
             tail[from] = prev[s];
         }
 
-        prev[s] = tail[protect];
+        prev[s] = tail[c];
         next[s] = -1;
-        if (tail[protect] >= 0) {
-            next[tail[protect]] = s;
+        if (tail[c] >= 0) {
+            next[tail[c]] = s;
         } else {
-            head[protect] = s;
+            head[c] = s;
         }
-        tail[protect] = s;
-        is_protected[s] = protect;
-        n_protected += int(protect) - int(from);
+        tail[c] = s;
+        list_of[s] = c;
     }
 
-    void touch(int32_t s) {
-        move(s, true);
-        if (n_protected > n_slots/2) {
-            move(head[1], false);
+    // key = index of an expert of a layer in crf and last_use
+    int32_t make_key(int32_t il, int32_t e) const { return il*n_expert + e; }
+    int32_t key_layer (int32_t key) const { return key / n_expert; }
+    int32_t key_expert(int32_t key) const { return key % n_expert; }
+
+    // for a key after use(): its CRF is >= 1, so log2 is >= 0 and the cast is the floor
+    int class_of(int32_t key) const {
+        return std::min(n_class - 1, (int) std::log2(crf[key]));
+    }
+
+    // the CRF of a key, decayed by the time since its last use
+    float decayed_crf(int32_t il, int32_t key) const {
+        return crf[key]*std::exp2(-(clock[il] - last_use[key])/crf_half_life);
+    }
+
+    // an unused key gets 1 because crf[key] is 0 prior to first use
+    void use(int32_t il, int32_t key) {
+        crf[key]      = decayed_crf(il, key) + 1.0f;
+        last_use[key] = clock[il];
+    }
+
+    // the experts selected by this plan() must not be evicted, nor the slots this plan() filled already
+    bool is_selected(int32_t il, int32_t key) const {
+        if (key < 0) {
+            return false; // unused slot
         }
+        if (key_layer(key) != il) {
+            return false; // seen is per expert index, an expert of another layer can have the same index
+        }
+        return seen[key_expert(key)] == seen_gen;
+    }
+
+    // the least recently used slot of list c that this plan() does not select and that is not being uploaded, -1 if none
+    int32_t candidate(int c, int32_t il) const {
+        for (int32_t s = head[c]; s >= 0; s = next[s]) {
+            if (!pending[s] && !is_selected(il, key_of[s])) {
+                return s;
+            }
+        }
+        return -1;
     }
 
     int32_t victim(int32_t il) const {
-        for (int segment = 0; segment < 2; ++segment) {
-            for (int32_t s = head[segment]; s >= 0; s = next[s]) {
-                if (pending[s]) {
-                    continue;
-                }
-                const int32_t key = key_of[s];
-                // keep every expert selected by this request, including earlier fills
-                if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
-                    return s;
-                }
+        int32_t res = -1;
+        double res_score = -1.0;
+        for (int c = 0; c < n_class; ++c) {
+            const int32_t s = candidate(c, il);
+            if (s < 0) {
+                continue;
+            }
+            const int32_t key = key_of[s];
+            if (key < 0) {
+                return s; // unused slot
+            }
+            const int64_t age   = clock[key_layer(key)] - last_use[key];
+            const double  score = std::ldexp((double) age, -c); // age/2^class
+            if (score > res_score) {
+                res       = s;
+                res_score = score;
             }
         }
-        GGML_ABORT("no SLRU victim");
+        if (res < 0) {
+            GGML_ABORT("no MoE cache victim");
+        }
+        return res;
     }
 
     struct fill {
@@ -152,16 +213,18 @@ struct moe_cache_slru {
         int32_t slot;
     };
 
-    // give a slot to each expert selected by ids in layer il, evicting from probation first
+    // give a slot to each expert selected by ids (n_tokens tokens) in layer il
     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // with skip_rank > 0, a miss that every token ranks skip_rank-th or later (ids are sorted by score, best
     // first) reads a zero slot and is left out of the CPU part too: it is skipped, an approximation
     // only the misses cpu_ok accepts may go to the CPU; the others are filled like any miss
+    // with max_admit > 0, all the misses cpu_ok accepts go to the CPU and up to max_admit of them are admitted: each
+    // takes a slot that stays pending until publish()
     // returns false if the ids select more distinct experts than there are slots
     template <typename F, typename G>
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, int32_t skip_rank,
-            F && n_cpu, G && cpu_ok, uint64_t & rng, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit,
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, int32_t skip_rank,
+            F && n_cpu, G && cpu_ok, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit,
             size_t & n_skip, size_t max_admit, std::vector<fill> & admits) {
         fills.clear();
         cpu.clear();
@@ -187,11 +250,13 @@ struct moe_cache_slru {
 
         int32_t * slots = slot_map[il];
 
-        // promote hits before choosing victims for misses
+        // update the CRF of all selected experts and promote hits before choosing victims for misses
         misses.clear();
         for (int32_t e : uniq) {
+            const int32_t key = make_key(il, e);
+            use(il, key);
             if (slots[e] < n_slots) {
-                touch(slots[e]);
+                move(slots[e], class_of(key));
                 n_hit++;
             } else {
                 misses.push_back(e);
@@ -199,7 +264,7 @@ struct moe_cache_slru {
         }
 
         // the zero slot of a miss: the first one none of its tokens reads yet, or -1 if there is none left
-        const size_t n_tokens = n_ids/n_used;
+        GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
         bool zero_init = false;
         auto take_zero = [&](int32_t e) -> int32_t {
             if (!zero_init) {
@@ -207,18 +272,21 @@ struct moe_cache_slru {
                 zero_init = true;
             }
             uint64_t used = 0;
-            for (size_t it = 0; it < n_tokens; ++it) {
+            for (int64_t it = 0; it < n_tokens; ++it) {
                 for (int32_t k = 0; k < n_used; ++k) {
                     if (ids[it*n_used + k] == e) {
                         used |= token_zero[it];
                     }
                 }
             }
-            const int32_t z = used == ~0ull ? 64 : __builtin_ctzll(~used);
+            int32_t z = 0;
+            while (z < 64 && (used >> z & 1)) {
+                z++;
+            }
             if (z >= n_zero) {
                 return -1;
             }
-            for (size_t it = 0; it < n_tokens; ++it) {
+            for (int64_t it = 0; it < n_tokens; ++it) {
                 for (int32_t k = 0; k < n_used; ++k) {
                     if (ids[it*n_used + k] == e) {
                         token_zero[it] |= 1ull << z;
@@ -247,19 +315,20 @@ struct moe_cache_slru {
             }
         }
 
-        // the misses left to the CPU are picked at random, so that every expert can enter the cache; with asynchronous
-        // admission all of them go to the CPU, and the share that would be filled is admitted in the background. They
-        // are picked among the misses cpu_ok accepts, moved first; when it accepts them all, nothing moves
-        const size_t  n_ok    = std::partition(misses.begin(), misses.end(), cpu_ok) - misses.begin();
-        const bool    async   = max_admit > 0;
-        const size_t  n_share = std::min(n_cpu(misses.size()), n_ok);
-        const size_t  n_c     = async ? n_ok : n_share;
-        size_t        n_admit = async ? std::min(n_ok - n_share, max_admit) : 0;
-        for (size_t i = 0; i < n_c; ++i) {
-            rng = rng*6364136223846793005ull + 1442695040888963407ull;
-            std::swap(misses[i], misses[i + (rng >> 33) % (n_ok - i)]);
-        }
+        // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
+        // all misses are used at the same clock, so their CRF compare without decay
+        // they are picked among the misses cpu_ok accepts, moved first
+        const size_t n_ok    = std::partition(misses.begin(), misses.end(), cpu_ok) - misses.begin();
+        const bool   async   = max_admit > 0;
+        const size_t n_share = std::min(n_cpu(misses.size()), n_ok);
+        const size_t n_c     = async ? n_ok : n_share;
+        size_t       n_admit = async ? std::min(n_ok - n_share, max_admit) : 0;
         if (n_c > 0) {
+            std::sort(misses.begin(), misses.begin() + n_ok, [&](int32_t a, int32_t b) {
+                const float crf_a = crf[make_key(il, a)];
+                const float crf_b = crf[make_key(il, b)];
+                return crf_a != crf_b ? crf_a < crf_b : a < b;
+            });
             size_t n_keep = n_c;
             for (size_t i = 0; i < n_keep; ) {
                 const int32_t e = misses[i];
@@ -275,32 +344,34 @@ struct moe_cache_slru {
             misses.erase(misses.begin(), misses.begin() + n_keep);
         }
 
-        // admit some of the experts left to the CPU: each takes a victim slot now, pending until its upload is done
+        // admit the experts left to the CPU with the highest CRF: each takes a victim slot now, pending until its upload is done
         for (size_t i = cpu.size(); i-- > 0 && n_admit > 0; ) {
             const int32_t e   = cpu[i].expert;
-            const int32_t key = il*n_expert + e;
+            const int32_t key = make_key(il, e);
             if (pend.count(key) > 0) {
                 continue;
             }
             const int32_t s = victim(il);
             if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+                slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
                 n_filled++;
             }
             key_of[s]  = key;
             pending[s] = true;
             pend[key]  = s;
-            move(s, false);
+            move(s, class_of(key));
             admits.push_back({ e, s });
             n_admit--;
         }
 
-        // sorted misses usually get consecutive slots, so the uploads can be merged
+        // fill the misses in expert order: victim() takes unused slots, and slots filled by one plan(), in list order,
+        // so consecutive experts often get consecutive slots and one upload
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
+            const int32_t key = make_key(il, e);
             // an expert still being admitted is filled into its own slot, with the same bytes
-            if (const auto it = pend.find(il*n_expert + e); it != pend.end()) {
+            if (const auto it = pend.find(key); it != pend.end()) {
                 const int32_t s = it->second;
                 pending[s] = false;
                 pend.erase(it);
@@ -310,21 +381,22 @@ struct moe_cache_slru {
             }
             const int32_t s = victim(il);
             if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+                slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
                 n_filled++;
             }
-            key_of[s] = il*n_expert + e;
-            slots[e] = s;
-            move(s, false);
+            key_of[s] = key;
+            slots[e]  = s;
+            move(s, class_of(key));
             fills.push_back({ e, s });
         }
+        clock[il] += n_tokens;
         return true;
     }
 
     // an admitted expert whose upload is done becomes a hit, unless it was filled since
     void publish(int32_t il, int32_t e, int32_t s) {
-        const int32_t key = il*n_expert + e;
+        const int32_t key = make_key(il, e);
         const auto it = pend.find(key);
         if (it == pend.end() || it->second != s || !pending[s] || key_of[s] != key) {
             return;
@@ -393,12 +465,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         int32_t n_excl   = 0; // exclusive core: the first slots, whose experts have no host copy
         std::vector<int32_t> spares;     // host slots that hold no expert
         std::vector<int32_t> quarantine; // host slots of experts that entered exclusive slots, spares from the next request
-        moe_cache_slru slru;
+        moe_cache_lru lru;
     };
 
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * slot_map_cpu = nullptr; // looked up in place of slot_map by the graphs with a CPU part, if cpu_share > 0, its data is not used
         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
@@ -419,14 +492,6 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         size_t bytes  = 0;
     };
 
-    // device data read by the CPU part of a layer
-    struct stash_entry {
-        const ggml_tensor * base; // the tensor that owns the data
-        size_t offs;              // offset of the data in base
-        size_t size;
-        size_t pos;               // position in stash_buf
-    };
-
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
@@ -441,12 +506,12 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     std::vector<group> groups;
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
-    std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
     std::vector<int32_t> ids;
-    std::vector<moe_cache_slru::fill> fills;
-    std::vector<moe_cache_slru::fill> cpu;
-    std::vector<moe_cache_slru::fill> admits;
+    std::vector<moe_cache_lru::fill> fills;
+    std::vector<moe_cache_lru::fill> cpu;
+    std::vector<moe_cache_lru::fill> admits;
 
     // asynchronous admission (LLAMA_MOE_CACHE_ASYNC): uploads into pending slots on a second stream of each device
     struct upload {
@@ -662,19 +727,6 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     int32_t  skip_rank = 0; // LLAMA_MOE_CACHE_TAIL_SKIP, 0 = off
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
-    uint64_t rng       = 0x853c49e6748fea9bull;
-
-    // the CPU part of the layer of a slot lookup
-    struct cpu_part {
-        int32_t n_used; // experts per token
-        std::vector<const ggml_tensor *> inputs; // device tensors read by the CPU part
-    };
-    std::unordered_map<const ggml_tensor *, cpu_part> cpu_parts; // slot lookup -> CPU part, no inputs if there is no CPU part
-    std::unordered_set<const ggml_tensor *> cpu_outputs; // results of the CPU parts, copied to the device asynchronously
-
-    // the device data read with the selected experts of the last slot lookup, in host memory that the device can copy to asynchronously
-    std::vector<stash_entry> stash;
-    ggml_backend_buffer_ptr stash_buf;
 
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
@@ -849,9 +901,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 }
             }
             g.n_active = phases ? g.n_core : g.n_slots;
-            g.slru.init(model.layers.size(), n_expert, g.n_slots);
+            g.lru.init(model.layers.size(), n_expert, g.n_slots);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 2 : 1); // slot map and CPU map
+            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -912,9 +964,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
-                layer_of[l.slot_map] = il;
+                layer_of[l.slot_map] = { il, false };
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
                 if (n_zero > 0) {
+                    l.slot_map_cpu = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.slot_map_cpu, "moe_cache.slot_map_cpu-%d", il);
+                    layer_of[l.slot_map_cpu] = { il, true };
+                    buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map_cpu), alignment_host);
                     l.cpu_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                     ggml_format_name(l.cpu_map, "moe_cache.cpu_map-%d", il);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
@@ -955,8 +1011,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 for (int32_t il : g.layers) {
                     if (layers[il].slot_map != nullptr) {
                         int32_t * slots = (int32_t *) layers[il].slot_map->data;
-                        std::fill(slots, slots + layers[il].slot_map->ne[1], g.slru.empty);
-                        g.slru.slot_map[il] = slots;
+                        std::fill(slots, slots + layers[il].slot_map->ne[1], g.lru.empty);
+                        g.lru.slot_map[il] = slots;
                     }
                 }
             }
@@ -983,8 +1039,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
-                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
-                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%, %.1f tokens worth)\n", __func__,
+                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
+                        (double) g.n_slots/(g.layers.size()*n_expert_used));
                 }
             }
         }
@@ -1155,7 +1212,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     // the slots [from, to) of group ig no longer hold an expert
     void evict_range(size_t ig, int32_t from, int32_t to) {
         group & g = groups[ig];
-        moe_cache_slru & sl = g.slru;
+        moe_cache_lru & sl = g.lru;
         const int32_t ne = sl.n_expert;
         int32_t * table = g.id < (int32_t) hdev.size() ? hdev[g.id].table_host : nullptr;
         for (int32_t s = from; s < to; ++s) {
@@ -1219,7 +1276,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             // a slot still pending holds a dropped re-admission: its expert is lent again
             lent.clear();
             for (size_t ig = 0; ig < groups.size(); ++ig) {
-                const moe_cache_slru & sl = groups[ig].slru;
+                const moe_cache_lru & sl = groups[ig].lru;
                 for (int32_t s = groups[ig].n_core; s < groups[ig].n_slots; ++s) {
                     const int32_t key = sl.key_of[s];
                     if (key >= 0) {
@@ -1291,7 +1348,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         };
         for (const publication & pb : lent) {
             group & g = groups[pb.ig];
-            moe_cache_slru & sl = g.slru;
+            moe_cache_lru & sl = g.lru;
             const int32_t key = pb.il*sl.n_expert + pb.expert;
             if (sl.key_of[pb.slot] >= 0 || sl.pending[pb.slot] || sl.slot_map[pb.il][pb.expert] < sl.n_slots || sl.pend.count(key) > 0) {
                 continue;
@@ -1580,7 +1637,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             if (g.n_slots == 0) {
                 continue;
             }
-            moe_cache_slru & sl = g.slru;
+            moe_cache_lru & sl = g.lru;
             host_device & hd = hdev[g.id];
             const int32_t ne = sl.n_expert;
             keys.clear();
@@ -1678,14 +1735,14 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         const double share = core_bytes > 0 ? std::min(1.0, (double) budget/core_bytes) : 0.0;
         const int32_t ne = hp_ne;
         for (const group & g : groups) {
-            GGML_ASSERT(g.slru.n_expert == ne);
+            GGML_ASSERT(g.lru.n_expert == ne);
         }
         std::vector<std::vector<int32_t>> excl_of(layers.size()); // the experts of each layer the exclusive slots hold
         for (group & g : groups) {
             g.n_excl = (int32_t) (g.n_core*share);
             for (int32_t s = 0; s < g.n_excl; ++s) {
-                const int32_t key = g.slru.key_of[s];
-                if (key >= 0 && !g.slru.pending[s]) {
+                const int32_t key = g.lru.key_of[s];
+                if (key >= 0 && !g.lru.pending[s]) {
                     excl_of[key / ne].push_back(key % ne);
                 }
             }
@@ -1789,7 +1846,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         host->take_counts(host_score, host_decay, profile_new.empty() ? nullptr : &profile_new);
         if (excl_on) {
             for (const svc_move & mv : svc_plan) {
-                const moe_cache_slru & sl = groups[mv.ig].slru;
+                const moe_cache_lru & sl = groups[mv.ig].lru;
                 excl_n_waited += !mv.started && mv.slot < groups[mv.ig].n_excl && sl.key_of[mv.slot] >= 0 && sl.staged[mv.slot] < 0;
             }
         }
@@ -1802,7 +1859,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             if (g.n_slots == 0) {
                 continue;
             }
-            moe_cache_slru & sl = g.slru;
+            moe_cache_lru & sl = g.lru;
             const int32_t ne = sl.n_expert;
             host_free.clear();
             host_vict.clear();
@@ -1858,11 +1915,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             // a download whose slot is no longer a victim gives its host slot back
             for (const svc_move & mv : svc_plan) {
                 if (mv.slot < groups[mv.ig].n_excl) {
-                    groups[mv.ig].slru.staging_keep(mv.slot);
+                    groups[mv.ig].lru.staging_keep(mv.slot);
                 }
             }
             for (group & g : groups) {
-                moe_cache_slru & sl = g.slru;
+                moe_cache_lru & sl = g.lru;
                 for (int32_t s = 0; s < g.n_excl; ++s) {
                     const bool victim = sl.take_kept(s);
                     if (sl.staged[s] >= 0 && !victim) {
@@ -1882,7 +1939,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         for (size_t i = svc_pos; i < svc_plan.size(); ++i) {
             const svc_move & mv = svc_plan[i];
             group & g = groups[mv.ig];
-            moe_cache_slru & sl = g.slru;
+            moe_cache_lru & sl = g.lru;
             const int32_t vk = mv.slot < g.n_excl ? sl.key_of[mv.slot] : -1;
             if (mv.started || vk < 0 || sl.pending[mv.slot] || sl.staged[mv.slot] >= 0 || sl.staging[mv.slot] || g.spares.empty()) {
                 continue;
@@ -1926,7 +1983,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 continue;
             }
             group & g = groups[mv.ig];
-            moe_cache_slru & sl = g.slru;
+            moe_cache_lru & sl = g.lru;
             const int32_t ne = sl.n_expert;
             const int32_t vk = sl.key_of[mv.slot];
             if (mv.slot >= g.n_active || sl.pending[mv.slot] || sl.pend.count(mv.key) > 0 ||
@@ -2011,7 +2068,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         for (const publication & pb : svc_started) {
-            moe_cache_slru & sl = groups[pb.ig].slru;
+            moe_cache_lru & sl = groups[pb.ig].lru;
             const int32_t key = pb.il*sl.n_expert + pb.expert;
             sl.pending[pb.slot] = false;
             sl.pend.erase(key);
@@ -2023,7 +2080,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         svc_pos = 0;
         for (group & g : groups) {
             for (int32_t s = 0; s < g.n_excl; ++s) {
-                if (g.slru.staged[s] >= 0) {
+                if (g.lru.staged[s] >= 0) {
                     excl_unstage(g, s);
                 }
             }
@@ -2032,8 +2089,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
 
     // the downloaded host copy of the expert of exclusive slot s is not needed for now: its host slot becomes a spare
     void excl_unstage(group & g, int32_t s) {
-        g.spares.push_back(g.slru.staged[s]);
-        g.slru.staged[s] = -1;
+        g.spares.push_back(g.lru.staged[s]);
+        g.lru.staged[s] = -1;
         excl_n_unstaged++;
     }
 
@@ -2189,11 +2246,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 if (table == nullptr) {
                     continue;
                 }
-                const int32_t * slots = g.slru.slot_map[il];
+                const int32_t * slots = g.lru.slot_map[il];
                 lacking.clear();
                 for (int32_t e = 0; e < ne; ++e) {
                     table[(size_t) il*ne + e] = 0;
-                    if (slots[e] >= g.slru.n_slots) {
+                    if (slots[e] >= g.lru.n_slots) {
                         lacking.push_back(e);
                     }
                 }
@@ -2395,7 +2452,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     // admits the experts of group ig selected most that are not cached, into free slots or over cached ones selected less
     void host_plan(size_t ig, admit_job & job) {
         group & g = groups[ig];
-        moe_cache_slru & sl = g.slru;
+        moe_cache_lru & sl = g.lru;
         host_device & hd = hdev[g.id];
         const int32_t ne = sl.n_expert;
 
@@ -2496,11 +2553,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             group & g = groups[pb.ig];
             host_device & hd = hdev[g.id];
             hd.in_flight--;
-            const int32_t key = pb.il*g.slru.n_expert + pb.expert;
-            if (g.slru.key_of[pb.slot] != key || !g.slru.pending[pb.slot]) {
+            const int32_t key = pb.il*g.lru.n_expert + pb.expert;
+            if (g.lru.key_of[pb.slot] != key || !g.lru.pending[pb.slot]) {
                 continue;
             }
-            g.slru.publish(pb.il, pb.expert, pb.slot);
+            g.lru.publish(pb.il, pb.expert, pb.slot);
             hd.table_host[key] = pb.slot;
             n_admitted++;
             // an expert in an exclusive slot needs its host copy no more
@@ -2518,7 +2575,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             }
             for (const stage & x : st) {
                 group & g = groups[x.ig];
-                moe_cache_slru & sl = g.slru;
+                moe_cache_lru & sl = g.lru;
                 excl_in_flight--;
                 sl.staging[x.slot] = false;
                 if (sl.key_of[x.slot] == x.key && !sl.pending[x.slot] && sl.staged[x.slot] < 0) {
@@ -2756,7 +2813,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         }
     }
 
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
@@ -2771,7 +2828,28 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
             return nullptr;
         }
-        return l.slot_map;
+        GGML_ASSERT(!cpu_part || l.slot_map_cpu != nullptr);
+        return cpu_part ? l.slot_map_cpu : l.slot_map;
+    }
+
+    ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].cpu_map == nullptr) {
+            return nullptr;
+        }
+        // the scheduler would run the CPU part on a device that offloads such batches from host weights
+        ggml_tensor probe = {};
+        probe.op    = GGML_OP_MUL_MAT_ID;
+        probe.type  = GGML_TYPE_F32;
+        probe.ne[0] = 1;
+        probe.ne[1] = n_expert_used;
+        probe.ne[2] = n_tokens;
+        probe.ne[3] = 1;
+        for (const device & d : devices) {
+            if (ggml_backend_offload_op(d.backend, &probe)) {
+                return nullptr;
+            }
+        }
+        return layers[il].cpu_map;
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
@@ -2791,7 +2869,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         }
 
         // large batches only read the cache, so the experts used in generation stay in it
-        const int32_t * slots = g.slru.slot_map[b.il];
+        const int32_t * slots = g.lru.slot_map[b.il];
         if (slots == nullptr || slots[e] >= g.n_slots) {
             return 0;
         }
@@ -2844,54 +2922,11 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         }
         const binding & b = it->second;
         const group & g = groups[layers[b.il].ig];
-        const int32_t * slots = g.slru.slot_map[b.il];
+        const int32_t * slots = g.lru.slot_map[b.il];
         return backend == devices[g.id].backend && slots != nullptr && slots[e] < g.n_slots;
     }
 
-    static const ggml_tensor * base_of(const ggml_tensor * t) {
-        while (t->view_src != nullptr) {
-            t = t->view_src;
-        }
-        return t;
-    }
-
-    // an input of the CPU part of the last layer, it was read from the device with the selected experts
-    bool copy_cpu_input(const ggml_tensor * src, ggml_tensor * dst) const {
-        if (stash.empty() || dst->buffer == nullptr || !ggml_backend_buffer_is_host(dst->buffer) || src->data == nullptr) {
-            return false;
-        }
-        const ggml_tensor * base = base_of(src);
-        const size_t offs = (const uint8_t *) src->data - (const uint8_t *) base->data;
-        const size_t size = ggml_nbytes(src);
-        for (const stash_entry & e : stash) {
-            if (e.base == base && offs >= e.offs && offs + size <= e.offs + e.size) {
-                memcpy(dst->data, (const uint8_t *) ggml_backend_buffer_get_base(stash_buf.get()) + e.pos + (offs - e.offs), size);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output) {
-        cpu_parts[lookup] = { n_used, std::move(inputs) };
-        if (output != nullptr) {
-            cpu_outputs.insert(output);
-        }
-    }
-
-    // the result of a CPU part, the device copies it after the work queued on it, without waiting on the host
-    // the next CPU part runs after the next slot lookup, which synchronizes the device, so the result is not overwritten before it is copied
-    bool copy_cpu_output(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) const {
-        if (cpu_outputs.count(src) == 0 || src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) ||
-            dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
-            return false;
-        }
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
-        return true;
-    }
-
     void begin() {
-        stash.clear();
         if (host) {
             host_begin();
         }
@@ -2900,9 +2935,10 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
-            return copy_cpu_input(src, dst) || copy_cpu_output(backend, src, dst);
+            return false;
         }
-        const int32_t il = it->second;
+        const int32_t il      = it->second.first;
+        const bool    has_cpu = it->second.second;
         layer & l = layers[il];
         group & g = groups[l.ig];
 
@@ -2929,49 +2965,16 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             }
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
+        GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_moe_cache_slots
 
-        // the device inputs of the CPU part are read with the selected experts, so the CPU part does not wait for the device
-        // the inputs computed in this split are left to the scheduler
-        // the graph has a CPU part for this layer if it registered its inputs
-        const auto it_cpu = cpu_parts.find(lookup);
-        const bool has_cpu = l.cpu_map != nullptr && it_cpu != cpu_parts.end() && !it_cpu->second.inputs.empty();
-
-        stash.clear();
-        size_t stash_size = 0;
-        if (has_cpu) {
-            for (const ggml_tensor * t : it_cpu->second.inputs) {
-                const ggml_tensor * base = base_of(t);
-                if (base->buffer == nullptr || ggml_backend_buffer_is_host(base->buffer) || t->data == nullptr) {
-                    continue;
-                }
-                bool in_split = false;
-                for (int i = 0; i < n_nodes && !in_split; ++i) {
-                    in_split = ggml_graph_node(graph, i) == base;
-                }
-                if (in_split) {
-                    continue;
-                }
-                const size_t offs = (const uint8_t *) t->data - (const uint8_t *) base->data;
-                stash.push_back({ base, offs, ggml_nbytes(t), stash_size });
-                stash_size += GGML_PAD(ggml_nbytes(t), 64);
-            }
-            if (!stash_buf || ggml_backend_buffer_get_size(stash_buf.get()) < stash_size) {
-                ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
-                stash_buf.reset(ggml_backend_buft_alloc_buffer(buft ? buft : ggml_backend_cpu_buffer_type(), 2*stash_size));
-                GGML_ASSERT(stash_buf);
-            }
-            uint8_t * stash_data = (uint8_t *) ggml_backend_buffer_get_base(stash_buf.get());
-            for (const stash_entry & e : stash) {
-                ggml_backend_tensor_get_async(backend, e.base, stash_data + e.pos, e.offs, e.size);
-            }
-        }
+        const int32_t n_used = (int32_t) sel->src[0]->ne[0];
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
 
         if (trace != nullptr) {
-            write_trace(il, it_cpu != cpu_parts.end() ? it_cpu->second.n_used : n_expert_used);
+            write_trace(il, n_used);
         }
 
         // admissions uploaded since the last plan become hits; after the synchronization above, so the slot maps
@@ -2983,13 +2986,13 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 ready.swap(done);
             }
             for (const publication & pb : ready) {
-                groups[pb.ig].slru.publish(pb.il, pb.expert, pb.slot);
+                groups[pb.ig].lru.publish(pb.il, pb.expert, pb.slot);
             }
             in_flight -= std::min(in_flight, ready.size());
         }
 
         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
-        const uint32_t share_q = has_cpu && g.slru.n_filled == g.slru.n_slots ? cpu_share_q : 0;
+        const uint32_t share_q = has_cpu && g.lru.n_filled == g.lru.n_slots ? cpu_share_q : 0;
         auto n_cpu = [&](size_t n_miss) {
             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
             l.cpu_acc = acc & 0xffff;
@@ -3004,8 +3007,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         size_t n_hit = 0;
         size_t n_skip = 0;
         const size_t max_admit = async_admit && has_cpu ? async_max - std::min(async_max, in_flight) : 0;
-        if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, has_cpu ? skip_rank : 0,
-                n_cpu, cpu_ok, rng, fills, cpu, n_hit, n_skip, max_admit, admits)) {
+        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, has_cpu ? skip_rank : 0,
+                n_cpu, cpu_ok, fills, cpu, n_hit, n_skip, max_admit, admits)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -3069,7 +3072,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
 
         return true;
     }
@@ -3104,24 +3107,16 @@ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
 }
 
-ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
-    return pimpl->get_slot_map(il, n_tokens, n_expert_used);
+ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
+    return pimpl->get_slot_map(il, n_tokens, n_expert_used, cpu_part);
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
-float llama_moe_cache::cpu_share() const {
-    return pimpl->cpu_share;
-}
-
-ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
-    return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_map : nullptr;
-}
-
-void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * output) {
-    pimpl->set_cpu_part(lookup, n_used, std::move(inputs), output);
+ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
+    return pimpl->get_cpu_map(il, n_tokens);
 }
 
 void llama_moe_cache::begin() {
