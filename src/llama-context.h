@@ -440,6 +440,16 @@ private:
     uint32_t                graph_slot_tokens = 16;
     uint64_t                graph_slot_clock  = 0;
 
+    // a graph with backend samplers holds their ops and their inputs (in the samplers' own buffers), so it computes
+    // again only with the samplers it was built with: a sampler set after it, even at the address of a freed one, is
+    // not. Every llama_set_sampler advances the epoch.
+    uint64_t sampling_epoch = 0;
+
+    // after a graph is built: the epoch of its samplers
+    void sampling_bind(llm_graph_result * res);
+    // before a graph is reused: its samplers are the current ones
+    bool sampling_bound(const llm_graph_result * res) const;
+
     // the slot with the allocated graph of the ubatch, nullptr if it goes the regular way
     graph_slot * graph_slot_get(const llama_ubatch & ubatch, llm_graph_type gtype, const llama_memory_context_i * mctx);
 

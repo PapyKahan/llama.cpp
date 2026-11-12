@@ -1020,6 +1020,9 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // the sampler epoch this graph was built in, see llama_context::sampling_epoch
+    uint64_t sampling_epoch = 0;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 

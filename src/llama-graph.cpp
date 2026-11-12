@@ -1437,6 +1437,8 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
 
+    sampling_epoch = 0;
+
     params = {};
 
     inputs.clear();

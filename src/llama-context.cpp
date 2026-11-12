@@ -1990,12 +1990,23 @@ static std::string llama_sampler_backend_sig(const llama_sampler * smpl) {
     return res;
 }
 
+void llama_context::sampling_bind(llm_graph_result * res) {
+    res->sampling_epoch = sampling_epoch;
+}
+
+bool llama_context::sampling_bound(const llm_graph_result * res) const {
+    return sampling.samplers.empty() || res->sampling_epoch == sampling_epoch;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+
+    // the graphs built with the samplers being replaced do not compute with the new ones, even at the same address
+    ++sampling_epoch;
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
@@ -2123,7 +2134,7 @@ llama_context::graph_slot * llama_context::graph_slot_get(const llama_ubatch & u
     }
 
     for (auto & gs : graph_slots) {
-        if (gs.active && ggml_backend_sched_shared_valid(gs.sched.get()) &&
+        if (gs.active && ggml_backend_sched_shared_valid(gs.sched.get()) && sampling_bound(gs.res.get()) &&
                 gs.res->can_reuse(graph_params(gs.res.get(), ubatch, mctx, gtype, gs.sched.get()))) {
             gs.used = ++graph_slot_clock;
             n_reused++;
@@ -2147,6 +2158,7 @@ llama_context::graph_slot * llama_context::graph_slot_get(const llama_ubatch & u
     ggml_backend_sched_set_eval_callback(gs.sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
     ggml_cgraph * gf = model.build_graph(graph_params(gs.res.get(), ubatch, mctx, gtype, gs.sched.get()));
+    sampling_bind(gs.res.get());
 
     // a graph larger than the compute buffers of sched goes the regular way
     if (gf == nullptr || !ggml_backend_sched_alloc_graph(gs.sched.get(), gf)) {
@@ -2185,7 +2197,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (slot != nullptr) {
         // the slot holds the allocated graph of the ubatch
-    } else if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    } else if (!graph_reuse_disable && gf_res_prev_active == res && sampling_bound(res) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2206,6 +2218,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        sampling_bind(res);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -3419,6 +3432,7 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+    sampling_bind(res);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
@@ -5139,6 +5153,7 @@ void llama_context::opt_epoch_iter(
             res->reset();
 
             auto * gf = model.build_graph(gparams);
+            sampling_bind(res);
 
             struct ggml_context * ctx_compute_opt;
             {

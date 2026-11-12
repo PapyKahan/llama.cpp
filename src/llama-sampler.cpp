@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -568,6 +569,34 @@ private:
 
     bool is_init;
     bool support;
+};
+
+// the inputs a backend sampler fills before each computation, in a buffer of its own: every graph built with the
+// sampler reads these tensors, so whichever graph computes (a context keeps several in its graph slots, sharing their
+// compute buffers) reads what the sampler wrote last, and the sampler writes into no compute buffer
+struct llama_sampler_backend_inputs {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+
+    // the tensors make() creates, in a buffer of buft; false, and no tensors, if the buffer cannot be had
+    bool alloc(ggml_backend_buffer_type_t buft, int n_tensors, const std::function<void(ggml_context *)> & make) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx.reset(ggml_init(params));
+        if (!ctx) {
+            return false;
+        }
+        make(ctx.get());
+        buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) {
+            ctx.reset();
+            return false;
+        }
+        return true;
+    }
 };
 
 // .copy_state for samplers deriving from llama_sampler_backend
@@ -1136,8 +1165,13 @@ struct llama_sampler_dist : public llama_sampler_backend {
     size_t n_backend_draws_generated;
     size_t n_backend_draws_committed;
 
-    // inputs for the current sampling graph
+    // inputs of a sampling graph built without the persistent uniforms (the support probe, or no buffer)
     std::vector<ggml_tensor *> inp_uniforms;
+
+    // the uniforms of a graph's chains, one per output of the sequence, see llama_sampler_backend_inputs
+    llama_sampler_backend_inputs inputs;
+    ggml_tensor *                uniforms   = nullptr;
+    uint32_t                     n_uniforms = 0; // the uniforms the chains of the graph being built have taken
 
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
@@ -1267,7 +1301,16 @@ static bool llama_sampler_dist_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    const bool res = llama_sampler_backend_support(smpl, buft);
+    bool res = llama_sampler_backend_support(smpl, buft);
+
+    // without its own uniforms the sampler stays on the CPU: inputs of the graph itself are unsafe with graph slots
+    if (res && !sctx->inputs.alloc(buft, 1, [&](ggml_context * ctx) {
+            sctx->uniforms = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, std::max<uint32_t>(n_outputs_max_per_seq, 1));
+            ggml_set_name(sctx->uniforms, "dist_uniforms");
+        })) {
+        sctx->uniforms = nullptr;
+        res = false;
+    }
 
     sctx->init(res);
     sctx->backend_transactional = n_outputs_max_per_seq > 1;
@@ -1287,10 +1330,18 @@ static void llama_sampler_dist_backend_apply(
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
-    ggml_set_input(inp_uniform);
-    sctx->inp_uniforms.push_back(inp_uniform);
+    ggml_tensor * inp_uniform = nullptr;
+    if (sctx->uniforms != nullptr) {
+        GGML_ASSERT(sctx->n_uniforms < (uint32_t) sctx->uniforms->ne[0] && "more chains than outputs per sequence");
+        inp_uniform = ggml_view_1d(ctx, sctx->uniforms, 1, sctx->n_uniforms*ggml_element_size(sctx->uniforms));
+        ggml_format_name(inp_uniform, "uniform_%u", sctx->n_uniforms);
+        sctx->n_uniforms++;
+    } else {
+        inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
+        ggml_set_input(inp_uniform);
+        sctx->inp_uniforms.push_back(inp_uniform);
+    }
 
     // flatten
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
@@ -1345,7 +1396,7 @@ static void llama_sampler_dist_backend_apply(
 static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    GGML_ASSERT(!sctx->inp_uniforms.empty());
+    GGML_ASSERT(sctx->uniforms != nullptr || !sctx->inp_uniforms.empty());
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_sampler_dist which uses double precision (sampling from
@@ -1355,6 +1406,19 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
 
     auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
+
+    if (sctx->uniforms != nullptr) {
+        // one draw per chain, as many as a graph built with the sampler has
+        std::vector<float> rnd(sctx->uniforms->ne[0]);
+        for (auto & r : rnd) {
+            r = dist(rng);
+            if (sctx->backend_transactional) {
+                ++sctx->n_backend_draws_generated;
+            }
+        }
+        ggml_backend_tensor_set(sctx->uniforms, rnd.data(), 0, ggml_nbytes(sctx->uniforms));
+        return;
+    }
 
     for (auto * inp_uniform : sctx->inp_uniforms) {
         GGML_ASSERT(inp_uniform != nullptr);
@@ -1371,6 +1435,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
     sctx->inp_uniforms.clear();
+    sctx->n_uniforms = 0;
 }
 
 static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
@@ -1417,6 +1482,9 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .n_backend_draws_generated = */ 0,
             /* .n_backend_draws_committed = */ 0,
             /* .inp_uniforms              = */ {},
+            /* .inputs                    = */ {},
+            /* .uniforms                  = */ nullptr,
+            /* .n_uniforms                = */ 0,
         }
     );
 }
@@ -2872,9 +2940,12 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
 
-    // backend graph inputs
+    // backend graph inputs, the sampler's own when inputs_own (see llama_sampler_backend_inputs)
     ggml_tensor * inp_token_ids = nullptr;
     ggml_tensor * inp_counts    = nullptr;
+
+    llama_sampler_backend_inputs inputs;
+    bool                         inputs_own = false;
 
     // backend helpers
     int32_t n_max   = 0;
@@ -3027,7 +3098,23 @@ static bool llama_sampler_penalties_backend_init(
         return false;
     }
 
-    const bool res = llama_sampler_backend_support(smpl, buft);
+    bool res = llama_sampler_backend_support(smpl, buft);
+
+    // without inputs of its own the sampler stays on the CPU: inputs of the graph itself are unsafe with graph slots
+    const int32_t n_max = std::min(sctx->penalty_last_n, sctx->n_vocab);
+    if (res && !sctx->is_disabled() && n_max > 0) {
+        sctx->inputs_own = sctx->inputs.alloc(buft, 2, [&](ggml_context * ctx) {
+            sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_max);
+            ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
+            sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_max);
+            ggml_set_name(sctx->inp_counts, "penalties_counts");
+        });
+        if (!sctx->inputs_own) {
+            sctx->inp_token_ids = nullptr;
+            sctx->inp_counts    = nullptr;
+            res = false;
+        }
+    }
 
     sctx->init(res);
 
@@ -3052,13 +3139,15 @@ static void llama_sampler_penalties_backend_apply(
     sctx->has_candidates = data->candidates != nullptr;
     sctx->n_max   = std::min(sctx->penalty_last_n, sctx->n_vocab);
 
-    sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
-    ggml_set_input(sctx->inp_token_ids);
+    if (!sctx->inputs_own) {
+        sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
+        ggml_set_input(sctx->inp_token_ids);
 
-    sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_counts, "penalties_counts");
-    ggml_set_input(sctx->inp_counts);
+        sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_counts, "penalties_counts");
+        ggml_set_input(sctx->inp_counts);
+    }
 
     if ((int32_t) sctx->host_token_ids.size() != sctx->n_max) {
         sctx->host_token_ids.assign(sctx->n_max, 0);
@@ -3188,8 +3277,10 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
 
 static void llama_sampler_penalties_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
-    sctx->inp_token_ids = nullptr;
-    sctx->inp_counts    = nullptr;
+    if (!sctx->inputs_own) {
+        sctx->inp_token_ids = nullptr;
+        sctx->inp_counts    = nullptr;
+    }
 }
 
 static struct llama_sampler_i llama_sampler_penalties_i = {
@@ -3920,8 +4011,12 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
 
     std::vector<llama_logit_bias> to_search;
 
+    // the sampler's own when inputs_own (see llama_sampler_backend_inputs)
     struct ggml_tensor * inp_logit_bias;
     struct ggml_tensor * inp_logit_idxs;
+
+    llama_sampler_backend_inputs inputs;
+    bool                         inputs_own;
 };
 
 static const char * llama_sampler_logit_bias_name(const struct llama_sampler * smpl) {
@@ -4033,26 +4128,41 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
 
 static void llama_sampler_logit_bias_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
-    sctx->inp_logit_bias = nullptr;
-    sctx->inp_logit_idxs = nullptr;
+    if (!sctx->inputs_own) {
+        sctx->inp_logit_bias = nullptr;
+        sctx->inp_logit_idxs = nullptr;
+    }
 }
 
 static bool llama_sampler_logit_bias_backend_init(
         struct llama_sampler       * smpl,
         ggml_backend_buffer_type_t   buft,
         uint32_t                     n_outputs_max_per_seq) {
-    GGML_UNUSED(buft);
     GGML_UNUSED(n_outputs_max_per_seq);
 
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
 
-    sctx->init(true);
-
     if (sctx->logit_bias.empty()) {
+        sctx->init(true);
         return true;
     }
 
-    return true;
+    // without inputs of its own the sampler stays on the CPU: inputs of the graph itself are unsafe with graph slots
+    const int64_t n = sctx->logit_bias.size();
+    sctx->inputs_own = sctx->inputs.alloc(buft, 2, [&](ggml_context * ctx) {
+        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(sctx->inp_logit_bias, "logit_bias");
+        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
+    });
+    if (!sctx->inputs_own) {
+        sctx->inp_logit_bias = nullptr;
+        sctx->inp_logit_idxs = nullptr;
+    }
+
+    sctx->init(sctx->inputs_own);
+
+    return sctx->inputs_own;
 }
 
 static struct llama_sampler_i llama_sampler_logit_bias_i = {
@@ -4089,6 +4199,8 @@ struct llama_sampler * llama_sampler_init_logit_bias(
             /* .to_search      = */ {},
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,
+            /* .inputs         = */ {},
+            /* .inputs_own     = */ false,
         }
     );
 }
