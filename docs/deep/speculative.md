@@ -62,6 +62,26 @@ graph metadata.
 Also: the per-cell state that picks what a ubatch re-pools (one entry per cache cell) was allocated and cleared for
 every decode, target and drafter alike, because a memory context lives for one decode; the memory now keeps it.
 
+Backend samplers that set inputs (the uniform draw of `dist`, `penalties`, `logit_bias`) used to create them as inputs
+of each graph built with them and kept only the last graph's, filling those whatever graph computed. An older slot graph
+then computed with its own sampler inputs unset and got the newer graph's written at their offsets in the shared compute
+buffers, over any of its own inputs: KV cell indices, mask, positions. With `-bs` and the drafter, verifications of
+different sizes take turns in the slots, so that sampled the last vocabulary token from a garbage uniform and wrote K/V
+rows into other cells, and a cached prompt reused afterwards produced only that token (2026-11-12, Mistral-Small-4 under
+opencode, its title request beside the main one; turning off `-bs`, the drafter or the graph slots each removed it; on
+Flash-Next the same setup aborted on a CUDA error under two requests). Two requests decoding together brought it within a
+few turns, but sequential single requests got there too: the acceptance of a decode-speed run fell from 0.89 to 0 by its
+third request.
+
+These samplers now keep their inputs in a buffer of their own, allocated with the sampler on the output device
+(`llama_sampler_backend_inputs` in `src/llama-sampler.cpp`): every graph built with a sampler reads the same tensors, so
+any slot graph computes with what the sampler wrote last, and nothing is written into a compute buffer. A sampler that
+cannot get its buffer stays on the CPU. The graphs of a context remember the sampler epoch they were built in
+(`sampling_epoch` in `src/llama-context.cpp`, advanced by every `llama_set_sampler`), so a graph never computes with a
+sampler set after it, such as a new request's chain allocated where a freed one was. A first fix that rebuilt every graph
+but the last one built with such samplers cost Flash-Next's backend-sampled decode about a quarter of its speed, the
+rebuilds following every change of verification size.
+
 ## Padded verifications
 
 `LLAMA_SPEC_PAD=1` (commit `2fe4ae266`; not used in the measured setup). Before graph slots, a draft that stopped early
