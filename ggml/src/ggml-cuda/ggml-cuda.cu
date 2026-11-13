@@ -822,20 +822,28 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
 
 #ifdef USE_CUDA_GRAPH
 ggml_cuda_graph * ggml_backend_cuda_context::cuda_graph(const void * first_node_ptr, int64_t time_now) {
-    // Give all cached graphs 10s to be reused after an idle period, without updating each graph.
-    if (!cuda_graphs.empty() && time_now - last_graph_use_time >= 10'000'000) {
-        next_graph_eviction_time = time_now + 10'000'000;
-    }
-    last_graph_use_time = time_now;
+    // GGML_CUDA_GRAPH_KEEP_S: the seconds a cached graph is kept without being used, 0 keeps every graph
+    static const int64_t keep_us = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_KEEP_S");
+        return (env != nullptr ? std::max<int64_t>(0, atoll(env)) : 10)*1'000'000;
+    }();
 
-    // Sweep every 5s during active use, evicting graphs unused for at least 10s.
-    if (time_now >= next_graph_eviction_time) {
-        next_graph_eviction_time = time_now + 5'000'000;
-        for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-            if (it->first != first_node_ptr && time_now - it->second->last_used_time >= 10'000'000) {
-                it = cuda_graphs.erase(it);
-            } else {
-                ++it;
+    if (keep_us > 0) {
+        // Give all cached graphs the same time to be reused after an idle period, without updating each graph.
+        if (!cuda_graphs.empty() && time_now - last_graph_use_time >= keep_us) {
+            next_graph_eviction_time = time_now + keep_us;
+        }
+        last_graph_use_time = time_now;
+
+        // Sweep every 5s during active use, evicting the graphs unused for that time.
+        if (time_now >= next_graph_eviction_time) {
+            next_graph_eviction_time = time_now + 5'000'000;
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                if (it->first != first_node_ptr && time_now - it->second->last_used_time >= keep_us) {
+                    it = cuda_graphs.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
