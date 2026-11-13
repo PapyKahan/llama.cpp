@@ -432,6 +432,82 @@ The fused scale chain is bit-identical to the ten operations it replaces (the sa
 order), and the kernel copies' limit must stay below the download piece size: a 1 MB limit took the pieces as kernels
 on the compute stream and cost the attention side 70 µs per layer.
 
+### Swaps in flight
+
+2026-11-12, from the engine's exit statistics and a replay of the service policy's mechanics; measured in the engine
+the next day (below).
+
+The logs: on Mistral-Small-4 (36 layers, 128 experts, 4 per token, 10.3 MiB per expert) the cache replaced 13 to 14
+experts per graph where Ornith replaces about 69 and Flash-Next about 76, as an expert is three uploads and each waits
+for the host to be idle (154,319 waits of 493 us on average in one run). A build whose device step was 33 us per layer
+shorter (181 against 214 us from an answer to the next request) missed more (48.9 % against 46.3 %) and decoded at
+the same speed: the swaps start with the requests, two each, and upload with the idle time left.
+
+The replay runs the plan, the starts, the serial uploads and the downloads of exclusive victims as the code does
+(`mech2.py` in the bench directory), on Ornith's recorded routing and, for Mistral, on selections drawn from a session's
+counts. Hits with the bound on the swaps started and not uploaded yet:
+
+| in flight | Ornith, 48 swaps per graph | Ornith, 96 swaps per graph | Mistral-Small-4, 48 swaps per graph |
+|---|---|---|---|
+| no bound | 67.35 % | 64.42 %, 188 uploads queued | 44.74 %, 237 uploads queued |
+| 1 | 67.16 % | 67.11 % | 50.37 % |
+| 2 | 67.37 % | 68.34 % | 50.45 % |
+| 4 | 67.36 % | 68.29 % | 50.37 % |
+| 8 | 67.35 % | 68.20 % | 50.26 % |
+| 16 | 67.35 % | 67.99 % | 50.20 % |
+| 32 | 67.35 % | 67.60 % | 49.86 % |
+
+A bound of 1 holds Ornith's swaps below what its uploads can take; from 2 to 8 the result barely moves, and the default
+is 4. Ornith at 48 swaps per graph has no backlog, so the bound changes nothing there; with it, 96 swaps per graph hit
+more than 48 do.
+
+In the engine (2026-11-13, the build with upstream `8ca5a8008` merged in; Mistral-Small-4 on the spec bench twice per
+server, two servers per row, no draft):
+
+| | decode | experts missing | uploads past the timeout |
+|---|---|---|---|
+| the build before the merge | 36.9 to 37.1 tok/s | 50.2 to 50.4 % | 1,531 to 1,686 |
+| merged, no bound | 37.2 to 37.9 tok/s | 49.3 to 49.7 % | 1,414 to 1,450 |
+| merged, bound 4 | 44.1 to 44.9 tok/s | 36.3 to 36.7 % | 544 to 650 |
+
+One server per bound: 45.1 and 45.6 tok/s at 1, 44.7 and 45.6 at 2, 44.4 and 44.6 at 8, 44.1 and 44.6 at 16, so the
+engine is as flat as the replay from 1 to 16 and gains more than the replay's hits say: the swaps not started for want
+of a downloaded victim fall from about 210,000 to 5,000 per run, and a request is answered in 453 us instead of 598.
+With the EAGLE draft: 49.0 to 50.0 tok/s against 41.1, and 45.8 to 47.7 against 41.8 after a 91K-token prompt.
+
+Ornith (48 swaps per graph, MTP draft, one server each): 57.0 / 52.4 / 51.8 tok/s on the three decode prompts against
+53.1 / 52.2 / 50.2 before, 33.4 % of the experts missing against 35.6 %; 96 swaps per graph give 55.0 / 52.7 / 51.0, no
+better than 48, unlike the replay. Flash-Next: 111.8 / 106.7 / 110.5 against 117.8 / 97.0 / 103.7, the bound holding
+2,750 requests of 55,488.
+
+### The merge of upstream 8ca5a8008
+
+2026-11-13, the merged build against the build before it (`47e4fcd`), unified q5_1 KV as served.
+
+Numerics, mean KLD on wikitext, no tail skip:
+
+| | Mistral-Small-4 | Ornith | Flash-Next |
+|---|---|---|---|
+| host mode, 4-token batches: merged against before | 0.078 | 0.036 | 0.028 |
+| host mode, 4-token batches: before against itself | 0.072 | 0.030 | 0.026 |
+| large phase: merged against before | 0.085 | 0.036 | 0.022 |
+| large phase: before against itself | 0 | 0 | 0 |
+| large phase against the BF16 logits, before | 0.1913 +- 0.0021 | 0.1270 +- 0.0038 | |
+| large phase against the BF16 logits, merged | 0.1925 +- 0.0021 | 0.1290 +- 0.0039 | |
+
+Host mode does not repeat itself (which experts the host computes depends on the timing, and the routing and the
+quantized cache amplify the rounding); the large phase does, and the merged build is another rounding of it at the
+same distance from the BF16 model.
+
+Prefill: Mistral-Small-4 on the 91K-token prompt 866 to 868 tok/s against 885 to 893 with the draft, 893 against 909
+without; Ornith 1,414 against 1,436 tok/s at 92K tokens, 1,790 against 1,806 at 35K, equal at 12K, 679 against 649 at
+2.3K; Flash-Next equal within the spread from 12K to 93K tokens. The loss on the long prompts of the two models that
+use the flash-attention kernel is not attributed yet.
+
+`GGML_CUDA_GRAPH_KEEP_S=300`: 320 to 460 MiB more of the device held on Mistral-Small-4 (peak 24,062 MiB with the
+draft against 23,602 at the default 10 s), and no decode gain resolved after the 91K-token prompt (47.7 and 41.9 tok/s
+on two servers against 45.8). Not set in the profiles.
+
 ## Pitfalls of measuring here
 
 - **systemd-oomd**: the user slice is killed at 80 % memory pressure for 30 s, and the victim is the cgroup holding the

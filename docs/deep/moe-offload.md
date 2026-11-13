@@ -3,8 +3,9 @@
 Upstream's MoE cache (`--cpu-moe --moe-cache-mib N`, [docs/moe-cache.md](../moe-cache.md)) keeps the most used experts
 of host-resident MoE layers in device memory for small batches; a miss is uploaded into the cache, or with
 `--moe-cache-cpu-share F` (upstream PR #30966, merged into this branch) computed on the CPU for a share of the misses.
-The cache is groups of slots, one group per set of layers with the same expert tensor layout, an SLRU per group, and a
-slot map per layer that the graph reads to find each selected expert.
+The cache is groups of slots, one group per set of layers with the same expert tensor layout, an LRU list per
+frequency class in each group (upstream's ClassLRU, #31233), and a slot map per layer that the graph reads to find
+each selected expert.
 
 For Qwen3.8-Flash-Next IQ3_S the host experts are 47.7 GiB (48 layers × 512 experts × gate, up and down, 0.4 to 0.9 MB
 per expert matrix, seven groups by quantization type) and the cache holds about 6,600 of the 24,576 experts in 13 GB.
@@ -71,6 +72,12 @@ nothing to do. The CPU and the uploads read the same host memory and share its b
 outlast the device's work up to the next request: the worker starts each upload while the host serves no request, one
 at a time, and one waiting past 2 ms starts anyway (commit `8c02bccc0`, `LLAMA_MOE_UPLOAD_GATE`).
 
+A swap gives up its victim when it starts, and its expert is cached only once uploaded. The uploads go one at a time,
+so swaps started faster than they upload leave slots that hold nothing: past `LLAMA_MOE_HOST_FLIGHT` swaps started and
+not uploaded yet, a request starts none, and the victims stay cached until a later request. Without the bound the
+starts follow the requests (two each) while the uploads follow the host's idle time, so the fewer experts a model
+uploads per graph, the more of its slots waited empty; see [measurements.md](measurements.md#swaps-in-flight).
+
 The service thread makes no CUDA call: a graph that waits for an answer may hold the driver while it is being launched,
 and a call from the thread that must answer would deadlock until the wait's timeout.
 
@@ -79,6 +86,7 @@ and a call from the thread that must answer would deadlock until the wait's time
 | `LLAMA_MOE_HOST_SWAPS` | 96 | replacements planned per graph |
 | `LLAMA_MOE_HOST_FILLS` | 192 | admissions into free slots per graph |
 | `LLAMA_MOE_HOST_PER_REQUEST` | 2 | swaps started per request |
+| `LLAMA_MOE_HOST_FLIGHT` | 4 | swaps started and not uploaded yet, past which a request starts none; 0: no bound |
 | `LLAMA_MOE_UPLOAD_GATE` | 1 | an upload starts while the host serves no request; 0: as soon as queued |
 | `LLAMA_MOE_HOST_DECAY` | 0.9 | decay of the selection counts per plan |
 | `LLAMA_MOE_HOST_HYST` | 1.0 | a victim must be selected this many times less than its successor |

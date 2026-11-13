@@ -12,7 +12,7 @@ embedding table) with its full 262,144-token context on a desktop PC:
 The goal set for the work: at least the speed of [Strata](https://github.com/Niko1221/Strata), an engine written for
 this model, on the same machine, with a RAM footprint on par with it, at 262K context.
 
-The branch is upstream `master` up to `39febd2ad` (v0.8.0 and three commits, merged in on 2026-10-28) plus four
+The branch is upstream `master` up to `8ca5a8008` (v0.9.0 and later commits, merged in on 2026-11-12) plus four
 upstream pull requests and about fifty commits of its own, named `local: ...`. This directory documents them, as the
 basis for upstream pull requests once the work listed in [upstreaming.md](upstreaming.md) is done. Nothing here is
 specific to the machine except the measurements; several parts are specific to `qwen4exp` and say so. The expert offload

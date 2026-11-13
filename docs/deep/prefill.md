@@ -15,11 +15,12 @@ the expert prefetch, 8192-token ubatches, the kernels and server changes below, 
 
 Commit `e2ff90695` (`ggml/src/ggml-cuda/mmq.cu`, `mmid.cu`):
 
-- **Active tiles only** (`GGML_CUDA_MMQ_TILE_MAP`, default on): MMQ for `MUL_MAT_ID` launched a grid sized as if one
-  expert took every token, about 655K blocks for an 8192-token ubatch of which about 97 % had no work. A tile map built
-  on the device lists the active tiles and the grid covers only those.
+- **Active tiles only**: MMQ for `MUL_MAT_ID` launched a grid sized as if one expert took every token, about 655K
+  blocks for an 8192-token ubatch of which about 97 % had no work. The branch listed the active tiles in a tile map
+  built on the device; upstream now lays the tiles out the same way (tile specs, #31047), and since the merge of
+  2026-11-12 the branch uses those. The ids' helper zeroes them first when ids may be negative.
 - **Stable counting sort of the ids** (`GGML_CUDA_MMID_SORT`, default on): the ids of many tokens are grouped by expert
-  with a stable counting sort instead of a scan per expert.
+  with a stable counting sort instead of a scan per expert; it writes upstream's tile specs.
 
 ## Prompt chunks in the server
 

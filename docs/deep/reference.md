@@ -17,6 +17,7 @@ become parameters.
 | `LLAMA_MOE_HOST_SWAPS` | 96 | | service policy: replacements planned per graph |
 | `LLAMA_MOE_HOST_FILLS` | 192 | | service policy: admissions into free slots per graph |
 | `LLAMA_MOE_HOST_PER_REQUEST` | 2 | | service policy: swaps started per host request |
+| `LLAMA_MOE_HOST_FLIGHT` | 4 | | service policy: swaps started and not uploaded yet, past which no swap starts; 0 = no bound |
 | `LLAMA_MOE_UPLOAD_GATE` | on | on | an upload of the cache starts while the host serves no request, one at a time |
 | `LLAMA_MOE_HOST_DECAY` | 0.9 (graph policy 0.97) | | decay of the selection counts per plan |
 | `LLAMA_MOE_HOST_HYST` | 1.0 (graph policy 1.25) | | a victim is selected this many times less than its successor |
@@ -58,12 +59,12 @@ become parameters.
 | `GGML_CUDA_VMM_CHUNK_MIB` | 32 | | granularity of the VMM buffers of the cache banks |
 | `GGML_CUDA_MMVF_ROWS` | off | 1 | multi-token GEMV for few long F32/F16/BF16 rows |
 | `GGML_CUDA_MMVF_FEW_ROWS` | off | 1 | MMVF instead of MMF for BF16 matrices of up to 1024 rows |
-| `GGML_CUDA_MMQ_TILE_MAP` | on | | MMQ for `MUL_MAT_ID` launches the active tiles only |
 | `GGML_CUDA_MMID_SORT` | on | | ids of many tokens grouped by a stable counting sort |
 | `GGML_CUDA_FA_COMPACT` | on | | sparse flash attention gathers the listed cells into compact buffers |
 | `GGML_CUDA_FA_SPARSE_MIN_KV` | 0 (worst-case bound) | 8192 | cells from which query tiles gather |
 | `GGML_CUDA_FA_DIRECT_KV` | on | | the MMA flash-attention kernel reads a q5_1/q8_0 cache in place for batches of up to 16 queries (320/256 and 256/256 with GQA); 0 converts it to F16 |
 | `GGML_CUDA_LID_MMA` | on | | lightning indexer for four heads on tensor cores |
+| `GGML_CUDA_GRAPH_KEEP_S` | 10 | | seconds a captured CUDA graph is kept without being used; 0 keeps every graph |
 
 ## Speculative decoding and server
 
@@ -143,7 +144,8 @@ New files: `src/llama-moe-host.{h,cpp}`, `ggml/src/ggml-cuda/moe-host.cu`, `ggml
 
 ## Commits
 
-Upstream base `f64a49819`, merged up to `39febd2ad` in `c1ebe7a83` (2026-10-28). Merged pull requests: #30966
+Upstream base `f64a49819`, merged up to `39febd2ad` in `c1ebe7a83` (2026-10-28) and up to `8ca5a8008` in `68c0d290b`
+(2026-11-12). Merged pull requests: #30966
 (`175c8336e`), #30815 (`f64d60f16`, includes #30640), #30448 (`a95a90a0d`), #30380 (`21fda432c`). Local commits, oldest
 first:
 
@@ -202,3 +204,5 @@ first:
 | `c5da9066b` | CUDA: the q5_1 rows of an attention tile staged by cp.async a tile ahead |
 | `70153c22e` | CUDA: faster head-320 MMA flash attention on a quantized cache (fixup, dequantization, prefetches, tile configurations) |
 | `437994c62` | CUDA: the decode step's device-side mechanics (amax chain fusion, kernel copies, graph chunk ramp, lazy sampled probabilities) |
+| `22c610029` | host mode: no swap starts past a bound on the swaps started and not uploaded yet (`LLAMA_MOE_HOST_FLIGHT`) |
+| `a566d460e` | CUDA: the time an unused CUDA graph is kept (`GGML_CUDA_GRAPH_KEEP_S`) |
