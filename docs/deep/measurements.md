@@ -480,6 +480,37 @@ Ornith (48 swaps per graph, MTP draft, one server each): 57.0 / 52.4 / 51.8 tok/
 better than 48, unlike the replay. Flash-Next: 111.8 / 106.7 / 110.5 against 117.8 / 97.0 / 103.7, the bound holding
 2,750 requests of 55,488.
 
+### The score window of the service policy
+
+2026-11-13, `LLAMA_MOE_HOST_DECAY` with the bound of 4 swaps in flight, build `a06ee0391`.
+
+Mistral-Small-4, no draft, the spec bench twice per server:
+
+| decay | decode | experts missing | replaced per graph | request to answer / answer to request |
+|---|---|---|---|---|
+| no swap (`LLAMA_MOE_HOST_SWAPS=0`) | 42.0 to 42.4 tok/s | 50.0 % | 0 | 530 / 141 us |
+| 0.9, two servers | 44.8 to 45.3 tok/s | 36.0 to 36.2 % | 12.4 | 448 / 185 us |
+| 0.97 | 46.2 tok/s | 35.3 % | 11.8 | 432 / 184 us |
+| 0.99 | 48.9 to 49.2 tok/s | 35.4 % | 7.0 | 410 / 172 us |
+| 0.995, three servers | 49.7 to 50.1 tok/s | 36.4 to 36.5 % | 4.4 | 406 / 164 us |
+| 0.998 | 48.5 to 48.7 tok/s | 39.9 % | 2.5 | 432 / 155 us |
+| 0.999 | 46.6 to 47.0 tok/s | 42.5 % | 1.7 | 458 / 150 us |
+| 1.0 | 44.6 to 45.4 tok/s | 45.8 % | 0.6 | 486 / 145 us |
+
+The longer window does not hit more: it replaces a third as many experts for the same hits, and both the host's
+answer and the device's step are shorter for it. With the hysteresis at 1.25 or 1.5 on top of 0.995 the speed is the
+same (49.4 to 50.2 tok/s) for 2.8 and 2.2 experts replaced per graph. With 14 or 18 host threads instead of 11:
+44.2 to 44.9 tok/s, no gain.
+
+With the EAGLE draft (2.2 tokens per request): 49.5 to 49.8 tok/s at 0.9, 51.0 to 51.7 at 0.99, 50.1 to 50.9 at
+0.995, and 49.7 tok/s after the 91K-token prompt at 0.995 (45.8 to 47.7 at 0.9). The draft adds little once the cache
+swaps less: 50 tok/s without it at 0.995.
+
+Ornith (3 tokens per request) is flat from 0.9 to 0.995 (858, 848, 883 and 852 us per layer for the host and the
+device together at 0.9, 0.97, 0.99 and 0.995) and loses at 0.998 (971 us, 41.5 % of the experts missing against 34 %).
+Flash-Next (4 tokens per request) loses past 0.97: 14.6 to 16.4 % missing at 0.9, 19.9 % at 0.99, 23.2 % at 0.995. The
+default stays 0.9; the value is a setting of the Mistral-Small-4 profiles.
+
 ### The merge of upstream 8ca5a8008
 
 2026-11-13, the merged build against the build before it (`47e4fcd`), unified q5_1 KV as served.
