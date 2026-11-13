@@ -598,6 +598,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     int32_t svc_swaps    = 96;  // replacements per graph
     int32_t svc_fills    = 192; // admissions into free slots per graph
     int32_t svc_per_req  = 2;   // swaps started per request
+    int32_t svc_flight   = 4;   // swaps started and not uploaded yet, 0 = no bound
     struct svc_move {
         float   benefit;
         int32_t ig;
@@ -611,6 +612,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
     std::mutex               svc_mtx;
     size_t svc_n_swaps = 0;
     size_t svc_n_fills = 0;
+    size_t svc_n_held  = 0; // requests that left swaps of the plan for later, with svc_flight of them in flight
 
     // phases (LLAMA_MOE_CACHE_PREFILL_MIB, host mode): between large batches each group holds n_slots experts; while
     // large batches run it holds the first n_core and lends the memory of the others, released from the end of each
@@ -1523,6 +1525,7 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             svc_swaps   = std::max(0, env_i("LLAMA_MOE_HOST_SWAPS", svc_swaps));
             svc_fills   = std::max(0, env_i("LLAMA_MOE_HOST_FILLS", svc_fills));
             svc_per_req = std::max(1, env_i("LLAMA_MOE_HOST_PER_REQUEST", svc_per_req));
+            svc_flight  = std::max(0, env_i("LLAMA_MOE_HOST_FLIGHT", svc_flight));
             host_decay  = std::clamp(env_f("LLAMA_MOE_HOST_DECAY", 0.9f), 0.0f, 1.0f);
             host_hyst   = std::max(1.0f, env_f("LLAMA_MOE_HOST_HYST", 1.0f));
             for (const group & g : groups) {
@@ -1533,8 +1536,8 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
                 }
             }
             host->set_listener(this);
-            LLAMA_LOG_INFO("%s: host mode cache policy: per graph %d replacements and %d admissions into free slots, %d started per request, decay %.2f, hysteresis %.2f\n",
-                __func__, svc_swaps, svc_fills, svc_per_req, host_decay, host_hyst);
+            LLAMA_LOG_INFO("%s: host mode cache policy: per graph %d replacements and %d admissions into free slots, %d started per request, %d in flight, decay %.2f, hysteresis %.2f\n",
+                __func__, svc_swaps, svc_fills, svc_per_req, svc_flight, host_decay, host_hyst);
         }
 
         LLAMA_LOG_INFO("%s: host mode: up to %d tokens, %d threads, a plan every %d graphs (%d fills, %d swaps), decay %.3f, hysteresis %.2f\n",
@@ -1993,6 +1996,12 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             }
             if (vk >= 0 && vk / ne == il) {
                 continue; // the device may read the victim now: later
+            }
+            // a swap gives up its victim now and its expert is cached once uploaded, and the uploads go one at a time:
+            // past a few of them in flight, the victims stay cached until a later request starts their swaps
+            if (svc_flight > 0 && hdev[g.id].in_flight + svc_started.size() >= (size_t) svc_flight) {
+                svc_n_held++;
+                break;
             }
             if (vk >= 0 && mv.slot < g.n_excl) {
                 // the victim of an exclusive slot leaves once its download is done, with that host copy
@@ -2775,6 +2784,9 @@ struct llama_moe_cache::impl : public llama_moe_host::listener {
             if (host_n_fills + host_n_swaps + svc_n_fills + svc_n_swaps > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu experts admitted into free slots, %zu replaced, %zu admitted again after large batches, %lld graphs, %.1f us before each graph\n",
                     host_n_fills + svc_n_fills, host_n_swaps + svc_n_swaps, n_readmitted, (long long) host_n_plans, host_n_plans > 0 ? host_begin_ns/1e3/host_n_plans : 0.0);
+            }
+            if (svc_n_held > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: host mode: %zu requests left swaps for later with %d in flight\n", svc_n_held, svc_flight);
             }
             if (gate_waits > 0) {
                 LLAMA_LOG_INFO("llama_moe_cache: uploads waited %llu times for the host to answer, %.1f us each on average, %llu past the timeout\n",
