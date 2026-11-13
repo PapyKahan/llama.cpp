@@ -206,3 +206,4 @@ first:
 | `437994c62` | CUDA: the decode step's device-side mechanics (amax chain fusion, kernel copies, graph chunk ramp, lazy sampled probabilities) |
 | `22c610029` | host mode: no swap starts past a bound on the swaps started and not uploaded yet (`LLAMA_MOE_HOST_FLIGHT`) |
 | `a566d460e` | CUDA: the time an unused CUDA graph is kept (`GGML_CUDA_GRAPH_KEEP_S`) |
+| `87cc7bd1c` | CUDA: the MMA flash-attention kernels that read K/V rows (`kv_rows`) are instances of their own |

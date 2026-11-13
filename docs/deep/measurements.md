@@ -501,8 +501,16 @@ same distance from the BF16 model.
 
 Prefill: Mistral-Small-4 on the 91K-token prompt 866 to 868 tok/s against 885 to 893 with the draft, 893 against 909
 without; Ornith 1,414 against 1,436 tok/s at 92K tokens, 1,790 against 1,806 at 35K, equal at 12K, 679 against 649 at
-2.3K; Flash-Next equal within the spread from 12K to 93K tokens. The loss on the long prompts of the two models that
-use the flash-attention kernel is not attributed yet.
+2.3K; Flash-Next equal within the spread from 12K to 93K tokens.
+
+The loss is the MMA flash-attention kernel. A trace of the same 30 s of Mistral-Small-4's prefill (context 45K to
+70K) has that kernel at 86 % of the kernel time (24.7 of 28.6 s), 192 / 221 / 250 / 280 ms per call over four batches
+before the merge and 200 / 230 / 260 / 290 ms after; the expert products cost the same on both. Upstream's K/V row
+lists (#29510) reach the F16 tile loads as a pointer tested per row; with none given, the test alone costs those 4 %,
+and testing it once per tile instead does not give them back (882 tok/s). As a template parameter of the kernel, set
+on the host from the operation, the loads without rows compile as before: 906 to 911 tok/s on the 91K-token prompt
+without the draft (909 before the merge, 887 to 893 after), Ornith 1,437 tok/s at 92K tokens and 1,811 at 35K. The
+F16 kernels are compiled twice for it, about two thirds more CPU time to build the CUDA backend.
 
 `GGML_CUDA_GRAPH_KEEP_S=300`: 320 to 460 MiB more of the device held on Mistral-Small-4 (peak 24,062 MiB with the
 draft against 23,602 at the default 10 s), and no decode gain resolved after the 91K-token prompt (47.7 and 41.9 tok/s
